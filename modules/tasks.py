@@ -104,14 +104,18 @@ async def task_monitor(tasks: list[asyncio.Task]) -> None:
     logger.info("任务监控已退出.", shift=True)
 
 
-async def video_optimize(page: Page, config: Config) -> None:
+async def video_optimize(
+    page: Page, config: Config, playback_enabled: asyncio.Event | None = None
+) -> None:
     await page.wait_for_load_state("domcontentloaded")
     while True:
         try:
             await asyncio.sleep(2)
+            if playback_enabled is not None and not playback_enabled.is_set():
+                continue
             try:
                 await page.wait_for_selector(
-                    COURSE_VIDEO_SELECTOR, state="attached", timeout=3000
+                    COURSE_VIDEO_SELECTOR, state="attached", timeout=1500
                 )
             except TimeoutError:
                 logger.debug_throttled(
@@ -173,6 +177,8 @@ async def play_video(
     while True:
         try:
             await asyncio.sleep(2)
+            if playback_enabled is not None and not playback_enabled.is_set():
+                continue
             try:
                 await page.wait_for_selector(
                     COURSE_VIDEO_SELECTOR, state="attached", timeout=1000
@@ -182,18 +188,6 @@ async def play_video(
                     "video:play",
                     f"视频播放跳过: 页面未找到元素 {COURSE_VIDEO_SELECTOR}",
                 )
-                continue
-            if playback_enabled is not None and not playback_enabled.is_set():
-                paused = await run_on(
-                    page,
-                    COURSE_VIDEO_SELECTOR,
-                    "(el) => el.paused",
-                    "读取视频暂停状态",
-                )
-                if paused is False:
-                    await run_on(
-                        page, COURSE_VIDEO_SELECTOR, "(el) => el.pause()", "暂停视频"
-                    )
                 continue
             state = await run_on(
                 page,
@@ -257,10 +251,15 @@ async def play_video(
             continue
 
 
-async def skip_questions(page: Page, event_loop) -> None:
+async def skip_questions(
+    page: Page, event_loop, playback_enabled: asyncio.Event | None = None
+) -> None:
     await page.wait_for_load_state("domcontentloaded")
     while True:
         try:
+            if playback_enabled is not None and not playback_enabled.is_set():
+                await asyncio.sleep(2)
+                continue
             if "studywisdomh5.zhihuishu.com" in page.url:
                 await asyncio.sleep(2)
                 if not await has_visible_element(page, (".topic-title",)):
@@ -309,16 +308,29 @@ async def skip_questions(page: Page, event_loop) -> None:
             else:
                 logger.log_exception("答题模块执行失败.", e)
             if "fusioncourseh5" in page.url:
-                not_finish_close = await page.query_selector(".el-dialog")
-                if not_finish_close:
-                    await page.press(".el-dialog", "Escape", timeout=1000)
+                try:
+                    not_finish_close = await page.query_selector(".el-dialog")
+                    if not_finish_close:
+                        await page.press(".el-dialog", "Escape", timeout=1000)
+                except Exception as cleanup_exc:
+                    # 页面切换时执行上下文会被销毁, 清理失败不应终止答题任务
+                    logger.debug_throttled(
+                        "skip_questions:cleanup",
+                        f"答题弹窗清理跳过: {logger.summarize_exception(cleanup_exc)}",
+                    )
             elif "hike.zhihuishu.com" in page.url:
                 logger.warn("当前课程为新版本,不支持自动答题.", shift=True)
                 return
             else:
-                not_finish_close = await page.query_selector(".el-message-box__headerbtn")
-                if not_finish_close:
-                    await not_finish_close.click()
+                try:
+                    not_finish_close = await page.query_selector(".el-message-box__headerbtn")
+                    if not_finish_close:
+                        await not_finish_close.click()
+                except Exception as cleanup_exc:
+                    logger.debug_throttled(
+                        "skip_questions:cleanup",
+                        f"答题弹窗清理跳过: {logger.summarize_exception(cleanup_exc)}",
+                    )
             continue
 
 
