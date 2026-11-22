@@ -23,6 +23,8 @@ from playwright.async_api import Page
 from playwright._impl._errors import TargetClosedError
 
 from modules.logger import Logger
+from modules import llm
+from modules.llm import pick_option
 from modules.video_state import COURSE_VIDEO_SELECTOR
 
 logger = Logger()
@@ -196,7 +198,8 @@ class FusionAdapter:
     async def skip_ai_exercise(page: Page) -> bool:
         """检测 AI 随堂弹窗并自动选选项+提交, 成功(或已处理)返回 True。
 
-        顺序: 每道题选一个选项 -> 点提交 -> 等已完成/弹窗消失 -> 点关闭图标 -> 恢复播放。
+        顺序: 每道题优先大模型选题(未启用或未命中时自动选第一个选项) -> 点提交
+        -> 等已完成/弹窗消失 -> 点关闭图标 -> 恢复播放。
         未作答的题不能提交也不能关闭; 只点第一题会把播放循环卡死。
         """
         if not await FusionAdapter.ai_exercise_visible(page):
@@ -210,6 +213,41 @@ class FusionAdapter:
                     logger.info("AI 随堂练习已自动提交关闭.")
                     await FusionAdapter.resume_video(page)
                     return True
+
+            if llm.enabled():
+                try:
+                    question_roots = await page.query_selector_all(
+                        f"{AI_CLASS_EXERCISE_DIALOG} .ques-list .item"
+                    )
+                    if not question_roots:
+                        dlg = await page.query_selector(AI_CLASS_EXERCISE_DIALOG)
+                        question_roots = [dlg] if dlg else []
+                    for root in question_roots:
+                        if await root.query_selector(".class-question-select.isSelect"):
+                            continue
+                        option_handles = await root.query_selector_all(".option")
+                        if not option_handles:
+                            continue
+                        option_texts = []
+                        for handle in option_handles:
+                            try:
+                                option_texts.append(
+                                    " ".join((await handle.inner_text()).split())
+                                )
+                            except Exception:
+                                option_texts.append("")
+                        question_text = " ".join((await root.inner_text()).split())
+                        chosen_idx = await pick_option(question_text, option_texts)
+                        if chosen_idx >= 0:
+                            logger.info(
+                                f"AI 随堂练习使用大模型选择: {option_texts[chosen_idx]}"
+                            )
+                            await option_handles[chosen_idx].click(timeout=2000)
+                except Exception as exc:
+                    logger.debug_throttled(
+                        "fusion:ai_llm",
+                        f"大模型选题跳过: {logger.summarize_exception(exc)}",
+                    )
 
             result = await page.evaluate(_SELECT_EACH_QUESTION_JS) or {}
             selected = int(result.get("selected") or 0)

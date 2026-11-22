@@ -138,6 +138,10 @@ Key 不需要加引号，不读取环境变量或系统钥匙串。开启后若 
 
 每次检测到验证最多尝试 3 次。模型无法确定目标、题目发生变化、坐标越界、API 出错或验证未通过时，会保留手动处理路径；失败不会无限调用 API。成功以弹窗消失为判据，后续视频与平台进度仍由原有播放逻辑检查。必要依赖 `httpx` 和 `Pillow` 已在基础依赖中，不需要安装本地视觉模型或额外的 OpenCV 依赖。
 
+##### 可选：DeepSeek 大模型自动答题
+
+在 `data/llm.json`（模板见 `data/llm.json.example`，首次运行时会自动生成）中填写 `api_key` 后，程序会调用兼容 OpenAI 格式的大模型接口（默认 DeepSeek `deepseek-chat`）辅助作答课中弹题、融合课/AI 慕课随堂练习弹窗及新开的测验标签页；留空 `api_key` 时自动禁用并完全保持原有默认行为，接口失败时自动回退。
+
 #### 五、发行版下载
 
 - Github: [Releases · CXRunfree/Autovisor](https://github.com/CXRunfree/Autovisor/releases)
