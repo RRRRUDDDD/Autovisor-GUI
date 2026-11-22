@@ -8,6 +8,7 @@ import platform
 import re
 import sys
 import time
+from pathlib import Path
 
 from modules.stdio import configure_stdio
 
@@ -17,6 +18,17 @@ from playwright.async_api import BrowserContext, Page, Playwright, TimeoutError,
 from playwright._impl._errors import TargetClosedError
 
 from modules import installer, quiz_page, updater
+from modules.ai_smart import (
+    complete_resources_for_node,
+    is_ai_smart_url,
+    run_ai_smart_course,
+)
+from modules.ai_smart_mastery import (
+    AnswerCache,
+    build_learn_url,
+    enumerate_nodes,
+    run_course_mastery,
+)
 from modules.banner import print_banner
 from modules.configs import Config, ConfigError, ensure_config_files
 from modules.course_runner import (
@@ -65,6 +77,7 @@ ZHS_COOKIE_URLS = [
     "https://fusioncourseh5.zhihuishu.com",
     "https://wisdom-mooc.zhihuishu.com",
     "https://hike.zhihuishu.com",
+    "https://ai-smart-course-student-pro.zhihuishu.com",
 ]
 # 运行期间周期性落盘 Cookies 的间隔(秒): 服务器中途续期后, 崩溃/断电也不丢凭证
 COOKIE_SYNC_INTERVAL_SECONDS = 300
@@ -324,6 +337,73 @@ def ensure_credentials(config) -> None:
     logger.info("已记录本次输入的账号密码,正在自动登录...")
 
 
+async def run_resources_stage(
+    page: Page, course_url: str, config, logger, playback_enabled
+) -> dict:
+    """按知识点逐个核对「必学资源」, 把漏掉的视频/文档/PPT 补齐."""
+    logger.section("必学资源补齐")
+    payload = await enumerate_nodes(page, course_url)
+    nodes = [node for node in payload["nodes"] if not node.get("freeExam")]
+    logger.event("资源补齐范围", 知识点=len(nodes))
+    started_at = time.monotonic()
+    total_done = total_failed = 0
+    for index, node in enumerate(nodes, 1):
+        if getattr(config, "limitMaxTime", 0) and (
+            time.monotonic() - started_at
+        ) / 60 >= config.limitMaxTime:
+            logger.warn("达到单课时限, 停止补齐资源.")
+            break
+        name = node.get("name") or node["nodeUid"]
+        learn_url = build_learn_url(
+            payload["courseId"], node["nodeUid"], payload["classId"]
+        )
+        result = await complete_resources_for_node(
+            page, learn_url, config, logger, playback_enabled, started_at
+        )
+        if result.get("ok"):
+            total_done += result.get("done", 0)
+            total_failed += result.get("failed", 0)
+            if result.get("done") or result.get("failed"):
+                logger.event(
+                    "资源补齐",
+                    序号=f"{index}/{len(nodes)}",
+                    名称=name,
+                    补齐=result.get("done"),
+                    已完成=result.get("skipped"),
+                    失败=result.get("failed"),
+                )
+        else:
+            logger.debug(f"跳过 {name}: {result.get('reason')}")
+    logger.event("资源补齐汇总", 补齐=total_done, 失败=total_failed)
+    return {"done": total_done, "failed": total_failed}
+
+
+async def run_mastery_stage(page: Page, course_url: str, config, logger) -> dict:
+    """AI 智慧课: 视频刷完后, 把每个知识点的掌握度刷到目标值."""
+    logger.section("掌握度提升")
+    payload = await enumerate_nodes(page, course_url)
+    nodes = payload.get("nodes") or []
+    free_count = sum(1 for node in nodes if node.get("freeExam"))
+    logger.event("知识点枚举", 总数=len(nodes), 免考=free_count)
+    if not nodes:
+        logger.warn("没有枚举到知识点, 跳过掌握度阶段.")
+        return {}
+    cache = AnswerCache(Path(get_runtime_path("data", "mastery_answers.json")))
+    target = int(config.masteryTarget)
+    logger.info(f"开始刷掌握度: 知识点 {len(nodes)} 个, 目标 {target}%")
+    summary = await run_course_mastery(
+        page,
+        nodes,
+        payload["courseId"],
+        payload["classId"],
+        cache,
+        logger,
+        target=target,
+        max_attempts=3,
+    )
+    return summary
+
+
 async def main(config) -> bool:
     modules, tasks = [], []
     playback_enabled = asyncio.Event()
@@ -400,6 +480,47 @@ async def main(config) -> bool:
                     except TimeoutError:
                         logger.warn("播放页加载较慢，继续等待目录渲染...", shift=True)
                     await page.wait_for_timeout(2000)
+
+                if is_ai_smart_url(course_url):
+                    logger.info("检测到 ai-smart 新形态课程.")
+                    logger.context(目录类型="ai-smart")
+                    logger.event("课程目录", 类型="ai-smart", 地址=page.url)
+                    await persist_login_cookies(context)
+                    playback_enabled.clear()
+                    outcome = await run_ai_smart_course(
+                        page, course_url, config, logger, playback_enabled
+                    )
+                    playback_enabled.clear()
+                    logger.event(
+                        "课程结果", 结果=outcome.value, 目录类型="ai-smart"
+                    )
+                    if outcome is CourseOutcome.FAILED:
+                        logger.warn("课程未确认完成, 已停止本轮运行.", shift=True)
+                        run_ok = False
+                        all_courses_complete = False
+                        break
+                    if outcome is CourseOutcome.TIME_LIMIT:
+                        all_courses_complete = False
+                        continue
+                    # 大纲接口会漏掉「绪论」这类 default 单元, 再按知识点补一遍资源
+                    try:
+                        await run_resources_stage(
+                            page, course_url, config, logger, playback_enabled
+                        )
+                    except Exception as exc:
+                        logger.log_exception("必学资源补齐失败.", exc)
+                    # 视频刷完后继续刷知识点掌握度(题目)
+                    if getattr(config, "enableMastery", True):
+                        try:
+                            await run_mastery_stage(
+                                page, course_url, config, logger
+                            )
+                        except Exception as exc:
+                            logger.log_exception("掌握度刷取失败.", exc)
+                            run_ok = False
+                            all_courses_complete = False
+                            break
+                    continue
 
                 catalog = await detect_catalog_after_verification(page, page.url)
                 logger.info(f"检测到 {catalog.name} 课程目录.")

@@ -32,6 +32,8 @@ class Config:
             self.showDonateCode = self.get_bool_field("script-option", "showDonateCode")
             # 课程选项
             self.soundOff = self.get_bool_field('course-option', 'soundOff')
+            # AI 智慧课: 视频刷完后是否继续把知识点掌握度刷满
+            self.enableMastery = self.get_bool_field('course-option', 'enableMastery', fallback=True)
             self.course_match_rule = re.compile("https://[-A-Za-z0-9+&@#/%?=~_|!:,.;]+[-A-Za-z0-9+&@#/%=~_|]")
             self.course_urls = self.get_course_urls()
         # 登录
@@ -129,6 +131,14 @@ class Config:
         speed = self._safe_get_float('course-option', 'limitSpeed', 1.0)
         return min(max(speed, 0.5), 1.8)
 
+    @property
+    def masteryTarget(self) -> float:
+        self._read_config()
+        target = self._safe_get_float('course-option', 'masteryTarget', 100.0)
+        if target <= 0:
+            return 100.0
+        return min(max(target, 1.0), 100.0)
+
 
 # 以下模板用于启动时自动生成缺失的配置文件, 与 *.example 保持一致。
 CONFIG_TEMPLATE = """[user-account]
@@ -144,8 +154,12 @@ driver = Edge
 EXE_PATH =
 
 [script-option]
-;是否自动过登录时的滑块验证(默认:True)
+;是否自动过验证码(登录滑块 / 课中点选, 默认:True)
 enableAutoCaptcha = True
+;可选: 使用 DeepSeek 处理课中单点点击验证，需要单独配置 API Key
+enableVisionCaptcha = False
+;仅填写在本地配置中，不要提交包含真实 Key 的文件
+deepseekApiKey =
 ;是否自动隐藏浏览器窗口(默认:False)
 enableHideWindow = False
 ;是否展示赞赏码(默认:True)
@@ -158,9 +172,13 @@ limitMaxTime = 30
 limitSpeed = 1.0
 ;设置是否静音播放 (默认:True)
 soundOff = True
+;AI智慧课: 视频刷完后是否继续把知识点掌握度(题目)刷满 (默认:True)
+enableMastery = True
+;掌握度目标百分比 (1-100, 默认:100)
+masteryTarget = 100
 
 [course-url]
-;配置要学习的课程链接,支持(智慧)共享课
+;配置要学习的课程链接,支持智慧共享课、翻转课、融合共享课、AI慕课(wisdom-mooc)、AI智慧课
 ;可继续添加多个课程链接
 URL1 =
 URL2 =
