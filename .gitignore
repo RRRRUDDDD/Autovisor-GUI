@@ -21,3 +21,4 @@ captcha/
 logs/
 ./preview/*
 *.egg-info/
+*.whl
