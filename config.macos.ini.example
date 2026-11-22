@@ -14,6 +14,10 @@ cdpUrl = http://127.0.0.1:9222
 [script-option]
 ;是否自动过验证码(登录滑块 / 课中点选)
 enableAutoCaptcha = False
+;可选: 使用 DeepSeek 处理课中单点点击验证，需要单独配置 API Key
+enableVisionCaptcha = False
+;仅填写在本地配置中，不要提交包含真实 Key 的文件
+deepseekApiKey =
 enableHideWindow = False
 showDonateCode = False
 
