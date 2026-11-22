@@ -1,5 +1,6 @@
 import asyncio
 import math
+import re
 from dataclasses import dataclass
 
 from playwright.async_api import Locator, Page, TimeoutError
@@ -18,6 +19,7 @@ class CatalogSelectors:
     course_title: str | None = None
     needs_expand: bool = False
     handles_ai_exercise: bool = False
+    click_target: str | None = None
 
 
 WISDOM_CATALOG = CatalogSelectors(
@@ -34,11 +36,15 @@ WISDOM_CATALOG = CatalogSelectors(
 
 FUSION_CATALOG = CatalogSelectors(
     name="fusion",
-    # 真实融合课小节的容器是 .chapter-item(完整课时列表, 含 finish-icon);
-    # .chapter-content-second 只是"当前展开层级的子节点"(真站实测仅 4/58),
-    # 用它会漏采大部分课时, 故校准为 .chapter-item。
-    item=".chapter-item",
-    active=".chapter-content-second.current",
+    # 两种融合目录都只取叶子课时。外层 chapter-item 可能包住多个小课时，
+    # 不能把它的任意完成图标、首个标题或点击中心当作同一段视频。
+    item=(
+        ".chapter-content-second:has(.item-name)"
+        ":not(:has(.chapter-content-second, .chapter-item)), "
+        ".chapter-item:has(.item-name)"
+        ":not(:has(.chapter-item, .chapter-content-second .item-name))"
+    ),
+    active=".chapter-content-second.current, .chapter-item.current",
     finish=".finish-icon",
     title=".item-name",
     active_class="current",
@@ -49,6 +55,7 @@ FUSION_CATALOG = CatalogSelectors(
     progress_attribute="aria-valuenow",
     needs_expand=True,
     handles_ai_exercise=True,
+    click_target=".item-name",
 )
 
 MOOC_CATALOG = CatalogSelectors(
@@ -186,35 +193,85 @@ async def wait_for_lesson_active(
     lesson: Locator, catalog: CatalogSelectors, timeout_ms: int = 8_000
 ) -> bool:
     deadline = asyncio.get_running_loop().time() + timeout_ms / 1000
-    # 一些目录结构(如融合课)的"当前激活"标识挂在课时内部子节点上
-    # (例如 .chapter-item 内的 .chapter-content-second.current), 课时自身无 active class,
-    # 因此除了检查本节点 active_class, 还需回退检查内部是否命中 catalog.active。
-    has_active_descendant = bool(catalog.active)
     while asyncio.get_running_loop().time() < deadline:
-        if has_class(await lesson.get_attribute("class"), catalog.active_class):
+        if await lesson_is_active(lesson, catalog):
             return True
-        if has_active_descendant:
-            try:
-                if await lesson.locator(catalog.active).count() > 0:
-                    return True
-            except Exception:
-                has_active_descendant = False
         await asyncio.sleep(0.2)
     return False
+
+
+async def lesson_is_active(lesson: Locator, catalog: CatalogSelectors) -> bool:
+    return await lesson.evaluate(
+        """(el, config) => el.classList.contains(config.className) ||
+            Boolean(config.selector && el.querySelector(config.selector))""",
+        {"className": catalog.active_class, "selector": catalog.active},
+    )
+
+
+async def active_lesson(page: Page, catalog: CatalogSelectors):
+    # 用同一叶子节点集解析 active，避免章节内别的小课时被误认成当前课时。
+    rows = page.locator(catalog.item)
+    index = await rows.evaluate_all(
+        """(rows, config) => rows.findIndex(el =>
+            el.classList.contains(config.className) ||
+            Boolean(config.selector && el.querySelector(config.selector)))""",
+        {"className": catalog.active_class, "selector": catalog.active},
+    )
+    return rows.nth(index) if index >= 0 else None
+
+
+async def lesson_key(lesson: Locator, catalog: CatalogSelectors) -> str:
+    return await lesson.evaluate(
+        """(el, config) => {
+            const rows = Array.from(document.querySelectorAll(config.item));
+            const title = el.querySelector(config.title);
+            const identity = el.getAttribute('data-id') || el.id || '';
+            return JSON.stringify([rows.indexOf(el), identity,
+                (title ? title.textContent : '').trim().replace(/\\s+/g, ' ')]);
+        }""",
+        {"item": catalog.item, "title": catalog.title},
+    )
+
+
+class LessonChanged(Exception):
+    """用户或网站已切到别的课时；主循环应采用新课时，不能继续读旧进度。"""
+
+
+async def ensure_lesson_unchanged(page: Page, catalog: CatalogSelectors, key: str):
+    selected = await active_lesson(page, catalog)
+    if selected is not None and await lesson_key(selected, catalog) != key:
+        raise LessonChanged
+
+
+async def click_lesson(lesson: Locator, catalog: CatalogSelectors, timeout_ms: int):
+    target = lesson.locator(catalog.click_target).first if catalog.click_target else lesson
+    await target.click(timeout=timeout_ms)
+
+
+_LESSON_NUMBER = re.compile(r"^\s*(\d+(?:\.\d+)+)(?=[^\d.]|$)")
 
 
 async def get_lesson_title(
     page: Page, lesson: Locator, catalog: CatalogSelectors
 ) -> str:
-    scoped = lesson.locator(catalog.title).first
-    title_element = scoped if await scoped.count() else page.locator(catalog.title).first
+    # A missing label must not fall back to an unrelated title elsewhere on
+    # the page (for example, the first chapter or a course-summary row).
+    title_element = lesson.locator(catalog.title).first
+    title = ""
     if await title_element.count():
-        title = await title_element.get_attribute("title")
-        if title:
-            return title.strip()
-        text = await title_element.text_content()
-        if text:
-            return " ".join(text.split())
+        title = await title_element.get_attribute("title") or ""
+        if not title.strip():
+            title = await title_element.text_content() or ""
+        title = " ".join(title.split())
 
-    text = await lesson.text_content()
-    return " ".join((text or "当前课时").split())
+    if title and catalog.name != "fusion":
+        return title
+
+    row_text = " ".join((await lesson.text_content() or "").split())
+    if title:
+        # Fusion renders the lesson number separately from .item-name.
+        number = _LESSON_NUMBER.match(row_text)
+        if number and not _LESSON_NUMBER.match(title):
+            return f"{number.group(1)} {title}"
+        return title
+    return row_text or "当前课时"
