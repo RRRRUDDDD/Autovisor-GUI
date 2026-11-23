@@ -1,5 +1,7 @@
+import gzip
 import os
 import re
+import shutil
 import sys
 import threading
 import time
@@ -7,12 +9,57 @@ import traceback
 
 # 用于在记录日志来源时跳过日志系统自身的栈帧
 _LOGGER_FILE = os.path.basename(__file__)
-_LOG_FILE_PATTERN = re.compile(r"^Log(\d+)\.txt$", re.IGNORECASE)
+_LOG_FILE_PATTERN = re.compile(r"^Log(\d+)\.txt(?:\.gz)?$", re.IGNORECASE)
+_MB = 1024 * 1024
+_DAY = 86400
+
+_REDACT_RULES = (
+    (re.compile(r"sk-[A-Za-z0-9_-]{8,}"), "sk-***REDACTED***"),
+    (re.compile(r"AIza[0-9A-Za-z_-]{16,}"), "AIza***REDACTED***"),
+    (
+        re.compile(r"(?:xai|gsk)_[A-Za-z0-9_-]{12,}|xai-[A-Za-z0-9_-]{12,}"),
+        "***REDACTED***",
+    ),
+    (
+        re.compile(r"(?i)(authorization\s*:\s*)(?:bearer\s+)?\S+"),
+        r"\1***REDACTED***",
+    ),
+    (re.compile(r"(?im)^(\s*(?:set-cookie|cookie)\s*:\s*).+$"), r"\1***REDACTED***"),
+    (re.compile(r"(?i)((?:https?|socks5h?):\/\/)[^:\s/@]+:[^@\s/]+@"), r"\1***:***@"),
+    (re.compile(r"(?i)(https?:\/\/api\.day\.app\/)[^\s/?#]+"), r"\1***REDACTED***"),
+    (re.compile(r"(?i)(https?:\/\/sctapi\.ftqq\.com\/)[^\s/?#]+"), r"\1***REDACTED***"),
+    (re.compile(r"(?i)(https?:\/\/qmsg\.zendee\.cn\/send\/)[^\s/?#]+"), r"\1***REDACTED***"),
+    (re.compile(r"(?i)(https?:\/\/api\.telegram\.org\/bot)[^\s/?#]+"), r"\1***REDACTED***"),
+    (
+        re.compile(
+            r"(?i)((?:notification[_-]?url|tg[_-]?chat[_-]?id|chat[_-]?id|bark[_-]?url|"
+            r"pushplus[_-]?token|password|passwd|pwd|api[_-]?key|x-api-key|"
+            r"x-goog-api-key|token|cookie)\s*[:=]\s*)([^\s,;]+)"
+        ),
+        r"\1***REDACTED***",
+    ),
+    (
+        re.compile(r"(?i)([?&](?:token|key|apikey|api_key|access_token)=)([^&\s]+)"),
+        r"\1***REDACTED***",
+    ),
+    (re.compile(r"\b(1[3-9]\d)\d{4}(\d{4})\b"), r"\1****\2"),
+)
+
+
+def redact_sensitive(text) -> str:
+    """落盘前脱敏 API Key/Cookie/代理口令/推送地址等敏感信息."""
+    value = str(text or "")
+    for pattern, replacement in _REDACT_RULES:
+        value = pattern.sub(replacement, value)
+    return value
 
 
 # 单例模式日志器
 class Logger:
-    MAX_LOG_FILES = 50
+    MAX_LOG_FILES = 200
+    MAX_LOG_SIZE_MB = 10.0
+    LOG_RETENTION_DAYS = 14.0
+    LOG_COMPRESS_AFTER_DAYS = 3.0
     _instance = None
     _lock = threading.Lock()  # 线程安全锁
 
@@ -29,35 +76,124 @@ class Logger:
         os.makedirs(self.log_dir, exist_ok=True)
         if os.name != "nt":
             os.chmod(self.log_dir, 0o700)
-        self._write_lock = threading.Lock()
+        self._write_lock = threading.RLock()
         self._throttled = {}
         self._context = {}
         self._event_sink = None
         self.console_debug = False
         self.emit_debug = False
         self.filename = ""
+        self._maintain_logs()
         self._open_new_log_file()
+
+    def configure(
+        self,
+        *,
+        max_size_mb=None,
+        retention_days=None,
+        max_files=None,
+        compress_after_days=None,
+    ):
+        """应用 config.ini 的日志策略; 留空的参数保持安全默认值.
+
+        写入类属性而非实例属性, 保证测试或调用方显式覆盖 Logger.MAX_LOG_FILES
+        等常量时不会被此前加载的配置值遮蔽.
+        """
+        cls = type(self)
+        if max_size_mb is not None:
+            cls.MAX_LOG_SIZE_MB = max(0.0, float(max_size_mb))
+        if retention_days is not None:
+            cls.LOG_RETENTION_DAYS = max(0.0, float(retention_days))
+        if max_files is not None:
+            cls.MAX_LOG_FILES = max(1, int(max_files))
+        if compress_after_days is not None:
+            cls.LOG_COMPRESS_AFTER_DAYS = max(0.0, float(compress_after_days))
+
+    def configure_from_config(self, config) -> None:
+        """从 Config 实例读取日志配置 (缺失时沿用默认值)."""
+        self.configure(
+            max_size_mb=getattr(config, "log_max_size_mb", None),
+            retention_days=getattr(config, "log_retention_days", None),
+            max_files=getattr(config, "log_max_files", None),
+            compress_after_days=getattr(config, "log_compress_after_days", None),
+        )
+
+    def _log_entries(self) -> list[tuple[int, str]]:
+        try:
+            names = os.listdir(self.log_dir)
+        except OSError:
+            return []
+        entries = []
+        for name in names:
+            match = _LOG_FILE_PATTERN.match(name)
+            if not match:
+                continue
+            path = os.path.join(self.log_dir, name)
+            if os.path.isfile(path):
+                entries.append((int(match.group(1)), path))
+        return entries
+
+    @staticmethod
+    def _mtime(path: str) -> float:
+        try:
+            return os.path.getmtime(path)
+        except OSError:
+            return 0.0
+
+    @staticmethod
+    def _remove_quietly(path: str) -> None:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+    def _compress_log(self, path: str) -> bool:
+        gz_path = f"{path}.gz"
+        if os.path.exists(gz_path):
+            return False
+        try:
+            with open(path, "rb") as src, gzip.open(gz_path, "wb") as dst:
+                shutil.copyfileobj(src, dst)
+            os.remove(path)
+            return True
+        except OSError as exc:
+            self._remove_quietly(gz_path)
+            self.write_log(f"日志压缩失败(文件可能被占用): {path}: {exc}\n", level="WARN")
+            return False
+
+    def _maintain_logs(self, now: float | None = None) -> None:
+        """启动时维护: 压缩旧日志、清理超期日志, 失败只告警不中断."""
+        now = time.time() if now is None else now
+        compress_days = max(0.0, float(getattr(self, "LOG_COMPRESS_AFTER_DAYS", 0.0)))
+        retention_days = max(0.0, float(getattr(self, "LOG_RETENTION_DAYS", 0.0)))
+
+        if compress_days > 0:
+            for _, path in self._log_entries():
+                if path.lower().endswith(".gz") or path == self.filename:
+                    continue
+                if (now - self._mtime(path)) / _DAY >= compress_days:
+                    self._compress_log(path)
+
+        if retention_days > 0:
+            for _, path in self._log_entries():
+                if path == self.filename:
+                    continue
+                if (now - self._mtime(path)) / _DAY >= retention_days:
+                    self._remove_quietly(path)
 
     def _open_new_log_file(self):
         os.makedirs(self.log_dir, exist_ok=True)
         existing_logs = []
         max_index = 0
-        try:
-            entries = os.listdir(self.log_dir)
-        except OSError:
-            entries = []
-        for name in entries:
-            match = _LOG_FILE_PATTERN.match(name)
-            if match:
-                idx = int(match.group(1))
-                if idx > max_index:
-                    max_index = idx
-                full_path = os.path.join(self.log_dir, name)
-                if os.path.isfile(full_path):
-                    existing_logs.append((idx, full_path))
+        for idx, full_path in self._log_entries():
+            if idx > max_index:
+                max_index = idx
+            existing_logs.append((idx, full_path))
 
         new_index = max_index + 1
-        while os.path.exists(os.path.join(self.log_dir, f"Log{new_index}.txt")):
+        while os.path.exists(os.path.join(self.log_dir, f"Log{new_index}.txt")) or os.path.exists(
+            os.path.join(self.log_dir, f"Log{new_index}.txt.gz")
+        ):
             new_index += 1
         self.filename = os.path.join(self.log_dir, f"Log{new_index}.txt")
         with open(self.filename, "w", encoding="utf-8"):
@@ -65,25 +201,18 @@ class Logger:
         if os.name != "nt":
             os.chmod(self.filename, 0o600)
 
-        max_files = max(1, int(getattr(self, "MAX_LOG_FILES", 50)))
+        max_files = max(1, int(getattr(self, "MAX_LOG_FILES", 200)))
         if len(existing_logs) >= max_files:
             def _sort_key(item):
                 idx, path = item
-                try:
-                    mtime = os.path.getmtime(path)
-                except OSError:
-                    mtime = 0.0
-                return (mtime, idx)
+                return (self._mtime(path), idx)
 
             existing_logs.sort(key=_sort_key)
             excess = len(existing_logs) - (max_files - 1)
             for _, old_path in existing_logs[:excess]:
                 if old_path == self.filename:
                     continue
-                try:
-                    os.remove(old_path)
-                except OSError:
-                    pass
+                self._remove_quietly(old_path)
         return self.filename
 
     def start_new_run(self):
@@ -93,6 +222,7 @@ class Logger:
             self.log_dir = os.path.join(self.runtime_root, "logs")
             self._throttled.clear()
             self._context.clear()
+            self._maintain_logs()
             return self._open_new_log_file()
 
     def set_event_sink(self, sink):
@@ -153,10 +283,20 @@ class Logger:
             )
         else:
             record = f"[{self._timestamp()}] [{self._source_location()}] {msg}"
+        record = redact_sensitive(record)
         with self._write_lock:
+            if not self.filename:
+                return
             with open(self.filename, "a", encoding="utf-8") as f:
                 f.write(record)
                 f.flush()
+            try:
+                size = os.path.getsize(self.filename)
+            except OSError:
+                size = 0
+            max_bytes = float(getattr(self, "MAX_LOG_SIZE_MB", 0.0)) * _MB
+            if max_bytes > 0 and size >= max_bytes:
+                self._open_new_log_file()
 
     def log_exception(self, msg, exc=None, shift=False):
         """记录异常: 异常类型、详情、当前运行状态和完整堆栈。"""

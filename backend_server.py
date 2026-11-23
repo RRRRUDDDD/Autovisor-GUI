@@ -779,6 +779,7 @@ class TaskManager:
             for path in created_files:
                 logger.info(f"已生成默认配置文件: {path}", shift=True)
             config = Config(config_path, mirrors_path)
+            logger.configure_from_config(config)
             cfg_debug = bool(getattr(config, "enableDebugLog", False))
             with self._lock:
                 debug_enabled = cfg_debug or self._debug_log_enabled

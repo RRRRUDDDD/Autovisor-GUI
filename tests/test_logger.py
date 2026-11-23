@@ -1,10 +1,13 @@
+import gzip
 import os
 import re
 import tempfile
+import threading
+import time
 import unittest
 from unittest import mock
 
-from modules.logger import Logger
+from modules.logger import Logger, redact_sensitive
 
 
 class FakeClock:
@@ -247,6 +250,161 @@ class LogRotationTests(unittest.TestCase):
             Logger.MAX_LOG_FILES = orig_max
             logger.log_dir = orig_log_dir
             logger.filename = orig_filename
+
+
+class LogProductionTests(unittest.TestCase):
+    """Phase 1.5: 体积轮转、保留期清理、gzip 归档与脱敏。"""
+
+    ATTRS = (
+        "MAX_LOG_SIZE_MB",
+        "LOG_RETENTION_DAYS",
+        "LOG_COMPRESS_AFTER_DAYS",
+        "MAX_LOG_FILES",
+    )
+
+    def setUp(self):
+        self.logger = Logger()
+        self.saved = {
+            name: self.logger.__dict__[name]
+            for name in self.ATTRS
+            if name in self.logger.__dict__
+        }
+        self.added = set()
+        self.orig_dir = self.logger.log_dir
+        self.orig_filename = self.logger.filename
+        self._tmp = tempfile.TemporaryDirectory()
+        self.tmp = self._tmp.name
+        self.logger.log_dir = self.tmp
+        self.logger.filename = os.path.join(self.tmp, "Log1.txt")
+        with open(self.logger.filename, "w", encoding="utf-8"):
+            pass
+        self.addCleanup(self._restore)
+
+    def _restore(self):
+        for name in self.added:
+            self.logger.__dict__.pop(name, None)
+        self.logger.__dict__.update(self.saved)
+        self.logger.log_dir = self.orig_dir
+        self.logger.filename = self.orig_filename
+        self._tmp.cleanup()
+
+    def _set(self, name, value):
+        if name not in self.logger.__dict__:
+            self.added.add(name)
+        setattr(self.logger, name, value)
+
+    def _files(self):
+        return sorted(os.listdir(self.tmp))
+
+    def test_write_beyond_size_limit_switches_to_next_log_file(self):
+        self._set("MAX_LOG_SIZE_MB", 0.0005)  # ~524 bytes
+        self._set("MAX_LOG_FILES", 50)
+        for index in range(30):
+            self.logger.write_log(f"测试轮转第{index}行 " + "x" * 80 + "\n")
+        files = self._files()
+        self.assertGreaterEqual(len(files), 2)
+        self.assertNotEqual(os.path.basename(self.logger.filename), "Log1.txt")
+        self.assertTrue(os.path.isfile(self.logger.filename))
+
+    def test_maintain_removes_logs_older_than_retention(self):
+        self._set("LOG_RETENTION_DAYS", 14.0)
+        self._set("LOG_COMPRESS_AFTER_DAYS", 0.0)
+        old = os.path.join(self.tmp, "Log1.txt")
+        recent = os.path.join(self.tmp, "Log2.txt")
+        with open(old, "w", encoding="utf-8") as file:
+            file.write("old")
+        with open(recent, "w", encoding="utf-8") as file:
+            file.write("recent")
+        now = time.time()
+        os.utime(old, (now - 20 * 86400, now - 20 * 86400))
+        os.utime(recent, (now - 3600, now - 3600))
+        self.logger.filename = os.path.join(self.tmp, "Log3.txt")
+        with open(self.logger.filename, "w", encoding="utf-8"):
+            pass
+
+        self.logger._maintain_logs()
+
+        files = self._files()
+        self.assertNotIn("Log1.txt", files)
+        self.assertIn("Log2.txt", files)
+        self.assertIn("Log3.txt", files)
+
+    def test_maintain_compresses_old_logs_with_matching_content(self):
+        self._set("LOG_RETENTION_DAYS", 14.0)
+        self._set("LOG_COMPRESS_AFTER_DAYS", 3.0)
+        old = os.path.join(self.tmp, "Log1.txt")
+        with open(old, "w", encoding="utf-8") as file:
+            file.write("需要归档的内容")
+        now = time.time()
+        os.utime(old, (now - 5 * 86400, now - 5 * 86400))
+        recent = os.path.join(self.tmp, "Log2.txt")
+        with open(recent, "w", encoding="utf-8") as file:
+            file.write("keep")
+        self.logger.filename = os.path.join(self.tmp, "Log3.txt")
+        with open(self.logger.filename, "w", encoding="utf-8"):
+            pass
+
+        self.logger._maintain_logs()
+
+        files = self._files()
+        self.assertNotIn("Log1.txt", files)
+        self.assertIn("Log1.txt.gz", files)
+        with gzip.open(os.path.join(self.tmp, "Log1.txt.gz"), "rt", encoding="utf-8") as file:
+            self.assertEqual(file.read(), "需要归档的内容")
+        self.assertIn("Log2.txt", files)
+
+    def test_redaction_covers_keys_cookies_proxy_and_url_query(self):
+        self.logger.write_log("Authorization: Bearer sk-abcdefgh12345678\n")
+        self.logger.write_log("Cookie: CASTGC=abc; CASLOGC=def\n")
+        self.logger.write_log("https://api.day.app/secret-key/通知\n")
+        self.logger.write_log("代理 http://user:pass@127.0.0.1:7890\n")
+        self.logger.event(
+            "配置",
+            api_key="sk-1234567890abcdef",
+            url="https://example.com/x?token=secret-token&key=secret-key",
+        )
+        with open(self.logger.filename, encoding="utf-8") as file:
+            text = file.read()
+        for secret in (
+            "sk-abcdefgh12345678",
+            "CASTGC=abc",
+            "secret-key",
+            "user:pass@",
+            "secret-token",
+            "sk-1234567890abcdef",
+        ):
+            self.assertNotIn(secret, text)
+        self.assertIn("REDACTED", text)
+
+    def test_redact_sensitive_helper_masks_provider_keys(self):
+        text = redact_sensitive(
+            "AIzaSyD-1234567890abcdefg gsk_123456789012 xai-123456789012"
+        )
+        self.assertNotIn("AIzaSyD-1234567890abcdefg", text)
+        self.assertNotIn("gsk_123456789012", text)
+        self.assertNotIn("xai-123456789012", text)
+
+    def test_concurrent_writes_do_not_lose_lines(self):
+        self._set("MAX_LOG_SIZE_MB", 0.0)
+        total = 0
+        lines_per_thread = 50
+        workers = 8
+
+        def writer(index):
+            for line in range(lines_per_thread):
+                self.logger.write_log(f"线程{index} 行{line}\n")
+
+        threads = [threading.Thread(target=writer, args=(i,)) for i in range(workers)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+
+        with open(self.logger.filename, encoding="utf-8") as file:
+            content = file.read().splitlines()
+        total = workers * lines_per_thread
+        self.assertEqual(len(content), total)
+        self.assertEqual(len(set(content)), total)
 
 
 if __name__ == "__main__":

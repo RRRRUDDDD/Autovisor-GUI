@@ -873,6 +873,7 @@ def cli() -> int:
             logger.warn("配置文件为默认模板, 请填写课程链接([course-url])后重新运行.", shift=True)
             return 0
         config = Config(config_path, mirrors_path)
+        logger.configure_from_config(config)
         config.apply_cli_overrides(args)
         notifier = Notifier.from_config(config, logger=logger)
         updater.check_for_update(logger, proxy=config.proxy)

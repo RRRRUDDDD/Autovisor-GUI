@@ -58,6 +58,11 @@ class Config:
             self.enableHideWindow = self.get_bool_field('script-option', 'enableHideWindow', fallback=True)
             self.shutdownOnComplete = self.get_bool_field('script-option', 'shutdownOnComplete', fallback=False)
             self.enableDebugLog = self.get_bool_field('script-option', 'enableDebugLog', fallback=False)
+            # 日志生产化选项(体积轮转/保留期/文件数/压缩归档)
+            self.log_max_size_mb = self._safe_get_float('script-option', 'log_max_size_mb', 10.0)
+            self.log_retention_days = self._safe_get_float('script-option', 'log_retention_days', 14.0)
+            self.log_max_files = int(self._safe_get_float('script-option', 'log_max_files', 200.0))
+            self.log_compress_after_days = self._safe_get_float('script-option', 'log_compress_after_days', 3.0)
             # 远程消息推送选项(可选配置段；未显式配置时默认启用 Windows 系统通知)
             has_provider_option = self._config.has_option('notification', 'provider')
             raw_provider = self._config.get('notification', 'provider', raw=True, fallback='').strip()
@@ -292,6 +297,14 @@ enableAutoCaptcha = True
 enableHideWindow = True
 ;刷课任务完成后自动关机(默认:False, 仅正常完成或达到课程时限时倒计时60秒关机, 手动停止/出错不关机)
 shutdownOnComplete = False
+;单份日志体积上限/MB, 超限自动切换到下一个日志文件 (默认:10)
+log_max_size_mb = 10
+;日志保留天数, 启动时清理超期文件 (默认:14, 0=不按天清理)
+log_retention_days = 14
+;日志文件数上限(含 .txt.gz), 超出后从旧到新删除 (默认:200)
+log_max_files = 200
+;超过该天数的日志启动时 gzip 压缩归档 (默认:3, 0=不压缩)
+log_compress_after_days = 3
 
 [notification]
 ;通知服务商（默认:Windows，留空表示禁用通知）。可选值:
