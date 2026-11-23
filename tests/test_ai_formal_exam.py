@@ -486,5 +486,18 @@ class FormalExamAliasTests(unittest.TestCase):
         self.assertFalse(issubclass(AiHomeworkCtx, AiFormalExamCtx))
 
 
+class FormalExamInjectionTests(unittest.TestCase):
+    def test_from_task_injects_question_bank(self):
+        api = FakeFormalApi([], {})
+        bank = object()
+        ctx = AiFormalExamCtx.from_task(
+            api,
+            {"courseId": "c1", "examTestId": "e1", "examPaperId": "p1"},
+            question_bank=bank,
+        )
+        self.assertIs(ctx.question_bank, bank)
+        self.assertTrue(ctx._question_bank_ready)
+
+
 if __name__ == "__main__":
     unittest.main()

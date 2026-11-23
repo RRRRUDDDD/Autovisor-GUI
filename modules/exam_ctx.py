@@ -1132,6 +1132,7 @@ class AiFormalExamCtx(AiExamBase):
         student_id="",
         save_nums: int = 5,
         auto_submit: bool = False,
+        question_bank=None,
     ):
         super().__init__(
             api,
@@ -1141,6 +1142,7 @@ class AiFormalExamCtx(AiExamBase):
             exam_paper_id,
             op_extra,
             answer_bank,
+            question_bank,
         )
         self.class_id = class_id or ""
         self.task_id = task_id or ""
@@ -1161,6 +1163,7 @@ class AiFormalExamCtx(AiExamBase):
         auto_submit: bool = False,
         op_extra: dict | None = None,
         answer_bank: AnswerBank | None = None,
+        question_bank=None,
     ) -> "AiFormalExamCtx":
         def pick(*keys):
             for key in keys:
@@ -1182,6 +1185,7 @@ class AiFormalExamCtx(AiExamBase):
             student_id=pick("studentId", "userId"),
             save_nums=save_nums,
             auto_submit=auto_submit,
+            question_bank=question_bank,
         )
 
     def start(

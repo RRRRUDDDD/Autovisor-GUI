@@ -16,6 +16,7 @@ from modules.zhidao_homework_api import (
     QUESTION_TYPE_NAMES,
     correct_option_ids,
     extract_exam_questions,
+    extract_homework_list,
     extract_score,
     format_student_answer,
 )
@@ -761,6 +762,57 @@ class ZhidaoHomeworkWorker:
                     ai_analysis=text,
                     auto_clear_wrong=False,
                 )
+
+    # ------------------------------------------------------------------- scan
+    def scan(
+        self,
+        flag: int = 1,
+        *,
+        page_size: int = 100,
+        max_pages: int = 20,
+    ) -> list[dict]:
+        """分页拉取作业列表, flag=1 未提交, flag=2 已提交未达标."""
+        items: list[dict] = []
+        seen: set[tuple[str, str]] = set()
+        page_num = 0
+        for _ in range(max_pages):
+            payload = self.api.get_student_homework(
+                recruit_id=self._recruit_id,
+                course_id=self.course_id,
+                flag=flag,
+                page_size=page_size,
+                page_num=page_num,
+            )
+            page = extract_homework_list(payload)
+            for item in page["items"]:
+                key = (item.get("studentExamId", ""), item.get("examId", ""))
+                if key in seen:
+                    continue
+                seen.add(key)
+                items.append(item)
+            next_page = page.get("next")
+            if next_page is None or next_page <= page_num:
+                break
+            page_num = next_page
+        return items
+
+    def run_pending(self, *, course_id="", school_id="", flag: int = 1) -> list[dict]:
+        """扫描指定状态的作业并逐份作答, 返回每份作业的统计."""
+        results = []
+        for item in self.scan(flag=flag):
+            exam_id = item.get("examId", "")
+            stats = self.run(
+                recruit_id=item.get("recruitId") or self._recruit_id,
+                course_id=item.get("courseId") or course_id or self.course_id,
+                homework_id=exam_id,
+                stu_exam_id=item.get("studentExamId", ""),
+                exam_id=exam_id,
+                school_id=(item.get("raw") or {}).get("schoolId") or school_id,
+            )
+            stats["homework_id"] = exam_id
+            stats["exam_name"] = item.get("examName", "")
+            results.append(stats)
+        return results
 
     # ------------------------------------------------------------------- run
     def run(

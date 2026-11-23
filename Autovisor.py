@@ -17,7 +17,7 @@ configure_stdio()
 from playwright.async_api import BrowserContext, Page, Playwright, TimeoutError, async_playwright
 from playwright._impl._errors import TargetClosedError
 
-from modules import installer, quiz_page, updater
+from modules import homework, installer, quiz_page, updater
 from modules.ai_smart import (
     complete_resources_for_node,
     is_ai_smart_url,
@@ -44,7 +44,7 @@ from modules.course_runner import (
     run_course,
 )
 from modules.diagnostics import check_browser, check_course
-from modules.exam_ctx import ExamApi, ExamRunner
+from modules.exam_ctx import AiFormalExamCtx, ExamApi, ExamRunner
 from modules.http_utils import build_playwright_proxy
 from modules.login import (
     describe_login_error,
@@ -63,6 +63,14 @@ from modules.tasks import (
     task_monitor,
     video_optimize,
     wait_for_verify,
+)
+from modules.url_router import (
+    KIND_EXAM,
+    KIND_HOMEWORK,
+    KIND_KNOWLEDGE_STUDY,
+    KIND_LEARN_PAGE,
+    KIND_TEST_DETAIL,
+    parse_url,
 )
 from modules.utils import (
     clear_cookies,
@@ -388,7 +396,194 @@ async def run_exam_stage(page: Page, course_url: str, config, logger) -> dict:
         跳过=len(summary.get("skipped") or []),
         未完成=len(summary.get("failed") or []),
     )
+    if getattr(config, "enableFormalExamApi", True):
+        auto_submit = bool(quiz_page.llm.conf().get("auto_submit", False))
+        try:
+            formal = await asyncio.to_thread(
+                run_formal_exam_tasks,
+                api,
+                payload.get("courseId", ""),
+                payload.get("classId", ""),
+                auto_submit,
+                logger,
+            )
+        except Exception as exc:
+            logger.log_exception("综合考试扫描失败.", exc)
+        else:
+            summary["formal_exams"] = formal
+            if formal.get("found"):
+                logger.event(
+                    "综合考试汇总",
+                    任务=formal["found"],
+                    完成=formal["done"],
+                    失败=formal["failed"],
+                )
     return summary
+
+
+def run_formal_exam_tasks(
+    api: ExamApi,
+    course_id,
+    class_id,
+    auto_submit: bool,
+    logger,
+) -> dict:
+    """扫描 AI 智慧课综合/单元测试任务并逐个执行 (在线程中调用)."""
+    probe = AiFormalExamCtx.from_task(
+        api,
+        {"courseId": course_id, "classId": class_id},
+        auto_submit=auto_submit,
+    )
+    tasks = probe.scan_pending_tasks()
+    summary = {"found": len(tasks), "done": 0, "failed": 0, "details": []}
+    for task in tasks:
+        task = dict(task)
+        if not task.get("courseId"):
+            task["courseId"] = course_id
+        if class_id and not task.get("classId"):
+            task["classId"] = class_id
+        name = (
+            task.get("taskName")
+            or task.get("examName")
+            or task.get("name")
+            or str(task.get("examTestId") or "")
+        )
+        ctx = AiFormalExamCtx.from_task(api, task, auto_submit=auto_submit)
+        try:
+            success, answered, total = ctx.start(submit=auto_submit)
+        except Exception as exc:
+            summary["failed"] += 1
+            summary["details"].append({"name": name, "error": str(exc)})
+            logger.log_exception(f"综合考试「{name}」执行失败.", exc)
+            continue
+        if success:
+            summary["done"] += 1
+        else:
+            summary["failed"] += 1
+        summary["details"].append(
+            {
+                "name": name,
+                "success": success,
+                "answered": answered,
+                "total": total,
+            }
+        )
+    return summary
+
+
+async def build_page_exam_api(page: Page, config) -> ExamApi:
+    cookies = await page.context.cookies()
+    try:
+        user_agent = await page.evaluate("navigator.userAgent")
+    except Exception:
+        user_agent = ""
+    return ExamApi(
+        cookies,
+        proxy=getattr(config, "proxy", ""),
+        user_agent=user_agent,
+    )
+
+
+async def run_formal_exam_route(page: Page, parsed: dict, config, logger) -> dict:
+    """testDetail 链接: 直接按综合考试接口作答."""
+    api = await build_page_exam_api(page, config)
+    auto_submit = bool(quiz_page.llm.conf().get("auto_submit", False))
+    task = {
+        "courseId": parsed.get("courseId", ""),
+        "classId": parsed.get("classId", ""),
+        "examTestId": parsed.get("examTestId", ""),
+        "examPaperId": parsed.get("examPaperId", ""),
+    }
+    logger.info(f"检测到综合考试链接, 开始接口作答 (自动交卷={auto_submit}) ...")
+    logger.event("综合考试", 状态="开始", 自动交卷=auto_submit)
+    ctx = AiFormalExamCtx.from_task(api, task, auto_submit=auto_submit)
+    success, answered, total = await asyncio.to_thread(ctx.start, submit=auto_submit)
+    logger.event("综合考试", 状态="结束", 成功=success, 作答=answered, 总数=total)
+    return {"success": success, "answered": answered, "total": total}
+
+
+async def run_learn_page_route(
+    page: Page, parsed: dict, config, logger, playback_enabled
+) -> dict:
+    """learnPage 单知识点链接: 先补资源, 再只对该节点跑接口考试."""
+    course_id = str(parsed.get("courseId", ""))
+    node_uid = str(parsed.get("nodeUid", ""))
+    class_id = str(parsed.get("classId", ""))
+    if not course_id or not node_uid or not class_id:
+        logger.warn("learnPage 链接缺少 courseId/nodeUid/classId, 已跳过.")
+        return {}
+    learn_url = build_learn_url(course_id, node_uid, class_id)
+    if not getattr(config, "reviewMode", False):
+        result = await complete_resources_for_node(
+            page, learn_url, config, logger, playback_enabled, time.monotonic()
+        )
+        logger.event(
+            "资源补齐",
+            知识点=node_uid,
+            补齐=result.get("done"),
+            已完成=result.get("skipped"),
+            失败=result.get("failed"),
+        )
+    if not getattr(config, "enableExamApi", True):
+        return {}
+    api = await build_page_exam_api(page, config)
+    limit = getattr(config, "limitMaxTime", 0) or 0
+    deadline = time.monotonic() + limit * 60 if limit > 0 else None
+    runner = ExamRunner(
+        course_id,
+        class_id,
+        api,
+        target=int(config.masteryTarget),
+        enable_ppt=getattr(config, "enablePptReference", True),
+    )
+    node = {"nodeUid": node_uid, "name": f"知识点 {node_uid}"}
+    summary = await asyncio.to_thread(runner.run, [node], deadline)
+    logger.event(
+        "接口考试汇总",
+        达标=len(summary.get("done") or []),
+        跳过=len(summary.get("skipped") or []),
+        未完成=len(summary.get("failed") or []),
+    )
+    return summary
+
+
+_DIRECT_TASK_KINDS = (
+    KIND_HOMEWORK,
+    KIND_EXAM,
+    KIND_TEST_DETAIL,
+    KIND_LEARN_PAGE,
+)
+
+
+def course_route(parsed: dict, course_url: str) -> str:
+    """决定课程 URL 走精准任务路由 / ai-smart 全课流程 / 常规目录."""
+    kind = (parsed or {}).get("kind", "")
+    if kind in _DIRECT_TASK_KINDS:
+        return "task"
+    if kind == KIND_KNOWLEDGE_STUDY or is_ai_smart_url(course_url):
+        return "ai_smart"
+    return "catalog"
+
+
+async def run_task_url(
+    page: Page, course_url: str, parsed: dict, config, logger, playback_enabled
+) -> dict:
+    """执行 dohomework/doexam/testDetail/learnPage 链接对应的任务."""
+    kind = parsed.get("kind", "")
+    if kind in (KIND_HOMEWORK, KIND_EXAM):
+        stats = await homework.auto_answer_homework(page, config=config)
+        logger.event(
+            "任务链接",
+            类型=kind,
+            作答=stats.get("answered"),
+            已交卷=stats.get("submitted"),
+        )
+        return stats
+    if kind == KIND_TEST_DETAIL:
+        return await run_formal_exam_route(page, parsed, config, logger)
+    return await run_learn_page_route(
+        page, parsed, config, logger, playback_enabled
+    )
 
 
 async def run_mastery_stage(page: Page, course_url: str, config, logger) -> dict:
@@ -605,7 +800,26 @@ async def main(config) -> bool:
                         logger.warn("播放页加载较慢，继续等待目录渲染...", shift=True)
                     await page.wait_for_timeout(2000)
 
-                if is_ai_smart_url(course_url):
+                parsed = parse_url(course_url)
+                route = course_route(parsed, course_url)
+                if route == "task":
+                    kind = parsed.get("kind", "")
+                    logger.info(f"检测到 {kind} 任务链接, 走精准路由.")
+                    logger.event("任务链接", 类型=kind, 地址=course_url)
+                    await persist_login_cookies(context)
+                    playback_enabled.clear()
+                    try:
+                        await run_task_url(
+                            page, course_url, parsed, config, logger, playback_enabled
+                        )
+                    except Exception as exc:
+                        logger.log_exception("任务链接处理失败.", exc)
+                        run_ok = False
+                        all_courses_complete = False
+                        break
+                    continue
+
+                if route == "ai_smart":
                     logger.info("检测到 ai-smart 新形态课程.")
                     logger.context(目录类型="ai-smart")
                     logger.event("课程目录", 类型="ai-smart", 地址=page.url)

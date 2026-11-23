@@ -2,7 +2,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from modules.answer_store import AiQuestionStore
 from modules.zhidao_homework_worker import (
@@ -525,6 +525,118 @@ class PromptAndParseTests(unittest.TestCase):
         )
         with_image_option = _normalized("q", 1, "题", [(1, '<img src="https://x/a.jpg">')])
         self.assertTrue(question_has_image(with_image_option))
+
+
+class FakeHomeworkListApi:
+    def __init__(self, pages):
+        self.pages = pages
+        self.calls = []
+
+    def get_student_homework(self, **kwargs):
+        self.calls.append(kwargs)
+        page = int(kwargs.get("page_num") or 0)
+        return self.pages.get(page, {"rt": {"studentHomeworkList": [], "next": -1}})
+
+
+class HomeworkScanTests(unittest.TestCase):
+    def setUp(self):
+        patcher = patch("modules.zhidao_homework_worker.logger", _QuietLogger())
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        root = Path(self.tmp.name)
+        self.store = AiQuestionStore(
+            db_path=root / "bank.db", data_root=root, migrate=False
+        )
+
+    def _worker(self, api):
+        worker = ZhidaoHomeworkWorker(
+            api,
+            course_id="C1",
+            store=self.store,
+            answerer=lambda _prompt: "",
+            sleep=lambda _seconds: None,
+        )
+        worker._recruit_id = "R1"
+        return worker
+
+    def test_scan_pages_follows_next_and_dedupes(self):
+        api = FakeHomeworkListApi(
+            {
+                0: {
+                    "rt": {
+                        "studentHomeworkList": [
+                            {
+                                "id": "S1",
+                                "examId": "E1",
+                                "recruitId": "R1",
+                                "courseId": "C1",
+                                "examName": "作业一",
+                            }
+                        ],
+                        "next": 2,
+                    }
+                },
+                2: {
+                    "rt": {
+                        "studentHomeworkList": [
+                            {"id": "S1", "examId": "E1"},
+                            {
+                                "id": "S2",
+                                "examId": "E2",
+                                "recruitId": "R1",
+                                "courseId": "C1",
+                                "examName": "作业二",
+                            },
+                        ],
+                        "next": -1,
+                    }
+                },
+            }
+        )
+        worker = self._worker(api)
+        items = worker.scan(flag=1)
+        self.assertEqual([item["examId"] for item in items], ["E1", "E2"])
+        self.assertEqual(api.calls[0]["flag"], 1)
+        self.assertEqual(api.calls[0]["page_size"], 100)
+        self.assertEqual(api.calls[0]["page_num"], 0)
+        self.assertEqual(api.calls[1]["page_num"], 2)
+        self.assertEqual(api.calls[0]["recruit_id"], "R1")
+
+    def test_run_pending_passes_item_ids_and_course(self):
+        api = FakeHomeworkListApi(
+            {
+                0: {
+                    "rt": {
+                        "studentHomeworkList": [
+                            {
+                                "id": "S1",
+                                "examId": "E1",
+                                "recruitId": "R1",
+                                "courseId": "C9",
+                                "examName": "作业",
+                                "schoolId": "SCH9",
+                            }
+                        ],
+                        "next": -1,
+                    }
+                }
+            }
+        )
+        worker = self._worker(api)
+        worker.run = MagicMock(return_value={"answered": 2, "submitted": True})
+        results = worker.run_pending(course_id="C1", school_id="SCH")
+        worker.run.assert_called_once_with(
+            recruit_id="R1",
+            course_id="C9",
+            homework_id="E1",
+            stu_exam_id="S1",
+            exam_id="E1",
+            school_id="SCH9",
+        )
+        self.assertEqual(results[0]["homework_id"], "E1")
+        self.assertEqual(results[0]["exam_name"], "作业")
 
 
 if __name__ == "__main__":
