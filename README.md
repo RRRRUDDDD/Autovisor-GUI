@@ -1,223 +1,376 @@
-##  Autovisor
+<div align="center">
 
-**Github项目主页：**[CXRunfree/Autovisor](https://github.com/CXRunfree/Autovisor)
+<img src="gui/public/logo.svg" width="96" alt="Autovisor GUI">
 
-------
-#### 2026/9/15 公告
+# Autovisor GUI
 
-感谢大家三年多以来的喜爱与支持~
+**知到 · 智慧树自动化学习助手**
 
-准备读研, 本项目佛系更新
+一个开箱即用的桌面客户端：登录账号 → 自动识别课程 → 一键开始，学习进度、日志与提醒全部可视化。
 
-#### 2026/10/21 更新
+[![Release](https://img.shields.io/badge/release-v1.0.0-2563eb)](https://github.com/RRRRUDDDD/Autovisor-GUI/releases)
+[![Tauri](https://img.shields.io/badge/Tauri-2-24C8DB?logo=tauri&logoColor=white)](https://tauri.app)
+[![React](https://img.shields.io/badge/React-18-61DAFB?logo=react&logoColor=black)](https://react.dev)
+[![Rust](https://img.shields.io/badge/Rust-stable-000000?logo=rust)](https://www.rust-lang.org)
+[![Python](https://img.shields.io/badge/Python-3.10~3.13-3776AB?logo=python&logoColor=white)](pyproject.toml)
+[![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 
-- 适配智慧树 AI 慕课 (`wisdom-mooc.zhihuishu.com`): 识别课程目录、展开折叠章节、跳过测试入口、自动提交 AI 随堂练习, 并避开页面上的数字人视频.
+[下载](https://github.com/RRRRUDDDD/Autovisor-GUI/releases) · [使用指南](#使用指南) · [本地开发](#本地开发) · [常见问题](#常见问题) · [反馈](https://github.com/RRRRUDDDD/Autovisor-GUI/issues)
 
-#### 2026/9/24 Autovisor-3.18.4 更新
+</div>
 
-**本次更新:**
+---
 
-- 新增融合共享课支持: 自动跳过 AI 随堂练习弹窗、展开折叠目录、关闭弹窗后恢复播放, 并读取课时真实学习进度 ([#158](https://github.com/CXRunfree/Autovisor/pull/158)).
+## 目录
 
-**近期更新:**
+- [功能概览](#功能概览)
+- [下载与安装](#下载与安装)
+- [使用指南](#使用指南)
+- [学习参数](#学习参数)
+- [大模型智能答题](#大模型智能答题)
+- [消息推送](#消息推送)
+- [数据与隐私](#数据与隐私)
+- [技术架构](#技术架构)
+- [本地开发](#本地开发)
+- [命令行模式](#命令行模式)
+- [常见问题](#常见问题)
+- [致谢](#致谢)
+- [许可证与声明](#许可证与声明)
 
-- 修复课程页卡死: 已读的"学前必读"弹窗是隐藏节点, 等它可见会一直等下去, 现在超时即跳过 ([#155](https://github.com/CXRunfree/Autovisor/pull/155)).
-- 课时切换、目录识别的等待也加上超时, 异常页面不再长时间卡住.
-- 支持 Python 3.13.
+## 功能概览
 
-------
-#### 一、程序介绍
+应用由四个主要页面组成：
 
-**项目简介:**
+| 页面 | 能做什么 |
+| --- | --- |
+| **登录** | 手机号 / 学号（支持高校库检索）/ 应用内扫码登录；已保存凭证自动恢复登录；登录前可配置网络代理 |
+| **自动学习** | 登录后自动识别账号下全部在学课程；搜索、勾选、排序课程队列；多行批量粘贴补充链接；配置倍速、时长、复习模式等参数后一键开始 |
+| **运行监控** | 实时显示当前课程 / 课时、播放进度、运行耗时、已完成课时；需人工处理时醒目提示；执行日志支持级别筛选、搜索、复制（自动遮盖敏感信息） |
+| **系统设置** | 大模型答题、消息推送、浏览器与代理、Cookie 与自动重登凭证、历史日志、完成后关机、窗口关闭行为、版本更新、引擎重启 |
 
-这是一个可无人监督的自动化程序, 基于微软的 Playwright 框架, 由 Python 和 JavaScript 编写而成. 核心原理是使用浏览器模拟用户操作.
+**支持的课程类型：** 智慧共享课 · 翻转课 · 融合共享课 · AI 慕课（wisdom-mooc）· AI 智慧课（视频 + 知识点掌握度）
 
-**程序功能:**
+**其他特性：**
 
-- **支持自动登录**
-- **自动通过登录滑块、课中点选验证(可选)**
-- **自动播放和切换下一集**
-- **自动跳过弹窗和弹题**
-- **自动静音、设置指定倍速**
-- **自动检测暂停并自动续播**
-- **支持智慧共享课、翻转课、融合共享课、AI慕课 (wisdom-mooc)、AI 新形态课程 (ai-smart)**
-- **支持刷习惯分**
-- **支持隐藏窗口后台刷课**
-- 启动时自动检查更新
-- 后台实时更新学习进度
-- macOS / Linux 支持源码运行
-- 根据当前时间自动设置背景色(白天/夜晚)
-- 完成章节时提示已刷课时长
-- 各种自定义配置
+- 🔍 自动识别本机 Edge / Chrome / Brave / Vivaldi / 360 / QQ 浏览器 / Chromium，无需手动配置路径
+- 🧩 自动处理登录滑块与课中点选验证，遇到无法自动处理的安全验证时将浏览器前置并推送提醒
+- 🙈 隐藏浏览器窗口后台学习，不影响日常使用电脑
+- 🤖 可选接入大模型辅助答题，兼容 OpenAI / Claude / Gemini / Azure / Ollama 及国内主流模型
+- 🔔 Windows 系统通知 / Server 酱 / Qmsg 酱 / Bark / Telegram 推送
+- ⏻ 任务完成后可自动关机（60 秒倒计时，可随时取消）
+- 🌗 浅色 / 深色主题，响应式布局（窄屏自动切换为底部导航）
+- 🪟 单实例运行，可最小化到系统托盘
+- ⬆️ 自动检查 GitHub 新版本并提示下载
 
-#### 二、发行版运行
+## 下载与安装
 
-1. 请确保系统为 Windows 10 及以上.
+### 系统要求
 
-2. 发行版文件夹内自带 **config.ini** (可能没显示 `.ini` 后缀名), 使用 **文本编辑器** 打开.
+- Windows 10 / 11（x64）
+- 已安装任意 Chromium 内核浏览器（推荐 Edge 或 Chrome）
+- WebView2 运行时（Windows 11 自带；安装版缺失时会自动静默安装）
 
-3. 根据文件内的注释, 填写配置文件:
+### 获取程序
 
-   - 默认启动系统自带的 Edge 浏览器;
-   - 文件里的 **EXE_PATH 项** 用于自定义浏览器路径, 需要精确到**浏览器可执行文件的位置**, 可以保持默认不填;
-   - 不知道浏览器的安装路径? 见下方 **六、常见问题**.
-   - 确认 **保存修改** 后再退出.
+前往 [Releases](https://github.com/RRRRUDDDD/Autovisor-GUI/releases) 下载以下任意一种：
 
-   <p align="left"><img src="resources/markdown/config_detail.png" width="600" alt="config.ini 配置说明"></p>
+| 发行形式 | 文件 | 说明 |
+| --- | --- | --- |
+| **安装版**（推荐） | `Autovisor-GUI-Setup-<版本>-windows-x64.exe` | 标准安装向导，创建开始菜单快捷方式，可正常卸载 |
+| **便携版** | `Autovisor-GUI-<版本>-windows-amd64` | 解压后双击 `Autovisor GUI.exe` 即用，所有数据保存在程序目录中，适合 U 盘携带 |
 
-4. 注意事项
+### 数据目录
 
-   - **`config.ini` 配置项不需要加引号.**
+| 发行形式 | 配置、Cookie、日志的存放位置 |
+| --- | --- |
+| 安装版 | `%APPDATA%\com.autovisor.gui\userdata\` |
+| 便携版 | 程序目录下的 `userdata\` |
 
-   - **如果需要修改下载镜像源, 请编辑 `data/mirrors.json`**
+可在「系统设置 → 运行环境与版本」中一键打开数据目录。
 
-5. 运行 **Autovisor.exe**, 会自动打开浏览器, 进入网课界面后就能自动刷课了!
+## 使用指南
 
-   (如果未设置 **enableAutoCaptcha=True**, 则需要**手动完成**登录滑块或课中点选验证)
-
-**发行版目录说明:**
-
-- `resources/`: 图片、脚本等程序资源.
-- `packages/`: 自动下载的 NumPy、OpenCV 等运行时依赖.
-- `data/`: 登录 Cookies 和镜像源配置.
-
-#### 三、macOS 源码运行
-
-需要 macOS 11 (Big Sur) 及以上 (Apple Silicon / Intel 均可) 和系统 Chrome浏览器. 先复制模板并填写配置:
-
-```bash
-cp config.macos.ini.example config.macos.ini
+```mermaid
+flowchart LR
+    A["登录账号"] --> B["自动识别课程"]
+    B --> C["勾选课程 / 调整参数"]
+    C --> D["开始刷课"]
+    D --> E["运行监控"]
+    E -->|"需要验证"| F["处理浏览器中的验证"]
+    F --> E
+    E -->|"全部完成"| G["推送通知 / 可选关机"]
 ```
 
-打开 `config.macos.ini`, 填入课程链接 (账号密码可留空, 用浏览器手动登录), 然后运行:
+**1. 登录**
 
-```bash
-./run_macos.sh
+启动后选择登录方式：
+
+- **手机号登录**：输入绑定手机号与密码；
+- **学号登录**：输入学校名称关键字检索并选择学校，再输入学号与密码；
+- **扫码登录**：应用内直接显示二维码，用知到 App 扫码确认即可（也可保存二维码图片，或改用浏览器扫码）。
+
+勾选「记住账号密码」后，挂机中途登录失效时会自动重新登录。下次启动若本地凭证仍有效，会自动跳过登录。
+
+**2. 选择课程**
+
+登录成功后，程序会自动拉取你的在学课程并填入课程队列。你可以：
+
+- 勾选 / 取消要学习的课程，调整学习顺序；
+- 点击「刷新课程」重新同步；
+- 在「手动补充链接」中粘贴课程播放页地址（支持多行批量粘贴，自动去重）；
+- 对单门课程执行「只读检测」，确认目录能否被正确识别。
+
+**3. 开始学习**
+
+在右侧调整 [学习参数](#学习参数)，点击 **开始刷课**（复习模式下为 **开始复习刷分**）。配置修改会自动保存。
+
+**4. 运行监控**
+
+任务启动后自动进入监控页，可随时停止任务。当页面提示「需要留意浏览器窗口」时，请在弹出的浏览器中完成验证，程序会自动继续。
+
+> [!TIP]
+> 关闭主窗口时可选择 **最小化 / 最小化到托盘 / 直接退出**，并可勾选「记住我的选择」；之后可在「系统设置 → 桌面窗口」中修改。退出程序时会自动保存 Cookie 并关闭学习浏览器。
+
+## 学习参数
+
+| 参数 | 说明 |
+| --- | --- |
+| 播放倍速 | 视频播放速度，最高 1.8x |
+| 单门课程时长限制 | 每门课最多学习多少分钟，`0` 为不限制 |
+| 复习模式（刷习惯分） | 忽略已完成状态重播视频；设置时长后循环播放直至满足时长 |
+| 自动跳过验证码 | 自动处理登录滑块与课中点选验证 |
+| 静音播放 | 视频静音，避免后台挂机出声 |
+| 隐藏浏览器窗口 | 把浏览器移出屏幕后台学习，遇到安全验证时自动前置 |
+| 课中弹题优先用智慧树 AI | 先尝试平台自带 AI 作答，失败后回退到你配置的大模型 |
+| AI 智慧课自动刷掌握度 | 视频完成后继续完成知识点掌握度题目 |
+| 接口版自动完成计分考试 | AI 智慧课视频完成后通过接口作答，成绩达标即跳过该知识点 |
+| 掌握度目标 | 掌握度目标百分比（1–100），同时作用于上面两项 |
+| 复习 / 模拟考试接口作答 | 捕获新打开的复习、模拟考试页并作答（默认关闭，**正式考试请勿开启**） |
+| 完成后关机 | 任务正常完成后倒计时 60 秒关机；手动停止、出错或诊断任务不会关机 |
+
+## 大模型智能答题
+
+可选功能，在「系统设置 → 大模型智能答题」中配置。未配置时自动跳过，调用失败时自动回退为默认行为。
+
+1. 选择 **模型服务商**（内置国内主流、国际主流、聚合平台、本地部署等多组预设，会自动填好地址与协议）；
+2. 填写 **API Key**（本地 Ollama / LM Studio 可留空）；
+3. 点击 **获取模型** 拉取模型列表，或手动输入模型名称；
+4. 点击 **测试模型连接** 验证可用性。
+
+支持的接口协议：
+
+| 协议 | 适用范围 |
+| --- | --- |
+| OpenAI 兼容（Chat Completions） | DeepSeek、通义千问、智谱 GLM、Kimi、豆包、硅基流动、OpenRouter、各类 OneAPI / NewAPI 中转等 |
+| OpenAI Responses API | OpenAI `/responses` 接口 |
+| Anthropic | Claude 原生 `/v1/messages` |
+| Google Gemini | Gemini 原生 `generateContent` |
+| Azure OpenAI | 需填写部署名与 `api_version` |
+| Ollama | 本地 `/api/chat` |
+
+「测验页自动复核并提交」关闭时，程序只填写答案，方便你核对后手动提交。
+
+## 消息推送
+
+在「系统设置 → 消息推送通知」中选择渠道并点击 **测试推送** 验证：
+
+| 渠道 | 需要填写 |
+| --- | --- |
+| Windows 系统通知 | 无 |
+| Server 酱 | `https://sctapi.ftqq.com/<SendKey>.send` |
+| Qmsg 酱 | `https://qmsg.zendee.cn/send/<key>` |
+| Bark | `https://api.day.app/<key>/` |
+| Telegram | `https://api.telegram.org/bot<token>/sendMessage` + Chat ID |
+
+可分别开关三类提醒：**遇安全验证 / 需人工登录**、**任务异常中断**、**学习完成 / 达到时限**。
+
+## 数据与隐私
+
+- 所有数据（配置、Cookie、日志）**仅保存在本机**数据目录，不上传任何服务器；
+- 密码**默认不保存**，仅在勾选「记住账号密码」时以明文保存在本机，可在设置中随时清除；
+- 内置引擎只监听本地回环地址，并使用每次启动随机生成的令牌鉴权；
+- 复制日志时会自动遮盖手机号、密码等常见敏感字段，分享前仍建议自行检查；
+- 网络代理同时作用于登录、课程拉取、浏览器学习、更新检查与推送通知。
+
+## 技术架构
+
+```mermaid
+flowchart LR
+    subgraph App["Autovisor GUI"]
+        UI["前端<br/>React + Tailwind"]
+        Host["宿主<br/>Tauri 2 / Rust"]
+    end
+    Engine["内置学习引擎<br/>Python + Playwright"]
+    B1["本机浏览器<br/>(登录 / 课程识别)"]
+    B2["学习浏览器"]
+
+    UI <-->|"IPC 命令 / 事件"| Host
+    Host -->|"启动并托管进程树"| Engine
+    Host <-->|"HTTP API + SSE 状态流"| Engine
+    Host -->|"CDP"| B1
+    Engine -->|"Playwright"| B2
 ```
 
-首次运行会自动部署环境 (安装 `uv`、依赖和必要的浏览器), 之后直接启动. 环境或配置变化时会自动重新部署, 也可用 `./run_macos.sh --setup` 强制重建.
+| 层 | 技术 | 职责 |
+| --- | --- | --- |
+| 前端 | React 18、Tailwind CSS、Vite、Vitest | 界面、配置模型、自动保存、日志展示 |
+| 宿主 | Tauri 2、Rust | 窗口 / 托盘 / 单实例、浏览器自动检测、CDP 登录与课程识别、配置读写、引擎生命周期 |
+| 引擎 | Python、Playwright、OpenCV | 课程播放与切换、验证码处理、答题、推送、进度上报 |
 
-#### 四、Linux 源码运行
+- 宿主启动时在后台拉起引擎，通过 JSON 握手获取端口与令牌，再经 SSE 实时接收进度、日志和提醒；
+- 通过 `stdin` 生命周期监听与 Windows Job Object 管理进程树，窗口关闭或任务停止时不会残留浏览器 / 引擎进程；
+- 引擎异常退出时可在界面中一键重启。
 
-需要 Python 3.10–3.13、`uv` 和图形界面 (X11 / Wayland). 先复制模板并填写配置:
+### 目录结构
 
-```bash
-cp config.linux.ini.example config.linux.ini
+```text
+.
+├── gui/                        # 桌面客户端
+│   ├── src/                    #   React 前端
+│   │   ├── components/         #     登录 / 工作台 / 监控 / 设置等页面
+│   │   └── lib/                #     Tauri 调用封装、配置模型、大模型预设
+│   ├── src-tauri/              #   Rust 宿主
+│   │   └── src/                #     backend / browser_detect / zhs_session / process_tree ...
+│   ├── build-installer.ps1     #   构建 NSIS 安装包
+│   └── build-portable.ps1      #   构建便携版
+├── backend_server.py           # 内置学习引擎入口
+├── build_backend.py            # 打包引擎为 autovisor-backend.exe
+├── modules/                    # 引擎核心模块（播放、登录、验证码、答题、推送……）
+├── Autovisor.py                # 命令行入口
+├── resources/                  # 引擎资源
+├── data/                       # 默认镜像源 / 大模型配置模板
+└── tests/                      # Python 单元测试
 ```
 
-打开 `config.linux.ini` 填入课程链接 (账号密码可留空, 用浏览器手动登录).
+## 本地开发
 
-首次运行需要安装环境和浏览器 (只需执行一次):
+### 环境准备
 
-```bash
+| 工具 | 版本 |
+| --- | --- |
+| Python | 3.10 – 3.13，推荐配合 [uv](https://docs.astral.sh/uv/) |
+| Node.js | 20+ |
+| Rust | stable（含 Tauri 2 的 [系统依赖](https://tauri.app/start/prerequisites/)） |
+
+### 启动开发环境
+
+```powershell
+# 1. 安装引擎依赖（会在仓库根目录创建 .venv）
 uv sync --extra captcha
-uv run playwright install chromium
+
+# 2. 安装前端依赖并启动 Tauri 开发模式
+cd gui
+npm install
+npm run tauri dev
 ```
 
-之后每次启动程序:
+开发模式下，宿主会自动向上查找仓库中的 `backend_server.py`，并使用根目录 `.venv` 中的 Python 启动引擎，数据直接读写仓库根目录。
+
+> [!NOTE]
+> 只调试界面时可运行 `npm run dev`，在普通浏览器中打开；此时所有 Tauri 调用会回退到内置的演示数据。
+
+### 运行测试
+
+```powershell
+uv run python -m unittest discover -s tests -v   # 引擎
+cd gui; npm test                                 # 前端
+cd src-tauri; cargo test                         # 宿主
+```
+
+CI 会在 Windows、macOS、Ubuntu 上执行以上三组测试与构建检查。
+
+### 打包发布
+
+```powershell
+cd gui
+
+# 便携版 → dist/Autovisor-GUI-<版本>-windows-amd64/
+powershell -ExecutionPolicy Bypass -File .\build-portable.ps1
+
+# 安装版 → dist/Autovisor-GUI-Setup-<版本>-windows-x64.exe
+powershell -ExecutionPolicy Bypass -File .\build-installer.ps1
+```
+
+两个脚本都会先构建内置引擎（`build_backend.py`），再构建前端与 Tauri Release；加 `-SkipBackendBuild` 可复用已构建的引擎。版本号以 `gui/src-tauri/tauri.conf.json` 为准。
+
+> [!NOTE]
+> 宿主代码已按平台做了条件编译（进程树托管、浏览器检测、数据目录），macOS / Linux 可从源码构建，但目前官方仅发布 Windows 版本。
+
+## 命令行模式
+
+仓库保留了无界面的命令行入口，适合服务器或脚本场景：
 
 ```bash
-uv run python -u Autovisor.py --config config.linux.ini
+cp config.ini.example config.ini   # 填写课程链接等配置
+uv run python Autovisor.py --help
 ```
 
-##### 可选：DeepSeek 课中视觉验证（实验性）
+macOS / Linux 可分别参考 `config.macos.ini.example`（配合 `run_macos.sh`）与 `config.linux.ini.example`。
 
-源码运行时可在 `[script-option]` 设置 `enableVisionCaptcha = True`，尝试处理易盾的单点点击题（字母、数字或图形）。默认关闭，与自动验证码开关 `enableAutoCaptcha` 相互独立。不支持滑块、多点或其他验证类型；朝向题仍可能识别失败，不能保证通过率。
+## 常见问题
 
-Windows、macOS 和 Linux 均直接读取本地配置文件；在 `config.ini`（macOS 为 `config.macos.ini`，Linux 为 `config.linux.ini`）中填写：
+<details>
+<summary><b>界面提示「内置学习引擎异常」？</b></summary>
 
-```ini
-[script-option]
-enableVisionCaptcha = True
-deepseekApiKey = 在这里填写自己的DeepSeek_API_Key
-```
+点击提示条右侧的「重试启动引擎」，或在「系统设置 → 运行环境与版本」中重启引擎。若反复失败，多为安全软件拦截了 `runtime/` 中的引擎程序，请将程序目录加入信任列表后重试。
 
-Key 不需要加引号，不读取环境变量或系统钥匙串。开启后若 `deepseekApiKey` 留空，程序会提示并等待手动验证。示例模板的 Key 默认留空；实际本地配置包含明文凭据，已被 `.gitignore` 排除，请勿上传或共享。可用 `--config` 指定独立配置，让不同账号分别使用自己的 Key。
+</details>
 
-启用后，程序会把**验证图片和题目文字**发送到 DeepSeek 官方接口 `https://api.deepseek.com/chat/completions`，使用 `deepseek-flash`；请求会产生 API 费用。程序不发送账号密码或 Cookie，不把验证截图、原始模型回复或 Key 写入日志。日志只记录尝试次数、归一化坐标、HTTP 状态码和结果。
+<details>
+<summary><b>提示未检测到浏览器？</b></summary>
 
-每次检测到验证最多尝试 3 次。模型无法确定目标、题目发生变化、坐标越界、API 出错或验证未通过时，会保留手动处理路径；失败不会无限调用 API。成功以弹窗消失为判据，后续视频与平台进度仍由原有播放逻辑检查。必要依赖 `httpx` 和 `Pillow` 已在基础依赖中，不需要安装本地视觉模型或额外的 OpenCV 依赖。
+在登录页或「系统设置 → 浏览器与网络」中点击「重新扫描」；仍未识别时，可手动选择浏览器的可执行文件（如 `msedge.exe`、`chrome.exe`）。
 
-##### 可选：DeepSeek 大模型自动答题
+</details>
 
-在 `data/llm.json`（模板见 `data/llm.json.example`，首次运行时会自动生成）中填写 `api_key` 后，程序会调用兼容 OpenAI 格式的大模型接口（默认 DeepSeek `deepseek-chat`）辅助作答课中弹题、融合课/AI 慕课随堂练习弹窗及新开的测验标签页；留空 `api_key` 时自动禁用并完全保持原有默认行为，接口失败时自动回退。
+<details>
+<summary><b>登录后没有识别到课程？</b></summary>
 
-#### 五、发行版下载
+点击「刷新课程」重新同步；若课程确实存在但未出现，可通过「手动补充链接」粘贴课程**播放页**地址。
 
-- Github: [Releases · CXRunfree/Autovisor](https://github.com/CXRunfree/Autovisor/releases)
-- 网盘备用: [蓝奏云 · Autovisor-for-windows](https://wwk.lanzouj.com/b05evsxif) 密码: 492l
+</details>
 
-这是已经打包好的程序, 若需要**源代码**请于 Github 项目主页下载.
+<details>
+<summary><b>运行中提示「需要留意浏览器窗口」？</b></summary>
 
-#### 六、常见问题
+说明遇到了需要人工处理的安全验证或登录失效。浏览器窗口会自动前置，完成验证后程序会自动继续。开启推送后，你也会同时收到提醒。
 
-1. 解压后没有 `Autovisor.exe` / 提示缺少依赖文件?
+</details>
 
-   - 多为杀毒软件误杀: 加入信任区后重新解压; 也请确认下载的是 Releases 里的发行包, 而不是源码.
+<details>
+<summary><b>课程卡住不动 / 不会切换下一课？</b></summary>
 
-2. 第一次启动很久没反应 / 依赖下载失败?
+- 请勿最小化学习浏览器（会暂停页面渲染），需要后台学习请开启「隐藏浏览器窗口」；
+- 可对该课程执行「只读检测」确认目录是否被识别；
+- 仍有问题请在 issue 中附上课程类型与「历史运行日志」中的日志文件。
 
-   - 首次会检查并下载运行时依赖 (numpy、opencv-python), 等后台日志跑完即可; 下载失败会自动换用 `data/mirrors.json` 里的下一个镜像.
-   - 报 `ModuleNotFoundError` / `ImportError: numpy...` 时, 删掉 `packages/` 目录重新运行.
+</details>
 
-3. 提示 **未检测到有效网址** / 一直**等待登录完成** ?
+<details>
+<summary><b>开启了完成后关机，想临时取消？</b></summary>
 
-   - `[course-url]` 要填**课程播放页**的地址 (能直接看到课程视频的页面), 不要填课程首页.
-   - 登录页改版导致的等待已在最新版修复, 请先升级到最新发行版.
+倒计时期间在运行监控页点击「取消关机」即可；也可以在命令提示符中运行 `shutdown /a`。
 
-4. 登录滑块或课中点选验证还是要手动过?
+</details>
 
-   - 只有 `enableAutoCaptcha = True` 才会自动过验证码 (登录滑块 / 课中「请点击大写X颜色一样的数字N」点选), 否则需要手动完成.
+<details>
+<summary><b>如何彻底重置？</b></summary>
 
-5. 只出现命令行窗口, 没有浏览器界面?
+在设置中清除 Cookie 与已保存账密，或直接删除 [数据目录](#数据目录) 后重新启动。
 
-   - 命令行是程序后台, 可以查看运行状态; 浏览器加载需要时间, 后台没异常退出就不必担心. 报错通常是浏览器路径配置有误.
-   - 找浏览器路径: 打开浏览器, 地址栏输入 `chrome://version`, 其中的"可执行文件目录"就是.
+</details>
 
-   <p align="left"><img src="resources/markdown/broswer_version.png" width="720" alt="Chrome 可执行文件目录"></p>
+## 致谢
 
-6. 看不到浏览器窗口 / 想后台刷课 / 报 `MoveWindow 无效的窗口句柄`?
+本项目的开发参考并受益于以下优秀的开源项目，在此表示衷心感谢：
 
-   - 最小化会让浏览器暂停渲染, 进度不增加, 也会影响弹题检测. 想后台刷课请用 `enableHideWindow = True`, 程序会把窗口移出屏幕.
-   - 若报窗口句柄错误, 改回 `enableHideWindow = False`.
+- [CXRunfree/Autovisor](https://github.com/CXRunfree/Autovisor)：基于 Playwright 的智慧树自动化学习程序
+- [VermiIIi0n/fuckZHS](https://github.com/VermiIIi0n/fuckZHS)：智慧树刷课脚本
 
-7. 卡在加载播放页 / 不会自动跳下一课 / 新版页面刷不了课?
+## 许可证与声明
 
-   - 这类基本都是**页面结构还没适配**, 不是配置问题. 目前支持: 智慧共享课、翻转课、融合共享课、AI慕课 (`wisdom-mooc.zhihuishu.com`)、AI 新形态课程 (`ai-smart-course-student-pro.zhihuishu.com`).
+本项目基于 [MIT License](LICENSE) 开源。
 
-   - AI 慕课请直接复制播放页链接 (以 `wisdom-mooc.zhihuishu.com` 开头). 程序会展开章节目录、跳过章节测试入口、自动提交 AI 随堂练习, 并避开页面上的数字人视频.
+本程序仅供学习和研究使用，请勿用于商业或非法用途。使用者应遵守所在学校及平台的相关规定，因使用本程序产生的一切后果由使用者自行承担。
 
-   - AI 新形态课程请填写 `.../singleCourse/knowledgeStudy/...` 形式的课程入口页（也支持自动补齐必学资源与刷取知识点掌握度）.
-
-     若仍识别不到课时, 欢迎附上课程链接和日志提 issue.
-
-8. 弹题关不掉 / 程序卡住?
-
-   - 弹题随时可能出现, 而检测不是实时的, 所以无法完全消除; 页面长时间无响应时, 先确认浏览器没有被最小化.
-
-9. 遇到 PPT、PDF 等没有视频的章节会卡住?
-
-   - 目前只处理视频课时, 非视频章节需要手动切到有视频的课时.
-
-10. 不想再弹赞赏码?
-
-    - 感谢您对本项目的支持~ 只需要设置 `showDonateCode = False` 就好了!
-
-------
-#### 已知问题
-
-- **长时间挂机**有概率弹出人机验证, 程序检测到后会暂停操作；默认需要手动验证，开启实验性视觉验证后仍可能需要手动处理;
-- 浏览器窗口若**最小化**可能导致视频播放进度不增加;
-- 若出现其他异常崩溃, 请提交 issue 并附上报错信息.
-
-#### 写在最后
-
-觉得体验还不错? 请留下你宝贵的 Star ⭐, 并分享给更多有需要的人!
-
-或者为项目发电支持一下~
-
-<p align="left"><img src="resources/markdown/donate.png" width="200" alt="赞赏码"></p>
-
-**作者的 CSDN:** [欢迎关注~](https://blog.csdn.net/Runfreeone)
-
-**声明：本程序只可用于学习和研究计算机原理, 请于 24h 内删除所有存档！**
+如果这个项目对你有帮助，欢迎点个 Star ⭐

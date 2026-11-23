@@ -5,13 +5,24 @@ from playwright.async_api import TimeoutError
 from playwright.async_api import Page
 from modules.configs import Config
 from modules.llm import answer_with_llm
-from modules.utils import get_video_attr, display_window, hide_window, run_on
+from modules.utils import (
+    display_window,
+    get_video_attr,
+    hide_window,
+    run_on,
+    should_hide_window,
+)
 from playwright._impl._errors import TargetClosedError
 from modules.logger import Logger
 from modules.click_captcha import solve_click_captcha
 from modules.fusion_adapter import FusionAdapter
 from modules.slider import IN_COURSE_APPEAR_TIMEOUT_MS, slider_verify
-from modules.video_state import COURSE_VIDEO_SELECTOR, video_at_end
+from modules.video_state import (
+    COURSE_VIDEO_SELECTOR,
+    has_valid_duration,
+    is_valid_video_time,
+    video_at_end,
+)
 
 logger = Logger()
 
@@ -21,6 +32,8 @@ VERIFICATION_SELECTORS = (
     "[id^='tcaptcha_transform']",
     "#tcaptcha_iframe_dy",
     "iframe[id^='tcaptcha']",
+    "iframe.tcaptcha-iframe",
+    "iframe[src*='captcha.qq.com']",
 )
 
 BLOCKING_OVERLAY_SELECTORS = (
@@ -156,6 +169,7 @@ async def video_optimize(
                 )
                 changes.append(f"倍速 {rate}->{config.limitSpeed}")
             if changes:
+                logger.info(f"已调节播放器: {', '.join(changes)}")
                 logger.event("播放器调节", 项目=", ".join(changes))
         except TargetClosedError:
             logger.debug("浏览器已关闭, 视频调节模块停止运行.")
@@ -233,15 +247,34 @@ async def play_video(
                         f"尝试播放跳过: 页面未找到元素 {PLAY_READY_SELECTOR}",
                     )
                     continue
-                await run_on(
-                    page, COURSE_VIDEO_SELECTOR, "(el) => el.play()", "恢复播放"
-                )
-                logger.debug("视频已恢复播放.")
-                logger.event(
+                played = await run_on(
+                    page,
+                    COURSE_VIDEO_SELECTOR,
+                    "async (el) => { await el.play(); return !el.paused; }",
                     "恢复播放",
-                    播放器时间=round(state["currentTime"], 1),
-                    总时长=round(state["duration"], 1),
                 )
+                if played:
+                    current_sec = (
+                        round(state["currentTime"], 1)
+                        if is_valid_video_time(state["currentTime"])
+                        else None
+                    )
+                    total_sec = (
+                        round(state["duration"], 1)
+                        if has_valid_duration(state["duration"])
+                        else None
+                    )
+                    logger.info("尝试播放成功,视频已恢复播放.")
+                    logger.event(
+                        "恢复播放",
+                        播放器时间=current_sec,
+                        总时长=total_sec,
+                    )
+                elif played is False:
+                    logger.debug_throttled(
+                        "video:play_unconfirmed",
+                        "尝试播放未生效,视频仍处于暂停状态.",
+                    )
         except TargetClosedError:
             logger.debug("浏览器已关闭, 视频播放模块停止运行.")
             return
@@ -257,7 +290,10 @@ async def play_video(
 
 
 async def skip_questions(
-    page: Page, event_loop, playback_enabled: asyncio.Event | None = None
+    page: Page,
+    event_loop,
+    playback_enabled: asyncio.Event | None = None,
+    config=None,
 ) -> None:
     await page.wait_for_load_state("domcontentloaded")
     while True:
@@ -269,25 +305,44 @@ async def skip_questions(
                 await asyncio.sleep(2)
                 if not await has_visible_element(page, (".topic-title",)):
                     continue
-                # 大模型尽力作答新版弹题, 失败仍回退手动
+                # 优先智慧树 AI, 失败回退自定义大模型, 仍失败则回退手动
+                llm_answered = False
                 try:
                     choices = await page.query_selector_all(".topic-item")
                     if len(choices) < 2:
                         choices = await page.query_selector_all(
                             "[class*=option], [class*=answer], .el-radio, .el-checkbox"
                         )
-                    await answer_with_llm(page, None, choices)
+                    answerer = None
+                    if config is not None and getattr(config, "enableZhidaoQuiz", True):
+                        from modules.quiz_page import make_zhidao_answerer
+
+                        answerer = await make_zhidao_answerer(page, config)
+                    if answerer is not None:
+                        llm_answered = bool(
+                            await answer_with_llm(page, None, choices, answerer=answerer)
+                        )
+                    else:
+                        llm_answered = bool(await answer_with_llm(page, None, choices))
                 except Exception as exc:
                     logger.debug(f"新版弹题大模型作答未命中: {logger.summarize_exception(exc)}")
-                logger.warn("检测到新版课中弹题, 若未自动作答请在浏览器中手动处理.", shift=True)
-                logger.event("新版课中弹题", 处理方式="大模型+手动兜底", 地址=page.url)
+                if llm_answered:
+                    logger.info("检测到新版课中弹题, 已由 AI 选择选项, 等待弹题弹窗关闭...", shift=True)
+                    logger.event("新版课中弹题", 处理方式="AI作答", 地址=page.url)
+                else:
+                    logger.warn("检测到新版课中弹题, 若未自动作答请在浏览器中手动处理.", shift=True)
+                    logger.event("新版课中弹题", 处理方式="AI+手动兜底", 地址=page.url)
+                    logger.event("人工介入", 状态="需要", 原因="检测到新版课中弹题, 若未自动作答请在浏览器中手动处理.")
                 while await has_visible_element(page, (".topic-title",)):
                     await asyncio.sleep(0.5)
+                logger.info("新版课中弹题弹窗已关闭, 继续学习.")
+                logger.event("新版课中弹题", 状态="已关闭")
+                logger.event("人工介入", 状态="已解除", 原因="新版课中弹题弹窗已关闭")
                 event_loop.set()
                 continue
             if "wisdom-mooc.zhihuishu.com" in page.url:
                 await asyncio.sleep(2)
-                if await FusionAdapter.skip_blocking_quizzes(page):
+                if await FusionAdapter.skip_blocking_quizzes(page, config=config):
                     event_loop.set()
                 continue
             if "hike.zhihuishu.com" in page.url:
@@ -298,18 +353,81 @@ async def skip_questions(
             ques_element = await page.wait_for_selector(".el-scrollbar__view", state="attached", timeout=1000)
             total_ques = await ques_element.query_selector_all(".number")
             if total_ques:
+                logger.info(f"检测到课中弹题(共 {len(total_ques)} 题), 开始自动作答...", shift=True)
+                answerer = None
+                if config is not None and getattr(config, "enableZhidaoQuiz", True):
+                    from modules.quiz_page import make_zhidao_answerer
+
+                    answerer = await make_zhidao_answerer(page, config)
                 answered = 0
-                for ques in total_ques:
+                llm_count = 0
+                fallback_count = 0
+                skipped_count = 0
+                for idx, ques in enumerate(total_ques, 1):
                     await ques.click(timeout=500)
                     if not await page.query_selector(".answer"):
                         choices = await page.query_selector_all(".topic-item")
-                        # 大模型作答, 失败回退原默认行为(点前两个选项)
-                        if not await answer_with_llm(page, ques, choices):
+                        # 优先智慧树 AI, 失败回退自定义大模型, 再失败回退默认行为(点前两个选项)
+                        ai_ok = (
+                            await answer_with_llm(page, ques, choices, answerer=answerer)
+                            if answerer is not None
+                            else await answer_with_llm(page, ques, choices)
+                        )
+                        if ai_ok:
+                            llm_count += 1
+                        else:
+                            q_title = ""
+                            try:
+                                title_el = await page.query_selector(".topic-title")
+                                if title_el:
+                                    q_title = " ".join((await title_el.inner_text()).split())
+                            except Exception:
+                                pass
+                            picked_texts = []
                             for each in choices[:2]:
+                                try:
+                                    opt_text = " ".join((await each.inner_text()).split())
+                                    if opt_text:
+                                        picked_texts.append(opt_text[:40])
+                                except Exception:
+                                    pass
                                 await each.click(timeout=500)
                                 await page.wait_for_timeout(100)
+                            fallback_count += 1
+                            picked_summary = "; ".join(picked_texts) or f"前 {min(len(choices), 2)} 项"
+                            title_summary = (q_title[:48] + "...") if len(q_title) > 48 else q_title
+                            if title_summary:
+                                logger.info(
+                                    f"课中弹题第 {idx}/{len(total_ques)} 题(默认选择): "
+                                    f"题目「{title_summary}」 -> {picked_summary}"
+                                )
+                            else:
+                                logger.info(
+                                    f"课中弹题第 {idx}/{len(total_ques)} 题(默认选择): {picked_summary}"
+                                )
+                            logger.event(
+                                "课中答题",
+                                序号=f"{idx}/{len(total_ques)}",
+                                方式="默认选择",
+                                题目=q_title[:80] if q_title else None,
+                                选项=picked_summary,
+                            )
                         answered += 1
-                logger.event("课中答题", 题目数=len(total_ques), 已作答=answered)
+                    else:
+                        skipped_count += 1
+                        logger.debug(f"课中弹题第 {idx}/{len(total_ques)} 题已作答, 跳过.")
+                logger.info(
+                    f"课中弹题处理完成: 共 {len(total_ques)} 题, "
+                    f"大模型作答 {llm_count} 题, 默认选择 {fallback_count} 题, 已作答跳过 {skipped_count} 题."
+                )
+                logger.event(
+                    "课中答题",
+                    题目数=len(total_ques),
+                    已作答=answered,
+                    大模型作答=llm_count,
+                    默认选择=fallback_count,
+                    跳过=skipped_count,
+                )
             await page.press(".el-dialog", "Escape", timeout=1000)
             event_loop.set()
         except TargetClosedError:
@@ -351,7 +469,9 @@ async def skip_questions(
             continue
 
 
-async def wait_for_verify(page: Page, config, event_loop, captcha_modules=None) -> None:
+async def wait_for_verify(
+    page: Page, config, event_loop, captcha_modules=None, notifier=None
+) -> None:
     await page.wait_for_load_state("domcontentloaded")
     while True:
         try:
@@ -381,21 +501,25 @@ async def wait_for_verify(page: Page, config, event_loop, captcha_modules=None) 
                     状态="自动完成",
                     耗时=f"{time.time() - wait_start:.1f}s",
                 )
+                logger.event("人工介入", 状态="已解除", 原因="安全验证已自动完成")
                 await asyncio.sleep(2)
                 continue
             logger.warn("检测到安全验证,请手动完成验证...", shift=True)
             logger.event("安全验证", 状态="开始", 地址=page.url)
-            if config.enableHideWindow:
+            logger.event("人工介入", 状态="需要", 原因="检测到安全验证,请手动完成验证...")
+            if notifier is not None:
+                await notifier.notify_verify(
+                    f"检测到课中安全验证，请及时在浏览器中完成。\n页面：{page.url}"
+                )
+            if should_hide_window(config):
                 await display_window(page)
-            if getattr(config, "enableVisionCaptcha", False):
-                from modules.vision_verification import attempt_course_verification
-                await attempt_course_verification(page, logger, config)
             await wait_until_verification_hidden(page)
             event_loop.set()
-            if config.enableHideWindow:
+            if should_hide_window(config):
                 await hide_window(page)
             logger.info("安全验证已完成.", shift=True)
             logger.event("安全验证", 状态="完成", 耗时=f"{time.time() - wait_start:.1f}s")
+            logger.event("人工介入", 状态="已解除", 原因="安全验证已完成")
             await asyncio.sleep(2)
         except TargetClosedError:
             logger.debug("浏览器已关闭, 安全验证模块停止运行.")

@@ -8,10 +8,36 @@ from modules.configs import Config, ConfigError, ensure_config_files
 
 
 class ConfigTests(unittest.TestCase):
-    def test_vision_verification_is_explicitly_opt_in(self):
+    def test_exam_api_switch_defaults_on_and_can_be_disabled(self):
         with tempfile.TemporaryDirectory() as directory:
             config_path = os.path.join(directory, "config.ini")
             mirrors_path = os.path.join(directory, "mirrors.json")
+            with open(mirrors_path, "w", encoding="utf-8") as file:
+                file.write('{"primary":"https://mirror.example/simple"}')
+            template = (
+                "[user-account]\nusername=\npassword=\n"
+                "[browser-option]\ndriver=chrome\nEXE_PATH=\n"
+                "[script-option]\n"
+                "[course-option]\nsoundOff=true\n{option}\n"
+                "[course-url]\nURL1=\n"
+            )
+            for option, expected in (
+                ("", True),
+                ("enableExamApi=False", False),
+                ("enableExamApi=True", True),
+            ):
+                with self.subTest(option=option):
+                    with open(config_path, "w", encoding="utf-8") as file:
+                        file.write(template.format(option=option))
+                    config = Config(config_path, mirrors_path)
+                    self.assertIs(config.enableExamApi, expected)
+
+    def test_hide_window_defaults_on_and_can_be_disabled(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config_path = os.path.join(directory, "config.ini")
+            mirrors_path = os.path.join(directory, "mirrors.json")
+            with open(mirrors_path, "w", encoding="utf-8") as file:
+                file.write('{"primary":"https://mirror.example/simple"}')
             template = (
                 "[user-account]\nusername=\npassword=\n"
                 "[browser-option]\ndriver=chrome\nEXE_PATH=\n"
@@ -19,19 +45,100 @@ class ConfigTests(unittest.TestCase):
                 "[course-option]\nsoundOff=true\n"
                 "[course-url]\nURL1=\n"
             )
-            with open(mirrors_path, "w", encoding="utf-8") as file:
-                file.write('{"primary":"https://mirror.example/simple"}')
-            for option, expected, key in (
-                ("", False, ""),
-                ("enableVisionCaptcha=False", False, ""),
-                ("enableVisionCaptcha=True\ndeepseekApiKey=  test-token%literal  ", True, "test-token%literal"),
+            for option, expected in (
+                ("", True),
+                ("enableHideWindow=False", False),
+                ("enableHideWindow=True", True),
             ):
                 with self.subTest(option=option):
                     with open(config_path, "w", encoding="utf-8") as file:
                         file.write(template.format(option=option))
                     config = Config(config_path, mirrors_path)
-                    self.assertIs(config.enableVisionCaptcha, expected)
-                    self.assertEqual(config.deepseek_api_key, key)
+                    self.assertIs(config.enableHideWindow, expected)
+
+    def test_notification_provider_defaults_to_windows_and_can_be_disabled(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config_path = os.path.join(directory, "config.ini")
+            mirrors_path = os.path.join(directory, "mirrors.json")
+            with open(mirrors_path, "w", encoding="utf-8") as file:
+                file.write('{"primary":"https://mirror.example/simple"}')
+            base = (
+                "[user-account]\nusername=\npassword=\n"
+                "[browser-option]\ndriver=chrome\nEXE_PATH=\n"
+                "[script-option]\n"
+                "[course-option]\nsoundOff=true\n"
+                "[course-url]\nURL1=\n"
+            )
+            cases = (
+                ("", "Windows"),
+                ("[notification]\nurl=\n", "Windows"),
+                ("[notification]\nprovider=\n", ""),
+                ("[notification]\nprovider=Windows\n", "Windows"),
+                ("[notification]\nprovider=Bark\nurl=https://api.day.app/key/\n", "Bark"),
+            )
+            for extra, expected in cases:
+                with self.subTest(extra=extra):
+                    with open(config_path, "w", encoding="utf-8") as file:
+                        file.write(base + extra)
+                    config = Config(config_path, mirrors_path)
+                    self.assertEqual(config.notification_provider, expected)
+
+    def test_review_exam_and_zhidao_quiz_switches(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config_path = os.path.join(directory, "config.ini")
+            mirrors_path = os.path.join(directory, "mirrors.json")
+            with open(mirrors_path, "w", encoding="utf-8") as file:
+                file.write('{"primary":"https://mirror.example/simple"}')
+            template = (
+                "[user-account]\nusername=\npassword=\n"
+                "[browser-option]\ndriver=chrome\nEXE_PATH=\n"
+                "[script-option]\n"
+                "[course-option]\nsoundOff=true\n{option}\n"
+                "[course-url]\nURL1=\n"
+            )
+            for option, review, zhidao in (
+                ("", False, True),
+                ("enableReviewExamApi=True\nenableZhidaoQuiz=False", True, False),
+                ("enableReviewExamApi=False\nenableZhidaoQuiz=True", False, True),
+            ):
+                with self.subTest(option=option):
+                    with open(config_path, "w", encoding="utf-8") as file:
+                        file.write(template.format(option=option))
+                    config = Config(config_path, mirrors_path)
+                    self.assertIs(config.enableReviewExamApi, review)
+                    self.assertIs(config.enableZhidaoQuiz, zhidao)
+
+    def test_review_mode_defaults_off_and_supports_ini_and_cli_override(self):
+        from types import SimpleNamespace
+
+        with tempfile.TemporaryDirectory() as directory:
+            config_path = os.path.join(directory, "config.ini")
+            mirrors_path = os.path.join(directory, "mirrors.json")
+            with open(mirrors_path, "w", encoding="utf-8") as file:
+                file.write('{"primary":"https://mirror.example/simple"}')
+            template = (
+                "[user-account]\nusername=\npassword=\n"
+                "[browser-option]\ndriver=chrome\nEXE_PATH=\n"
+                "[script-option]\n"
+                "[course-option]\nsoundOff=true\n{option}\n"
+                "[course-url]\nURL1=\n"
+            )
+            for option, expected in (
+                ("", False),
+                ("reviewMode=True", True),
+                ("reviewMode=False", False),
+            ):
+                with self.subTest(option=option):
+                    with open(config_path, "w", encoding="utf-8") as file:
+                        file.write(template.format(option=option))
+                    config = Config(config_path, mirrors_path)
+                    self.assertIs(config.reviewMode, expected)
+
+            with open(config_path, "w", encoding="utf-8") as file:
+                file.write(template.format(option="reviewMode=False"))
+            config = Config(config_path, mirrors_path)
+            config.apply_cli_overrides(SimpleNamespace(review=True))
+            self.assertTrue(config.reviewMode)
 
     def test_reports_missing_config_file(self):
         with self.assertRaisesRegex(ConfigError, "未找到配置文件"):
@@ -53,7 +160,7 @@ class ConfigTests(unittest.TestCase):
             file.write(
                 "[user-account]\nusername=\npassword=\n"
                 "[browser-option]\ndriver=edge\nEXE_PATH=\n"
-                "[script-option]\nenableAutoCaptcha=true\nenableHideWindow=false\nshowDonateCode=true\n"
+                "[script-option]\nenableAutoCaptcha=true\nenableHideWindow=false\n"
                 "[course-option]\nsoundOff=true\n"
                 "[course-url]\nURL1=\n"
                 "[mirrors]\nprimary=https://mirror.example/simple\n"
@@ -91,7 +198,7 @@ class ConfigTests(unittest.TestCase):
             file.write(
                 "[user-account]\nusername=\npassword=\n"
                 "[browser-option]\ndriver=edge\nEXE_PATH=\n"
-                "[script-option]\nenableAutoCaptcha=false\nenableHideWindow=false\nshowDonateCode=false\n"
+                "[script-option]\nenableAutoCaptcha=false\nenableHideWindow=false\n"
                 "[course-option]\nsoundOff=true\n"
                 "[course-url]\nURL1=\n"
             )
@@ -110,7 +217,7 @@ class ConfigTests(unittest.TestCase):
             file.write(
                 "[user-account]\nusername=\npassword=\n"
                 "[browser-option]\ndriver=edge\nEXE_PATH=\n"
-                "[script-option]\nenableAutoCaptcha=false\nenableHideWindow=false\nshowDonateCode=false\n"
+                "[script-option]\nenableAutoCaptcha=false\nenableHideWindow=false\n"
                 "[course-option]\nsoundOff=true\n"
                 "[course-url]\nURL1=\n"
             )
@@ -126,6 +233,39 @@ class ConfigTests(unittest.TestCase):
         finally:
             os.remove(path)
             os.remove(mirrors_path)
+
+    def test_dynamic_properties_use_mtime_cache_and_reload_on_change(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config_path = os.path.join(directory, "config.ini")
+            mirrors_path = os.path.join(directory, "mirrors.json")
+            with open(mirrors_path, "w", encoding="utf-8") as file:
+                file.write('{"primary":"https://mirror.example/simple"}')
+            template = (
+                "[user-account]\nusername=\npassword=\n"
+                "[browser-option]\ndriver=chrome\nEXE_PATH=\n"
+                "[script-option]\n"
+                "[course-option]\nsoundOff=true\nlimitSpeed={speed}\nlimitMaxTime={limit}\nmasteryTarget={mastery}\n"
+                "[course-url]\nURL1=\n"
+            )
+            with open(config_path, "w", encoding="utf-8") as file:
+                file.write(template.format(speed="1.2", limit="30", mastery="90"))
+
+            config = Config(config_path, mirrors_path)
+            with patch.object(config, "_read_config", wraps=config._read_config) as spy:
+                self.assertEqual(config.limitSpeed, 1.2)
+                self.assertEqual(config.limitMaxTime, 30.0)
+                self.assertEqual(config.masteryTarget, 90.0)
+                self.assertEqual(spy.call_count, 0)
+
+                with open(config_path, "w", encoding="utf-8") as file:
+                    file.write(template.format(speed="1.5", limit="45", mastery="80"))
+                new_mtime = (config._config_mtime or 0.0) + 5.0
+                os.utime(config_path, (new_mtime, new_mtime))
+
+                self.assertEqual(config.limitSpeed, 1.5)
+                self.assertEqual(config.limitMaxTime, 45.0)
+                self.assertEqual(config.masteryTarget, 80.0)
+                self.assertEqual(spy.call_count, 1)
 
 
 
@@ -170,6 +310,9 @@ class EnsureConfigFilesTests(unittest.TestCase):
         config = Config(config_path, os.path.join(self._tmpdir.name, "data", "mirrors.json"))
         self.assertEqual(config.course_urls, [])
         self.assertEqual(config.driver, "edge")
+        self.assertTrue(config.enableHideWindow)
+        self.assertEqual(config.notification_provider, "Windows")
+        self.assertEqual(config.limitMaxTime, 0.0)
 
     def test_generated_llm_json_has_expected_keys(self):
         ensure_config_files(self._config_path())
@@ -177,9 +320,11 @@ class EnsureConfigFilesTests(unittest.TestCase):
             data = json.load(file)
         self.assertEqual(
             sorted(data),
-            ["api_base", "api_key", "auto_submit", "model"],
+            ["api_base", "api_format", "api_key", "api_version", "auto_submit", "model", "provider"],
         )
         self.assertEqual(data["api_key"], "")
+        self.assertEqual(data["api_format"], "openai")
+        self.assertEqual(data["provider"], "deepseek")
 
 
 if __name__ == "__main__":

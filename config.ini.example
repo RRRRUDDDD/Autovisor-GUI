@@ -3,34 +3,67 @@
 ;留空时首次运行会在终端引导输入一次并自动保存到本文件, 之后即可全自动登录
 username =
 password =
+;可选: 启用终端二维码登录(默认:False)
+qrLogin = False
+qrTerminal = False
+qrUnicode = False
+qrSaveDir =
 
 [browser-option]
 ;配置浏览器,可选 Edge 或 Chrome
 driver = Edge
 ;指定浏览器所在路径,不填则使用默认路径
 EXE_PATH =
+;可选: 配置代理服务器(支持 http:// / https:// / socks5://, 留空直连)
+proxy =
 
 [script-option]
-;是否自动过验证码(登录滑块 / 课中点选, 默认:True)
+;是否自动过验证码(登录滑块[易盾/腾讯] / 课中点选, 默认:True)
 enableAutoCaptcha = True
-;可选: 使用 DeepSeek 处理课中单点点击验证，需要单独配置 API Key
-enableVisionCaptcha = False
-;仅填写在本地配置中，不要提交包含真实 Key 的文件
-deepseekApiKey =
-;是否自动隐藏浏览器窗口(默认:False)
-enableHideWindow = False
-;是否展示赞赏码(默认:True)
-showDonateCode = True
+;是否自动隐藏浏览器窗口(默认:True)
+enableHideWindow = True
+;刷课任务完成后自动关机(默认:False, 仅正常完成或达到课程时限时倒计时60秒关机, 手动停止/出错不关机)
+shutdownOnComplete = False
+;是否在桌面端实时输出 DEBUG 调试日志(默认:False)
+enableDebugLog = False
+
+[notification]
+;通知服务商（默认:Windows，留空表示禁用通知）。可选值:
+;Windows    - Windows 系统通知（Toast，仅 Windows 可用，无需下方参数）
+;ServerChan - Server酱 (https://sct.ftqq.com)
+;Qmsg       - Qmsg酱 (https://qmsg.zendee.cn)
+;Bark       - Bark (iOS, https://github.com/Finb/Bark)
+;Telegram   - Telegram Bot
+provider = Windows
+;推送地址（ServerChan/Qmsg/Bark/Telegram 需要）:
+;ServerChan: https://sctapi.ftqq.com/<SendKey>.send
+;Qmsg:       https://qmsg.zendee.cn/send/<key>
+;Bark:       https://api.day.app/<key>/
+;Telegram:   https://api.telegram.org/bot<token>/sendMessage
+url =
+;Telegram 聊天 ID（仅 Telegram 需要）
+tg_chat_id =
+notifyOnVerify = True
+notifyOnFinish = True
+notifyOnError = True
 
 [course-option]
 ;限制每门课程刷课时长/min (不限制:0)
-limitMaxTime = 30
+limitMaxTime = 0
 ;限定播放倍速 (最高:1.8)
 limitSpeed = 1.0
 ;设置是否静音播放 (默认:True)
 soundOff = True
+;复习模式/刷习惯分: 忽略已完成状态重播视频, 设置 limitMaxTime 时循环刷满时长 (默认:False)
+reviewMode = False
 ;AI智慧课: 视频刷完后是否继续把知识点掌握度(题目)刷满 (默认:True)
 enableMastery = True
+;AI智慧课: 是否先用接口版 ExamCtx 刷计分考试并交卷 (默认:True)
+enableExamApi = True
+;复习/模拟考试页: 是否捕获新页面并用接口直接作答交卷 (默认:False, 正式考试勿开)
+enableReviewExamApi = False
+;课中弹题: 是否优先用智慧树 AI 作答, 失败回退自定义大模型 (默认:True)
+enableZhidaoQuiz = True
 ;掌握度目标百分比 (1-100, 默认:100)
 masteryTarget = 100
 

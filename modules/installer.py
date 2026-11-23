@@ -102,6 +102,9 @@ def normalize_version(package, version):
 
 
 def get_runtime_root():
+    override = os.environ.get("AUTOVISOR_DATA_DIR", "").strip()
+    if override:
+        return os.path.abspath(override)
     if getattr(sys, "frozen", False):
         return os.path.dirname(sys.executable)
     return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -321,6 +324,29 @@ def install_package(package, version, mirrors, config_obj=None):
     return None
 
 
+def load_preinstalled_modules():
+    """优先直接加载已内置（或当前环境已安装）的验证码依赖，避免运行时联网下载。"""
+    loaded = []
+    for package, alias in mapping.items():
+        try:
+            module = import_module(alias)
+        except Exception:
+            return None
+        loaded.append((package, module))
+
+    for package, module in loaded:
+        installed_version = getattr(module, "__version__", None) or "内置"
+        logger.info(f"{package}-{installed_version} 已内置就绪！")
+        logger.event(
+            "依赖状态",
+            包=package,
+            版本=installed_version,
+            已安装=True,
+            来源="内置",
+        )
+    return [module for _, module in loaded]
+
+
 # 下载器,启动!
 def start(config_obj=None):
     if config_obj is None:
@@ -336,11 +362,15 @@ def start(config_obj=None):
         if missing:
             names = ", ".join(missing)
             raise RuntimeError(
-                f"缺少自动滑块依赖: {names}; 请运行 uv sync --extra captcha"
+                f"缺少自动滑块依赖: {names}; 请运行 uv sync"
             )
         return modules
 
     validate_python_version()
+    preinstalled = load_preinstalled_modules()
+    if preinstalled is not None:
+        return preinstalled
+
     modules = []
     res_dir = get_res_dir()
     os.makedirs(res_dir, exist_ok=True)

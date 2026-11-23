@@ -9,7 +9,9 @@ from modules.installer import (
     build_wheel_url,
     install_package,
     is_compatible_wheel,
+    load_preinstalled_modules,
     runtime_packages,
+    start,
     validate_python_version,
     wheel_tags,
 )
@@ -117,6 +119,36 @@ class InstallerTests(unittest.TestCase):
         self.assertEqual(download_wheel.call_count, 2)
         self.assertEqual(download_wheel.call_args_list[1].args[:3],
                          ("清华", "https://tsinghua", "numpy"))
+
+    def test_start_uses_preinstalled_modules_without_network(self):
+        fake_np = SimpleNamespace(__version__="2.5.1")
+        fake_cv2 = SimpleNamespace(__version__="4.13.0")
+        modules_map = {"numpy": fake_np, "cv2": fake_cv2}
+
+        with (
+            patch("modules.installer.os.name", "nt"),
+            patch("modules.installer.import_module", side_effect=lambda name: modules_map[name]),
+            patch("modules.installer.test_mirrors") as mock_mirrors,
+            patch("modules.installer.install_package") as mock_install,
+            patch("modules.installer.add_runtime_search_paths") as mock_add_paths,
+        ):
+            loaded = start(config_obj=SimpleNamespace(mirrors={}))
+
+        self.assertEqual(loaded, [fake_np, fake_cv2])
+        mock_mirrors.assert_not_called()
+        mock_install.assert_not_called()
+        mock_add_paths.assert_not_called()
+
+    def test_load_preinstalled_returns_none_when_cv2_missing(self):
+        fake_np = SimpleNamespace(__version__="2.5.1")
+
+        def fake_import(name):
+            if name == "numpy":
+                return fake_np
+            raise ImportError("No module named 'cv2'")
+
+        with patch("modules.installer.import_module", side_effect=fake_import):
+            self.assertIsNone(load_preinstalled_modules())
 
 
 if __name__ == "__main__":

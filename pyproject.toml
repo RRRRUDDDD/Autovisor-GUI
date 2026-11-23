@@ -5,25 +5,32 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "autovisor"
 dynamic = ["version"]
-description = "智慧树课程自动化工具"
+description = "知到 · 智慧树自动化学习助手"
 readme = "README.md"
+license = { file = "LICENSE" }
+authors = [
+    { name = "PengChengxu" },
+    { name = "RUD", email = "92616185+RRRRUDDDD@users.noreply.github.com" },
+]
 requires-python = ">=3.10,<3.14"
 dependencies = [
     "httpx>=0.28,<1",
+    "numpy>=2,<3",
+    "opencv-python>=4.10,<5",
     "pillow>=10,<13",
     "playwright>=1.49,<2",
+    "pycryptodome>=3.20,<4",
     "pygetwindow>=0.0.9; platform_system == 'Windows'",
     "requests>=2.31,<3",
 ]
 
+[project.urls]
+Homepage = "https://github.com/RRRRUDDDD/Autovisor-GUI"
+Repository = "https://github.com/RRRRUDDDD/Autovisor-GUI.git"
+Issues = "https://github.com/RRRRUDDDD/Autovisor-GUI/issues"
+
 [project.optional-dependencies]
-captcha = [
-    "numpy>=2,<3",
-    "opencv-python>=4.10,<5",
-]
-gui = [
-    "sv-ttk>=2.6,<3",
-]
+captcha = []
 
 [tool.uv]
 package = false

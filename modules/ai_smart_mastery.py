@@ -35,6 +35,13 @@ def normalize_text(value: str | None) -> str:
     return " ".join((value or "").split())
 
 
+def _brief(value: str | None, limit: int = 48) -> str:
+    text = normalize_text(value)
+    if len(text) <= limit:
+        return text
+    return f"{text[:limit]}..."
+
+
 def cache_key(value: str | None) -> str:
     """答案缓存的键: 去掉所有空白和首尾括号, 避免判断题/空格差异导致查不到."""
     text = re.sub(r"[\s\u3000]+", "", value or "")
@@ -480,7 +487,16 @@ async def answer_current(page: Page, cache: "AnswerCache", logger) -> dict | Non
         except Exception as error:
             logger.warn(f"第{question['number']}题作答失败: {type(error).__name__}")
     logger.info(
-        f"第{question['number']}题 {'命中缓存' if known else '未命中缓存'}: {picked}"
+        f"第{question['number']}题({'命中缓存' if known else '未命中缓存'}): "
+        f"{_brief(question['text'], 40)} -> {picked}"
+    )
+    logger.event(
+        "掌握度答题",
+        题号=question.get("number") or "?",
+        题型=question.get("type") or question.get("kind"),
+        题目=_brief(question["text"], 80),
+        命中缓存=bool(known),
+        答案=",".join(str(x) for x in picked),
     )
     return {"text": question["text"], "picked": picked, "cached": bool(known)}
 
@@ -597,9 +613,14 @@ async def submit_exam(page: Page, logger, cache=None) -> bool:
         for _ in range(20):
             await page.wait_for_timeout(1000)
             if "/point/" in page.url or "/examPreview/" in page.url:
+                logger.info("掌握度练习试卷已提交.")
+                logger.event("掌握度交卷", 结果="成功", 地址=page.url)
                 return True
         if "/point/" in page.url:
+            logger.info("掌握度练习试卷已提交.")
+            logger.event("掌握度交卷", 结果="成功", 地址=page.url)
             return True
+    logger.event("掌握度交卷", 结果="未确认跳转", 地址=page.url)
     return "/point/" in page.url
 
 
@@ -813,6 +834,8 @@ async def run_mastery(
                 logger.event("答案解析", 题目=len(answers), 来源="解析页")
             for text, answer in answers.items():
                 cache.put(text, answer)
+            if answers:
+                logger.info(f"本轮收录参考答案 {len(answers)} 题 (题库累计 {len(cache.items)} 题).")
             logger.event("答案入库", 本轮=len(answers), 累计=len(cache.items))
 
         await page.goto(learn_url, wait_until="domcontentloaded")
@@ -831,6 +854,7 @@ async def run_mastery(
                 "questions": len(answered),
             }
         )
+        logger.info(f"第 {attempt}/{rounds} 轮交卷后掌握度: {mastery}% (目标 {target}%)")
         logger.event("掌握度结果", 轮次=attempt, 掌握度=mastery)
         for item in captured:
             if "get-knowledge-mastery-stat" in item["url"]:
@@ -1121,6 +1145,11 @@ async def run_course_mastery(
         else:
             summary["failed"].append(record)
 
+    logger.info(
+        f"课程掌握度阶段完成: 达标 {len(summary['done'])} 个, "
+        f"跳过 {len(summary['skipped'])} 个, 未达标 {len(summary['failed'])} 个 "
+        f"(共 {len(summary['passes'])} 轮)."
+    )
     logger.event(
         "课程掌握度汇总",
         达标=len(summary["done"]),

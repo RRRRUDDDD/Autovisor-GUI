@@ -57,6 +57,7 @@ class _Page:
     def __init__(self):
         self.closed = False
         self.timeout = None
+        self.init_scripts = []
 
     async def close(self):
         self.closed = True
@@ -64,8 +65,8 @@ class _Page:
     def is_closed(self):
         return self.closed
 
-    async def add_init_script(self, **_kwargs):
-        pass
+    async def add_init_script(self, **kwargs):
+        self.init_scripts.append(kwargs)
 
     def set_default_timeout(self, timeout):
         self.timeout = timeout
@@ -74,6 +75,10 @@ class _Page:
 class _Context:
     def __init__(self):
         self.page = _Page()
+        self.added_cookies = None
+
+    async def add_cookies(self, cookies):
+        self.added_cookies = cookies
 
     async def new_page(self):
         return self.page
@@ -83,6 +88,11 @@ class _Browser:
     def __init__(self):
         self.contexts = [_Context()]
         self.closed = False
+        self.new_context_kwargs = None
+
+    async def new_context(self, **kwargs):
+        self.new_context_kwargs = kwargs
+        return self.contexts[0]
 
     async def close(self):
         self.closed = True
@@ -92,9 +102,14 @@ class _Chromium:
     def __init__(self):
         self.browser = _Browser()
         self.cdp_url = None
+        self.launch_kwargs = None
 
     async def connect_over_cdp(self, url):
         self.cdp_url = url
+        return self.browser
+
+    async def launch(self, **kwargs):
+        self.launch_kwargs = kwargs
         return self.browser
 
 
@@ -138,3 +153,40 @@ class BrowserSessionTests(unittest.IsolatedAsyncioTestCase):
         session = BrowserSession(browser, browser.contexts[0], _Page(), False)
         await session.close()
         self.assertTrue(browser.closed)
+
+    async def test_launch_session_uses_viewport_none_and_injects_stealth(self):
+        class _LaunchConfig:
+            attach_existing_chrome = False
+            cdp_url = "http://127.0.0.1:9222"
+            driver = "edge"
+            exe_path = ""
+            proxy = ""
+
+        with tempfile.TemporaryDirectory() as root:
+            playwright = _Playwright()
+            session = await create_browser_session(
+                playwright, _LaunchConfig(), [{"name": "a", "value": "b"}], _Logger(root)
+            )
+            self.assertFalse(session.attached)
+            self.assertEqual(session.browser.new_context_kwargs, {"viewport": None})
+            self.assertEqual(session.context.added_cookies, [{"name": "a", "value": "b"}])
+            self.assertIn("--no-first-run", playwright.chromium.launch_kwargs["args"])
+            self.assertIn("--no-default-browser-check", playwright.chromium.launch_kwargs["args"])
+            self.assertIn(
+                "--disable-backgrounding-occluded-windows",
+                playwright.chromium.launch_kwargs["args"],
+            )
+            self.assertIn(
+                "--disable-renderer-backgrounding",
+                playwright.chromium.launch_kwargs["args"],
+            )
+            self.assertIn(
+                "--disable-background-timer-throttling",
+                playwright.chromium.launch_kwargs["args"],
+            )
+            self.assertTrue(
+                any(
+                    "stealth.min.js" in str(call.get("path", ""))
+                    for call in session.page.init_scripts
+                )
+            )

@@ -498,6 +498,12 @@ async def solve_click_captcha(page: Page, modules: list[ModuleType], attempts: i
     target = await resolve_click_captcha_target(page)
     if target is None:
         return False
+    from modules.tencent_slider import has_slider_thumb
+
+    if await has_slider_thumb(target):
+        # 腾讯滑块与点选共用 tcaptcha iframe, 这里让给滑块模块处理。
+        logger.debug("检测到腾讯滑块验证, 跳过点选流程.")
+        return False
 
     for attempt in range(attempts):
         try:
@@ -519,10 +525,17 @@ async def solve_click_captcha(page: Page, modules: list[ModuleType], attempts: i
                 f"第{attempt + 1}次尝试点选验证: {instruction} -> "
                 f"({point[0]:.0f}, {point[1]:.0f})"
             )
+            logger.event(
+                "点选验证",
+                尝试=attempt + 1,
+                题目=instruction,
+                坐标=f"({point[0]:.0f},{point[1]:.0f})",
+            )
             await click_image_point(target, image_locator, point[0], point[1], image.shape)
             await page.wait_for_timeout(1200)
             if await resolve_click_captcha_target(page) is None:
                 logger.info("点选验证已成功通过.")
+                logger.event("点选验证", 结果="通过", 尝试=attempt + 1)
                 return True
             logger.warn(f"第{attempt + 1}次点选未通过,正在刷新...")
             await _refresh(target)
@@ -534,4 +547,5 @@ async def solve_click_captcha(page: Page, modules: list[ModuleType], attempts: i
             await _refresh(target)
             await page.wait_for_timeout(800)
     logger.warn("自动点选验证失败,请手动验证!")
+    logger.event("点选验证", 结果="失败", 尝试=attempts)
     return False

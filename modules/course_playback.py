@@ -123,7 +123,7 @@ async def learn_lesson(
 
             # 融合共享课 / AI 慕课: 随堂练习弹窗或课中练习面板自动选作答+提交。
             if catalog.handles_ai_exercise and await FusionAdapter.skip_blocking_quizzes(
-                page
+                page, config=config
             ):
                 retry_count = 0
                 last_activity = time.monotonic()
@@ -352,7 +352,7 @@ async def review_lesson(
         await run_on(
             page,
             COURSE_VIDEO_SELECTOR,
-            "(el) => { el.currentTime = 0; }",
+            "(el) => { el.currentTime = 0; if (el.paused && el.play) el.play().catch(() => {}); }",
             "重置播放进度",
         )
     except TargetClosedError:
@@ -384,7 +384,7 @@ async def review_lesson(
             if (
                 catalog is not None
                 and catalog.handles_ai_exercise
-                and await FusionAdapter.skip_blocking_quizzes(page)
+                and await FusionAdapter.skip_blocking_quizzes(page, config=config)
             ):
                 last_activity = time.monotonic()
                 continue
@@ -430,11 +430,22 @@ async def review_lesson(
                 start_time, paused_before + paused_time
             ):
                 return paused_time, False, True
-            show_course_progress(
-                desc="完成进度:",
-                cur_time=elapsed_minutes(start_time, paused_before + paused_time),
-                limit_time=config.limitMaxTime,
-            )
+            if config.limitMaxTime > 0:
+                show_course_progress(
+                    desc="复习进度:",
+                    cur_time=elapsed_minutes(start_time, paused_before + paused_time),
+                    limit_time=config.limitMaxTime,
+                )
+            else:
+                pct = (
+                    int(min(max(current_time / total_time, 0.0), 1.0) * 100)
+                    if is_valid_video_time(current_time) and has_valid_duration(total_time)
+                    else 0
+                )
+                show_course_progress(
+                    desc="复习进度:",
+                    cur_time=f"{pct}%",
+                )
             await asyncio.sleep(0.5)
         except LessonChanged as exc:
             exc.paused_time = paused_time

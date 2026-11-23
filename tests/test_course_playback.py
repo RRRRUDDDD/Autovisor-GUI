@@ -44,6 +44,37 @@ class CoursePlaybackTests(unittest.IsolatedAsyncioTestCase):
         result = await review_lesson(object(), 0, 0, _Config(), _Logger())
         self.assertEqual(result, (7.5, False, False))
 
+    async def test_review_lesson_reports_video_percentage_when_time_limit_is_zero(self):
+        with (
+            patch(
+                "modules.course_playback._wait_for_duration",
+                new_callable=AsyncMock,
+                return_value=(200.0, 0.0),
+            ),
+            patch("modules.course_playback.run_on", new_callable=AsyncMock),
+            patch(
+                "modules.course_playback.has_visible_verification",
+                new_callable=AsyncMock,
+                return_value=False,
+            ),
+            patch(
+                "modules.course_playback.has_visible_element",
+                new_callable=AsyncMock,
+                return_value=False,
+            ),
+            patch(
+                "modules.course_playback.get_video_attr",
+                new_callable=AsyncMock,
+                side_effect=[100.0, 200.0],
+            ),
+            patch("modules.course_playback.asyncio.sleep", new_callable=AsyncMock),
+            patch("modules.course_playback.show_course_progress") as show_progress,
+        ):
+            result = await review_lesson(object(), 0, 0, _Config(), _Logger())
+
+        self.assertEqual(result, (0.0, True, False))
+        show_progress.assert_called_once_with(desc="复习进度:", cur_time="50%")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -1,0 +1,54 @@
+[package]
+name = "autovisor-gui"
+version = "1.0.0"
+description = "知到 · 智慧树自动化学习助手桌面版"
+authors = ["RUD <92616185+RRRRUDDDD@users.noreply.github.com>", "PengChengxu"]
+license = "MIT"
+homepage = "https://github.com/RRRRUDDDD/Autovisor-GUI"
+repository = "https://github.com/RRRRUDDDD/Autovisor-GUI"
+edition = "2021"
+
+[lib]
+name = "autovisor_gui_lib"
+path = "src/lib.rs"
+
+[[bin]]
+name = "autovisor-gui"
+path = "src/main.rs"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["tray-icon"] }
+tauri-plugin-single-instance = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+rfd = { version = "0.15", default-features = false }
+tungstenite = { version = "0.24", default-features = false, features = ["handshake"] }
+reqwest = { version = "0.13", default-features = false, features = ["blocking", "json", "native-tls"] }
+
+[target.'cfg(windows)'.dependencies]
+winreg = "0.56"
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_System_JobObjects",
+    "Win32_System_Threading",
+    "Win32_Security",
+] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+rfd = { version = "0.15", default-features = false, features = ["gtk3"] }
+
+[features]
+default = ["custom-protocol"]
+custom-protocol = ["tauri/custom-protocol"]
+
+[profile.release]
+strip = true
+opt-level = "s"
+lto = false
+codegen-units = 4

@@ -7,6 +7,8 @@ from urllib.parse import urlparse
 from playwright.async_api import Locator, Page, TimeoutError
 
 from modules.course_runner import CourseOutcome
+from modules.popups import dismiss_course_popups
+from modules.progress import show_course_progress
 from modules.utils import get_video_attr
 
 
@@ -276,6 +278,8 @@ async def complete_document_resource(
     await page.wait_for_timeout(1500)
     for _ in range(rounds):
         if await is_resource_completed(resource):
+            logger.info("文档/PPT 资源已标记完成.")
+            logger.event("ai-smart 文档资源", 完成=True)
             return True
         # PPT/文档阅读器要先点一下内容区拿到焦点, 键盘翻页才生效
         try:
@@ -294,8 +298,11 @@ async def complete_document_resource(
             await page.wait_for_timeout(180)
         await page.wait_for_timeout(800)
     completed = await is_resource_completed(resource)
-    if not completed:
+    if completed:
+        logger.info("文档/PPT 资源已标记完成.")
+    else:
         logger.warn("文档资源翻页/滚动后仍未标记完成, 稍后再试.", shift=True)
+    logger.event("ai-smart 文档资源", 完成=completed)
     return completed
 
 
@@ -350,6 +357,25 @@ async def _play_video(page: Page) -> None:
             }
         }"""
     )
+
+
+async def _seek_video(page: Page, target_seconds: float) -> None:
+    try:
+        await page.evaluate(
+            """(target) => {
+                const list = [...document.querySelectorAll('video')]
+                    .sort((a, b) => (Number.isFinite(b.duration) ? b.duration : 0) - (Number.isFinite(a.duration) ? a.duration : 0));
+                const video = list[0];
+                if (!video) return;
+                video.currentTime = Math.max(0, target);
+                if (video.paused && video.play) {
+                    video.play().catch(() => {});
+                }
+            }""",
+            float(target_seconds),
+        )
+    except Exception:
+        pass
 
 
 def _time_limit_reached(config, started_at: float) -> bool:
@@ -495,6 +521,7 @@ async def watch_video_resource(
     logger,
     started_at: float,
     playback_enabled: asyncio.Event,
+    review_mode: bool = False,
 ) -> tuple[bool, bool]:
     await page.wait_for_selector("video", state="attached", timeout=VIDEO_READY_TIMEOUT_MS)
     playback_enabled.set()
@@ -524,10 +551,15 @@ async def watch_video_resource(
         )):
             segment_start = segment_end = None
             break
+    if review_mode:
+        # 复习模式从分段起点(或视频 0 秒)重播, 避免已完成视频停在末尾立刻结束
+        await _seek_video(page, segment_start if segment_start is not None else 0)
+        await asyncio.sleep(0.3)
     logger.event(
         "ai-smart 视频分段",
         开始=segment_start,
         结束=segment_end,
+        复习模式=review_mode,
     )
     last_time = -1.0
     last_activity = time.monotonic()
@@ -551,11 +583,13 @@ async def watch_video_resource(
                 interval=30,
                 当前=current_time,
                 分段结束=segment_end,
+                复习模式=review_mode,
             )
 
+            duration = None
             if segment_end is not None and current_time is not None:
                 if current_time >= segment_end - 1:
-                    if not await _wait_for_resource_completed(page, resource):
+                    if not review_mode and not await _wait_for_resource_completed(page, resource):
                         logger.warn("视频分段已播完, 但页面尚未标记资源完成.", shift=True)
                     return True, False
             else:
@@ -566,9 +600,13 @@ async def watch_video_resource(
                     and current_time is not None
                     and current_time >= duration - 1
                 ):
-                    await _wait_for_resource_completed(page, resource)
+                    if not review_mode:
+                        await _wait_for_resource_completed(page, resource)
                     return True, False
                 if time.monotonic() >= metadata_deadline:
+                    if review_mode:
+                        logger.warn("复习模式下无法读取视频时长/分段, 跳过当前资源.", shift=True)
+                        return False, False
                     logger.warn("视频时长/分段读不到, 改为轮询「已完成」标记.", shift=True)
                     return await _wait_until_completed(
                         page,
@@ -579,10 +617,30 @@ async def watch_video_resource(
                         title=await resource_title(resource),
                     )
 
+            if review_mode:
+                limit = getattr(config, "limitMaxTime", 0) or 0
+                if limit > 0:
+                    elapsed_min = max(0.0, (time.monotonic() - started_at) / 60)
+                    show_course_progress(
+                        desc="复习进度:",
+                        cur_time=elapsed_min,
+                        limit_time=limit,
+                    )
+                else:
+                    if segment_end is not None and current_time is not None:
+                        seg_start = segment_start or 0
+                        span = max(1, segment_end - seg_start)
+                        pct = int(min(max((current_time - seg_start) / span, 0.0), 1.0) * 100)
+                    elif isinstance(duration, (int, float)) and duration > 0 and current_time is not None:
+                        pct = int(min(max(current_time / duration, 0.0), 1.0) * 100)
+                    else:
+                        pct = 0
+                    show_course_progress(desc="复习进度:", cur_time=f"{pct}%")
+
             state = await get_video_state(page)
             if state and state.get("p"):
                 await _play_video(page)
-            if current_time is not None and current_time > last_time + 0.25:
+            if current_time is not None and abs(current_time - last_time) > 0.25:
                 last_time = current_time
                 last_activity = time.monotonic()
             if time.monotonic() - last_activity >= STALL_TIMEOUT_SECONDS:
@@ -596,6 +654,7 @@ async def watch_video_resource(
 async def _load_home(page: Page, home_url: str) -> None:
     await page.goto(home_url, wait_until="domcontentloaded")
     await page.wait_for_selector(KNOWLEDGE_CONTENT, state="attached", timeout=20_000)
+    await dismiss_course_popups(page, max_rounds=3, settle_ms=200)
 
 
 async def complete_resources_for_node(
@@ -613,6 +672,7 @@ async def complete_resources_for_node(
     try:
         await page.goto(learn_url, wait_until="domcontentloaded")
         await page.wait_for_selector(".resources-section", state="attached", timeout=25_000)
+        await dismiss_course_popups(page, max_rounds=3, settle_ms=200)
     except Exception as error:
         return {"ok": False, "reason": f"资源区未加载:{type(error).__name__}"}
     try:
@@ -631,6 +691,7 @@ async def complete_resources_for_node(
         title = await resource_title(resource)
         kind = await resource_type(resource)
         logger.info(f"正在补齐资源: {title} ({kind})")
+        logger.event("资源开始", 标题=title, 类型=kind, 阶段="补齐")
         if kind == "video":
             if not await activate_resource(page, resource):
                 logger.warn(f"资源无法激活: {title}", shift=True)
@@ -644,12 +705,16 @@ async def complete_resources_for_node(
                         "failed": failed, "time_limit": True}
             if completed:
                 done += 1
+                logger.info(f"资源补齐完成: {title}")
+                logger.event("ai-smart 资源完成", 标题=title, 类型=kind, 阶段="补齐")
             else:
                 logger.warn(f"视频未完成: {title}", shift=True)
                 failed += 1
         else:
             if await complete_document_resource(page, resource, logger):
                 done += 1
+                logger.info(f"资源补齐完成: {title}")
+                logger.event("ai-smart 资源完成", 标题=title, 类型=kind, 阶段="补齐")
             else:
                 failed += 1
     return {"ok": True, "done": done, "skipped": skipped, "failed": failed}
@@ -664,24 +729,115 @@ async def run_ai_smart_course(
 ) -> CourseOutcome:
     page.set_default_timeout(10_000)
     started_at = time.monotonic()
+    review_mode = getattr(config, "reviewMode", False) is True
     await _load_home(page, home_url)
     outline = await extract_outline(page)
     targets = build_targets(outline)
+    if not targets:
+        logger.error("ai-smart 课程大纲为空, 未找到可学习的子项目.", shift=True)
+        return CourseOutcome.FAILED
+
+    if review_mode:
+        logger.event(
+            "ai-smart 课程大纲",
+            模式="复习",
+            子项目=len(targets),
+            待核对=len(targets),
+        )
+        logger.info(f"ai-smart 进入复习模式，共 {len(targets)} 个子项目（仅重播视频资源）")
+        round_num = 1
+        while not page.is_closed():
+            videos_played = 0
+            for index, target in enumerate(targets, 1):
+                if _time_limit_reached(config, started_at):
+                    return CourseOutcome.TIME_LIMIT
+                playback_enabled.clear()
+                logger.info(f"正在复习子项目 {index}/{len(targets)}: {target.label}")
+                logger.context(
+                    子项目序号=f"{index}/{len(targets)}",
+                    子项目名称=target.label,
+                    模式="复习",
+                )
+                try:
+                    await _load_home(page, home_url)
+                    if not await open_target(page, target):
+                        logger.warn(f"未找到子项目: {target.label}", shift=True)
+                        continue
+                    resources = await list_required_resources(page)
+                    if not resources:
+                        continue
+                    for resource in resources:
+                        if _time_limit_reached(config, started_at):
+                            return CourseOutcome.TIME_LIMIT
+                        kind = await resource_type(resource)
+                        if kind != "video":
+                            continue
+                        title = await resource_title(resource)
+                        logger.info(f"正在复习资源: {title} ({kind})")
+                        logger.event("资源开始", 标题=title, 类型=kind, 阶段="复习")
+                        if not await activate_resource(page, resource):
+                            logger.warn(f"资源无法激活: {title}", shift=True)
+                            continue
+                        completed, reached_limit = await watch_video_resource(
+                            page,
+                            resource,
+                            config,
+                            logger,
+                            started_at,
+                            playback_enabled,
+                            review_mode=True,
+                        )
+                        if reached_limit:
+                            return CourseOutcome.TIME_LIMIT
+                        if completed:
+                            videos_played += 1
+                            logger.info(f"资源复习完成: {title}")
+                            logger.event(
+                                "ai-smart 资源复习完成",
+                                标题=title,
+                                类型=kind,
+                                轮次=round_num,
+                            )
+                        else:
+                            logger.warn(f"复习资源未完成: {title}", shift=True)
+                except Exception as exc:
+                    playback_enabled.clear()
+                    logger.log_exception(
+                        f"ai-smart 子项目复习失败: {target.label}", exc, shift=True
+                    )
+                finally:
+                    playback_enabled.clear()
+
+            if videos_played == 0:
+                logger.warn("ai-smart 课程中未找到可复习的视频资源.", shift=True)
+                return CourseOutcome.FAILED
+            limit = getattr(config, "limitMaxTime", 0) or 0
+            if limit > 0 and not _time_limit_reached(config, started_at):
+                round_num += 1
+                logger.info(
+                    f"ai-smart 本轮复习已播完全部视频资源，未达时长上限，开始第 {round_num} 轮循环复习..."
+                )
+                logger.event("ai-smart 复习循环", 轮次=round_num, 时限=f"{limit:g}min")
+                continue
+            logger.info("ai-smart 课程视频复习已完成!", shift=True)
+            logger.event("ai-smart 课程完成", 模式="复习")
+            return CourseOutcome.COMPLETED
+        return CourseOutcome.FAILED
+
     pending = incomplete_targets(outline)
     # 学习进度 100% 不代表「必学资源」都做完了: 文档/PPT/文献也要点开并翻完,
     # 所以这里不再只跑进度未满的子项目, 而是全部过一遍, 已完成的资源会被跳过.
     pending = targets
     logger.event(
         "ai-smart 课程大纲",
+        模式="学习",
         子项目=len(targets),
         进度未满=len(incomplete_targets(outline)),
         待核对=len(pending),
     )
-    if not targets:
-        logger.error("ai-smart 课程大纲为空, 未找到可学习的子项目.", shift=True)
-        return CourseOutcome.FAILED
     if not pending:
         logger.info("ai-smart 课程全部子项目已完成!", shift=True)
+        logger.event("ai-smart 课程完成", 模式="学习")
         return CourseOutcome.COMPLETED
 
     logger.info(f"ai-smart 待核对子项目: {len(pending)} 个")
@@ -691,7 +847,11 @@ async def run_ai_smart_course(
             return CourseOutcome.TIME_LIMIT
         playback_enabled.clear()
         logger.info(f"正在处理子项目 {index}/{len(pending)}: {target.label}")
-        logger.context(子项目序号=f"{index}/{len(pending)}", 子项目名称=target.label)
+        logger.context(
+            子项目序号=f"{index}/{len(pending)}",
+            子项目名称=target.label,
+            模式="学习",
+        )
         target_failed = False
         try:
             await _load_home(page, home_url)
@@ -711,9 +871,13 @@ async def run_ai_smart_course(
                 title = await resource_title(resource)
                 kind = await resource_type(resource)
                 logger.info(f"正在学习资源: {title} ({kind})")
+                logger.event("资源开始", 标题=title, 类型=kind, 阶段="学习")
                 if kind != "video":
                     # 文档/PPT/文献要滚到底才会被平台记为完成
-                    if not await complete_document_resource(page, resource, logger):
+                    if await complete_document_resource(page, resource, logger):
+                        logger.info(f"资源已完成: {title}")
+                        logger.event("ai-smart 资源完成", 标题=title, 类型=kind)
+                    else:
                         target_failed = True
                     continue
                 if not await activate_resource(page, resource):
@@ -734,6 +898,8 @@ async def run_ai_smart_course(
                     logger.warn(f"资源未完成: {title}", shift=True)
                     target_failed = True
                     break
+                logger.info(f"资源已完成: {title}")
+                logger.event("ai-smart 资源完成", 标题=title, 类型=kind)
         except Exception as exc:
             playback_enabled.clear()
             logger.log_exception(f"ai-smart 子项目处理失败: {target.label}", exc, shift=True)
@@ -749,4 +915,5 @@ async def run_ai_smart_course(
             logger.warn(f"- {target.label}", shift=True)
         return CourseOutcome.FAILED
     logger.info("ai-smart 课程全部必学资源已处理完成!", shift=True)
+    logger.event("ai-smart 课程完成", 模式="学习")
     return CourseOutcome.COMPLETED

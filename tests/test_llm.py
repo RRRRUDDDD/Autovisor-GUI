@@ -1,0 +1,495 @@
+import asyncio
+import unittest
+from unittest.mock import MagicMock, patch
+
+from modules import llm
+
+PAGE_TEXT = "在线测验页面文本，包含多道题目和选项。" * 5
+QUIZ_JSON = (
+    '{"questions": [{"index": 1, "question": "2+2=?", '
+    '"options": ["3", "4"], "type": "single", "answer": [1]}]}'
+)
+
+
+def _mock_response(payload: dict, status_code: int = 200):
+    resp = MagicMock()
+    resp.status_code = status_code
+    resp.json.return_value = payload
+    resp.text = ""
+    resp.raise_for_status.return_value = None
+    return resp
+
+
+class QuizPageAnswererTests(unittest.TestCase):
+    def tearDown(self):
+        llm.reset_cache()
+        llm.set_proxy("")
+
+    def test_prefers_zhidao_answerer_without_deepseek(self):
+        with patch("modules.llm.enabled", return_value=False):
+            questions = asyncio.run(
+                llm.solve_quiz_page(PAGE_TEXT, lambda prompt: QUIZ_JSON)
+            )
+        self.assertEqual(len(questions), 1)
+        self.assertEqual(questions[0]["question"], "2+2=?")
+        self.assertEqual(questions[0]["options"], ["3", "4"])
+        self.assertEqual(questions[0]["answer"], [1])
+
+    def test_parses_json_fenced_reply(self):
+        with patch("modules.llm.enabled", return_value=False):
+            questions = asyncio.run(
+                llm.solve_quiz_page(
+                    PAGE_TEXT, lambda prompt: f"<think>推理过程</think>\n```json\n{QUIZ_JSON}\n```"
+                )
+            )
+        self.assertEqual(len(questions), 1)
+        self.assertEqual(questions[0]["answer"], [1])
+
+    def test_falls_back_to_deepseek_when_answerer_fails(self):
+        def broken(prompt):
+            raise RuntimeError("zhidao down")
+
+        with patch("modules.llm.enabled", return_value=True), patch(
+            "modules.llm._conf",
+            return_value={
+                "api_base": "https://api.example.com",
+                "api_key": "key",
+                "model": "deepseek-chat",
+            },
+        ), patch("modules.llm._chat_sync", return_value=QUIZ_JSON) as chat:
+            questions = asyncio.run(llm.solve_quiz_page(PAGE_TEXT, broken))
+        self.assertEqual(len(questions), 1)
+        self.assertTrue(chat.called)
+
+    def test_returns_empty_when_no_source_available(self):
+        def broken(prompt):
+            raise RuntimeError("zhidao down")
+
+        with patch("modules.llm.enabled", return_value=False):
+            questions = asyncio.run(llm.solve_quiz_page(PAGE_TEXT, broken))
+        self.assertEqual(questions, [])
+
+
+class UniversalLlmProtocolTests(unittest.TestCase):
+    def tearDown(self):
+        llm.reset_cache()
+        llm.set_proxy("")
+
+    def test_build_endpoint_for_all_protocols(self):
+        self.assertEqual(
+            llm.build_endpoint("https://api.openai.com/v1", "gpt-4o", "openai"),
+            "https://api.openai.com/v1/chat/completions",
+        )
+        self.assertEqual(
+            llm.build_endpoint("https://api.openai.com/v1/chat/completions", "gpt-4o", "openai"),
+            "https://api.openai.com/v1/chat/completions",
+        )
+        self.assertEqual(
+            llm.build_endpoint("https://api.openai.com/v1", "gpt-5", "openai-responses"),
+            "https://api.openai.com/v1/responses",
+        )
+        self.assertEqual(
+            llm.build_endpoint("https://api.anthropic.com", "claude-sonnet-4-20250514", "anthropic"),
+            "https://api.anthropic.com/v1/messages",
+        )
+        self.assertEqual(
+            llm.build_endpoint("https://generativelanguage.googleapis.com/v1beta", "gemini-2.5-flash", "gemini"),
+            "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent",
+        )
+        self.assertEqual(
+            llm.build_endpoint("https://myres.openai.azure.com", "gpt4o-dep", "azure", "2024-10-21"),
+            "https://myres.openai.azure.com/openai/deployments/gpt4o-dep/chat/completions?api-version=2024-10-21",
+        )
+        self.assertEqual(
+            llm.build_endpoint("http://127.0.0.1:11434", "qwen2.5:7b", "ollama"),
+            "http://127.0.0.1:11434/api/chat",
+        )
+
+    def test_anthropic_protocol_request_and_response(self):
+        mock_resp = _mock_response(
+            {
+                "content": [
+                    {"type": "thinking", "thinking": "internal"},
+                    {"type": "text", "text": "正确答案B"},
+                ]
+            }
+        )
+        with patch("modules.llm.requests.post", return_value=mock_resp) as post:
+            reply = llm.chat_sync(
+                "题目",
+                conf_override={
+                    "provider": "anthropic",
+                    "api_format": "anthropic",
+                    "api_key": "sk-ant-123",
+                    "api_base": "https://api.anthropic.com",
+                    "model": "claude-sonnet-4-20250514",
+                },
+            )
+        self.assertEqual(reply, "正确答案B")
+        url = post.call_args[0][0]
+        headers = post.call_args[1]["headers"]
+        self.assertEqual(url, "https://api.anthropic.com/v1/messages")
+        self.assertEqual(headers["x-api-key"], "sk-ant-123")
+        self.assertEqual(headers["anthropic-version"], "2023-06-01")
+
+    def test_gemini_protocol_request_and_response(self):
+        mock_resp = _mock_response(
+            {
+                "candidates": [
+                    {
+                        "content": {
+                            "parts": [
+                                {"text": "思考...", "thought": True},
+                                {"text": "正确答案C"},
+                            ]
+                        }
+                    }
+                ]
+            }
+        )
+        with patch("modules.llm.requests.post", return_value=mock_resp) as post:
+            reply = llm.chat_sync(
+                "题目",
+                json_mode=True,
+                conf_override={
+                    "provider": "gemini",
+                    "api_format": "gemini",
+                    "api_key": "AIzaTestKey",
+                    "api_base": "https://generativelanguage.googleapis.com/v1beta",
+                    "model": "gemini-2.5-flash",
+                },
+            )
+        self.assertEqual(reply, "正确答案C")
+        url = post.call_args[0][0]
+        headers = post.call_args[1]["headers"]
+        body = post.call_args[1]["json"]
+        self.assertEqual(
+            url,
+            "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent",
+        )
+        self.assertEqual(headers["x-goog-api-key"], "AIzaTestKey")
+        self.assertEqual(body["generationConfig"]["responseMimeType"], "application/json")
+
+    def test_azure_protocol_uses_api_key_header_and_version(self):
+        mock_resp = _mock_response(
+            {"choices": [{"message": {"content": "Azure 答案"}}]}
+        )
+        with patch("modules.llm.requests.post", return_value=mock_resp) as post:
+            reply = llm.chat_sync(
+                "题目",
+                conf_override={
+                    "provider": "azure",
+                    "api_format": "azure",
+                    "api_key": "azure-key",
+                    "api_base": "https://demo.openai.azure.com",
+                    "model": "gpt4o-deploy",
+                    "api_version": "2024-10-21",
+                },
+            )
+        self.assertEqual(reply, "Azure 答案")
+        url = post.call_args[0][0]
+        headers = post.call_args[1]["headers"]
+        self.assertEqual(
+            url,
+            "https://demo.openai.azure.com/openai/deployments/gpt4o-deploy/chat/completions?api-version=2024-10-21",
+        )
+        self.assertEqual(headers["api-key"], "azure-key")
+        self.assertNotIn("Authorization", headers)
+
+    def test_ollama_local_works_without_api_key_and_bypasses_proxy(self):
+        ollama_conf = llm.normalize_conf(
+            {
+                "provider": "ollama",
+                "api_format": "ollama",
+                "api_key": "",
+                "api_base": "http://127.0.0.1:11434",
+                "model": "qwen2.5:7b",
+            }
+        )
+        llm.set_proxy("http://127.0.0.1:7890")
+        with patch("modules.llm._conf", return_value=ollama_conf):
+            self.assertTrue(llm.enabled())
+
+        mock_resp = _mock_response(
+            {"message": {"content": "<think>推理</think>本地模型答案"}}
+        )
+        with patch("modules.llm.requests.post", return_value=mock_resp) as post:
+            reply = llm.chat_sync("题目", conf_override=ollama_conf)
+        self.assertEqual(reply, "本地模型答案")
+        self.assertEqual(post.call_args[0][0], "http://127.0.0.1:11434/api/chat")
+        self.assertNotIn("proxies", post.call_args[1])
+
+    def test_openai_responses_protocol(self):
+        mock_resp = _mock_response({"output_text": "Responses 答案"})
+        with patch("modules.llm.requests.post", return_value=mock_resp) as post:
+            reply = llm.chat_sync(
+                "题目",
+                conf_override={
+                    "provider": "openai",
+                    "api_format": "openai-responses",
+                    "api_key": "sk-test",
+                    "api_base": "https://api.openai.com/v1",
+                    "model": "gpt-5",
+                },
+            )
+        self.assertEqual(reply, "Responses 答案")
+        self.assertEqual(post.call_args[0][0], "https://api.openai.com/v1/responses")
+
+    def test_openai_400_retries_without_temperature_and_response_format(self):
+        bad = _mock_response({"error": {"message": "temperature not supported"}}, status_code=400)
+        good = _mock_response({"choices": [{"message": {"content": "推理模型答案"}}]})
+        with patch("modules.llm.requests.post", side_effect=[bad, good]) as post:
+            reply = llm.chat_sync(
+                "题目",
+                json_mode=True,
+                conf_override={
+                    "provider": "openai",
+                    "api_format": "openai",
+                    "api_key": "sk-test",
+                    "api_base": "https://api.openai.com/v1",
+                    "model": "o4-mini",
+                },
+            )
+        self.assertEqual(reply, "推理模型答案")
+        self.assertEqual(post.call_count, 2)
+        first_body = post.call_args_list[0][1]["json"]
+        second_body = post.call_args_list[1][1]["json"]
+        self.assertIn("temperature", first_body)
+        self.assertIn("response_format", first_body)
+        self.assertNotIn("temperature", second_body)
+        self.assertNotIn("response_format", second_body)
+
+
+class LlmAnsweringLogTests(unittest.TestCase):
+    def tearDown(self):
+        llm.reset_cache()
+        llm.set_proxy("")
+
+    def test_pick_option_logs_question_and_selected_option(self):
+        infos = []
+        events = []
+
+        class _CaptureLogger:
+            def info(self, msg, shift=False):
+                infos.append(msg)
+
+            def warn(self, msg, shift=False):
+                pass
+
+            def debug(self, msg):
+                pass
+
+            def event(self, name, interval=None, **fields):
+                events.append((name, fields))
+
+            @staticmethod
+            def summarize_exception(exc):
+                return f"{type(exc).__name__}: {exc}"
+
+        async def fake_ask(_q, _opts):
+            return "选项B"
+
+        with (
+            patch.object(llm, "logger", _CaptureLogger()),
+            patch("modules.llm.enabled", return_value=True),
+            patch("modules.llm.provider_label", return_value="DeepSeek(deepseek-chat)"),
+            patch("modules.llm._ask_llm", side_effect=fake_ask),
+        ):
+            idx = asyncio.run(llm.pick_option("下列哪项正确？", ["选项A", "选项B"]))
+
+        self.assertEqual(idx, 1)
+        self.assertTrue(any("下列哪项正确" in m and "选项B" in m for m in infos))
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0][0], "大模型选题")
+        self.assertEqual(events[0][1]["选项"], "选项B")
+        self.assertIn("下列哪项正确", events[0][1]["题目"])
+
+    def test_answer_with_llm_logs_info_and_event(self):
+        infos = []
+        events = []
+
+        class _CaptureLogger:
+            def info(self, msg, shift=False):
+                infos.append(msg)
+
+            def warn(self, msg, shift=False):
+                pass
+
+            def debug(self, msg):
+                pass
+
+            def event(self, name, interval=None, **fields):
+                events.append((name, fields))
+
+            @staticmethod
+            def summarize_exception(exc):
+                return f"{type(exc).__name__}: {exc}"
+
+        class _Choice:
+            def __init__(self, text):
+                self._text = text
+                self.clicked = False
+
+            async def inner_text(self):
+                return self._text
+
+            async def click(self, timeout=2000):
+                self.clicked = True
+
+        class _Title:
+            async def inner_text(self):
+                return "1+1等于几？"
+
+        class _Page:
+            async def query_selector(self, selector):
+                if selector == ".topic-title":
+                    return _Title()
+                return None
+
+            async def wait_for_timeout(self, _ms):
+                return None
+
+        choices = [_Choice("1"), _Choice("2")]
+
+        async def fake_ask(_q, _opts):
+            return "2"
+
+        with (
+            patch.object(llm, "logger", _CaptureLogger()),
+            patch("modules.llm.enabled", return_value=True),
+            patch("modules.llm.provider_label", return_value="OpenAI(gpt-4o)"),
+            patch("modules.llm._ask_llm", side_effect=fake_ask),
+        ):
+            ok = asyncio.run(llm.answer_with_llm(_Page(), None, choices))
+
+        self.assertTrue(ok)
+        self.assertTrue(choices[1].clicked)
+        self.assertTrue(any("1+1等于几" in m and "选择「2」" in m for m in infos))
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0][0], "课中答题")
+        self.assertEqual(events[0][1]["结果"], "已作答")
+        self.assertEqual(events[0][1]["选项"], "2")
+
+    def test_pick_option_and_answer_with_llm_prefer_zhidao_without_custom_llm(self):
+        class _Choice:
+            def __init__(self, text):
+                self._text = text
+                self.clicked = False
+
+            async def inner_text(self):
+                return self._text
+
+            async def click(self, timeout=2000):
+                self.clicked = True
+
+        class _Title:
+            async def inner_text(self):
+                return "狭义相对论中洛伦兹因子满足？"
+
+        class _Page:
+            async def query_selector(self, selector):
+                if selector == ".topic-title":
+                    return _Title()
+                return None
+
+            async def wait_for_timeout(self, _ms):
+                return None
+
+        with patch("modules.llm.enabled", return_value=False):
+            idx = asyncio.run(
+                llm.pick_option(
+                    "狭义相对论中洛伦兹因子满足？",
+                    ["A. γ < 1", "B. γ >= 1"],
+                    answerer=lambda _prompt: "正确答案是 B",
+                )
+            )
+            self.assertEqual(idx, 1)
+
+            choices = [_Choice("γ < 1"), _Choice("γ >= 1")]
+            ok = asyncio.run(
+                llm.answer_with_llm(
+                    _Page(),
+                    None,
+                    choices,
+                    answerer=lambda _prompt: "γ >= 1",
+                )
+            )
+            self.assertTrue(ok)
+            self.assertTrue(choices[1].clicked)
+
+    def test_pick_option_falls_back_to_custom_llm_when_zhidao_fails(self):
+        def broken(_prompt):
+            raise RuntimeError("zhidao down")
+
+        async def fake_ask(_q, _opts):
+            return "选项A"
+
+        with (
+            patch("modules.llm.enabled", return_value=True),
+            patch("modules.llm.provider_label", return_value="DeepSeek(deepseek-chat)"),
+            patch("modules.llm._ask_llm", side_effect=fake_ask),
+        ):
+            idx = asyncio.run(
+                llm.pick_option("测试题", ["选项A", "选项B"], answerer=broken)
+            )
+        self.assertEqual(idx, 0)
+
+    def test_build_models_endpoint_all_protocols(self):
+        self.assertEqual(
+            llm.build_models_endpoint("https://api.openai.com/v1", "openai"),
+            "https://api.openai.com/v1/models",
+        )
+        self.assertEqual(
+            llm.build_models_endpoint("https://api.anthropic.com", "anthropic"),
+            "https://api.anthropic.com/v1/models",
+        )
+        self.assertEqual(
+            llm.build_models_endpoint("https://generativelanguage.googleapis.com/v1beta", "gemini"),
+            "https://generativelanguage.googleapis.com/v1beta/models",
+        )
+        self.assertEqual(
+            llm.build_models_endpoint("http://127.0.0.1:11434", "ollama"),
+            "http://127.0.0.1:11434/api/tags",
+        )
+        with self.assertRaises(ValueError):
+            llm.build_models_endpoint("https://x.openai.azure.com", "azure")
+
+    def test_connection_and_fetch_models_via_requests(self):
+        class _Resp:
+            def __init__(self, payload, status_code=200):
+                self._payload = payload
+                self.status_code = status_code
+                self.text = str(payload)
+
+            def json(self):
+                return self._payload
+
+            def raise_for_status(self):
+                if self.status_code >= 400:
+                    raise RuntimeError(f"HTTP {self.status_code}")
+
+        cfg = {
+            "provider": "deepseek",
+            "apiFormat": "openai",
+            "apiBase": "https://api.deepseek.com",
+            "apiKey": "sk-test-123",
+            "model": "deepseek-chat",
+        }
+        with patch(
+            "modules.llm.requests.post",
+            return_value=_Resp({"choices": [{"message": {"content": "OK"}}]}),
+        ):
+            msg = llm.test_connection(cfg)
+            self.assertIn("连接成功", msg)
+            self.assertIn("OK", msg)
+
+        with patch(
+            "modules.llm.requests.get",
+            return_value=_Resp({"data": [{"id": "deepseek-reasoner"}, {"id": "deepseek-chat"}]}),
+        ):
+            models = llm.fetch_models(cfg)
+            self.assertEqual(models, ["deepseek-chat", "deepseek-reasoner"])
+
+
+if __name__ == "__main__":
+    unittest.main()

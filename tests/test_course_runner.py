@@ -87,6 +87,33 @@ class CourseRunnerTests(unittest.IsolatedAsyncioTestCase):
         self.assertIs(result, CourseOutcome.FAILED)
         filtered.assert_not_awaited()
 
+    async def test_completed_course_is_skipped_when_review_mode_is_off(self):
+        page = Mock()
+        page.is_closed = Mock(return_value=False)
+        page.wait_for_selector = AsyncMock()
+        page.wait_for_timeout = AsyncMock()
+        lesson = Mock(key="completed", click=AsyncMock())
+        with (
+            patch(
+                "modules.course_runner.get_filtered_class",
+                AsyncMock(side_effect=[[], [lesson]]),
+            ),
+            patch("modules.course_runner.review_lesson", AsyncMock()) as review,
+            patch("modules.course_runner.learn_lesson", AsyncMock()) as learn,
+        ):
+            result = await run_course(
+                page,
+                LEGACY_CATALOG,
+                Mock(limitMaxTime=0, reviewMode=False),
+                Mock(),
+                asyncio.Event(),
+            )
+
+        self.assertIs(result, CourseOutcome.COMPLETED)
+        lesson.click.assert_not_awaited()
+        review.assert_not_awaited()
+        learn.assert_not_awaited()
+
     async def test_review_mode_still_plays_completed_lessons(self):
         page = Mock()
         page.is_closed = Mock(return_value=False)
@@ -96,7 +123,7 @@ class CourseRunnerTests(unittest.IsolatedAsyncioTestCase):
         with (
             patch(
                 "modules.course_runner.get_filtered_class",
-                AsyncMock(side_effect=[[], [lesson], [lesson], [lesson]]),
+                AsyncMock(side_effect=[[lesson], [lesson], [lesson]]),
             ),
             patch("modules.course_runner.lesson_progress", AsyncMock(return_value=100)),
             patch(
@@ -121,9 +148,70 @@ class CourseRunnerTests(unittest.IsolatedAsyncioTestCase):
             ) as review,
         ):
             result = await run_course(
-                page, LEGACY_CATALOG, Mock(limitMaxTime=0), Mock(), asyncio.Event()
+                page,
+                LEGACY_CATALOG,
+                Mock(limitMaxTime=0, reviewMode=True),
+                Mock(),
+                asyncio.Event(),
             )
 
         self.assertIs(result, CourseOutcome.COMPLETED)
         lesson.click.assert_awaited_once()
         review.assert_awaited_once()
+
+    async def test_review_mode_loops_until_time_limit_is_reached(self):
+        page = Mock()
+        page.is_closed = Mock(return_value=False)
+        page.wait_for_selector = AsyncMock()
+        page.wait_for_timeout = AsyncMock()
+        lesson = Mock(key="completed", click=AsyncMock())
+        review_calls = 0
+
+        async def fake_review(*args, **kwargs):
+            nonlocal review_calls
+            review_calls += 1
+            if review_calls == 1:
+                return (0, True, False)
+            return (0, False, True)
+
+        with (
+            patch(
+                "modules.course_runner.get_filtered_class",
+                AsyncMock(return_value=[lesson]),
+            ),
+            patch("modules.course_runner.lesson_progress", AsyncMock(return_value=100)),
+            patch(
+                "modules.course_runner.lesson_key",
+                AsyncMock(side_effect=lambda row, _: row.key),
+            ),
+            patch(
+                "modules.course_runner.active_lesson",
+                AsyncMock(return_value=None),
+            ),
+            patch(
+                "modules.course_runner.get_lesson_name",
+                AsyncMock(return_value="Completed"),
+            ),
+            patch(
+                "modules.course_runner.wait_for_lesson_active",
+                AsyncMock(return_value=True),
+            ),
+            patch(
+                "modules.course_runner.elapsed_minutes",
+                return_value=5.0,
+            ),
+            patch(
+                "modules.course_runner.review_lesson",
+                AsyncMock(side_effect=fake_review),
+            ) as review,
+        ):
+            result = await run_course(
+                page,
+                LEGACY_CATALOG,
+                Mock(limitMaxTime=30, reviewMode=True),
+                Mock(),
+                asyncio.Event(),
+            )
+
+        self.assertIs(result, CourseOutcome.TIME_LIMIT)
+        self.assertEqual(review.await_count, 2)

@@ -2,6 +2,11 @@
 ;配置账号密码，留空则打开网页后需手动登录
 username =
 password =
+;可选: 启用终端二维码登录(适合无头 / SSH 环境)
+qrLogin = False
+qrTerminal = False
+qrUnicode = False
+qrSaveDir =
 
 [browser-option]
 ;Linux 默认使用 Playwright 自带的 Chromium
@@ -9,14 +14,25 @@ password =
 driver = chromium
 ;指定浏览器所在路径，留空则使用 Playwright 自带的 Chromium
 EXE_PATH =
+;可选: 配置代理服务器(支持 http:// / https:// / socks5://)
+proxy =
 
 [script-option]
 ;是否自动过登录时的滑块验证(默认:True)，需要 uv sync --extra captcha
 enableAutoCaptcha = True
 ;是否自动隐藏浏览器窗口(默认:False)，Linux 下无效
 enableHideWindow = False
-;是否展示赞赏码(默认:True)
-showDonateCode = True
+;刷课任务完成后自动关机(默认:False)
+shutdownOnComplete = False
+
+[notification]
+;可选: 远程消息推送(ServerChan / Qmsg / Bark / Telegram)
+provider =
+url =
+tg_chat_id =
+notifyOnVerify = True
+notifyOnFinish = True
+notifyOnError = True
 
 [course-option]
 ;限制每门课程刷课时长/min (不限制:0)
@@ -25,6 +41,14 @@ limitMaxTime = 0
 limitSpeed = 1.0
 ;设置是否静音播放 (默认:True)
 soundOff = True
+;复习模式/刷习惯分: 忽略已完成状态重播视频, 设置 limitMaxTime 时循环刷满时长 (默认:False)
+reviewMode = False
+;AI智慧课: 是否先用接口版 ExamCtx 刷计分考试并交卷 (默认:True)
+enableExamApi = True
+;复习/模拟考试页: 是否捕获新页面并用接口直接作答交卷 (默认:False, 正式考试勿开)
+enableReviewExamApi = False
+;课中弹题: 是否优先用智慧树 AI 作答, 失败回退自定义大模型 (默认:True)
+enableZhidaoQuiz = True
 
 [course-url]
 ;配置要学习的课程链接,支持(智慧)共享课

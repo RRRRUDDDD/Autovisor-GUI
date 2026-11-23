@@ -1,0 +1,308 @@
+name: Build & Release Windows Packages
+
+on:
+  workflow_dispatch:
+    inputs:
+      publish_release:
+        description: Publish the verified build to GitHub Releases
+        required: false
+        default: false
+        type: boolean
+      release_tag:
+        description: Optional release tag (e.g. v1.0.0); blank uses v<version> from source
+        required: false
+        default: ""
+        type: string
+  push:
+    branches:
+      - main
+    tags:
+      - "v*"
+      - "[0-9]+.[0-9]+.[0-9]+*"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-release-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: pwsh
+
+jobs:
+  test:
+    name: Verify Tests (Windows)
+    runs-on: windows-latest
+    timeout-minutes: 30
+    env:
+      PYTHONUTF8: "1"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+          cache-dependency-path: gui/package-lock.json
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Cache Rust
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "gui/src-tauri -> target"
+
+      - name: Setup uv & Python
+        uses: astral-sh/setup-uv@v10.1.0
+        with:
+          python-version: "3.12"
+          enable-cache: true
+
+      - name: Install Python dependencies
+        run: uv sync --extra captcha
+
+      - name: Verify backend dependencies and run Python unit tests
+        run: |
+          uv run --no-sync python backend_server.py --verify-deps
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          uv run --no-sync python -m unittest discover -s tests -v
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Frontend test & build
+        working-directory: gui
+        run: |
+          npm ci
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          npm test
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          npm run build
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Rust unit tests
+        working-directory: gui/src-tauri
+        run: |
+          cargo test
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+  build-windows:
+    name: Build Windows Installer & Portable
+    needs: [test]
+    runs-on: windows-latest
+    timeout-minutes: 90
+    permissions:
+      contents: write
+    env:
+      PYTHONUTF8: "1"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+          cache-dependency-path: gui/package-lock.json
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Cache Rust
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "gui/src-tauri -> target"
+
+      - name: Setup uv & Python
+        uses: astral-sh/setup-uv@v10.1.0
+        with:
+          python-version: "3.12"
+          enable-cache: true
+
+      - name: Install Python dependencies
+        run: uv sync --extra captcha
+
+      - name: Validate version and resolve release tag
+        env:
+          REQUESTED_RELEASE_TAG: ${{ inputs.release_tag }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $pyVersion = (uv run --no-sync python -c "from modules.version import __gui_version__; print(__gui_version__)" | Select-Object -Last 1).Trim()
+          $tauriConf = Get-Content -Raw -Encoding UTF8 gui/src-tauri/tauri.conf.json | ConvertFrom-Json
+          $tauriVersion = [string]$tauriConf.version
+          if (-not $pyVersion -or $pyVersion -ne $tauriVersion) {
+            throw "版本号不一致: modules/version.py __gui_version__ ($pyVersion) != tauri.conf.json ($tauriVersion)"
+          }
+
+          $releaseTag = "v$pyVersion"
+          if ($env:GITHUB_REF_TYPE -eq "tag" -and $env:GITHUB_REF_NAME) {
+            $releaseTag = $env:GITHUB_REF_NAME.Trim()
+          } elseif ($env:REQUESTED_RELEASE_TAG -and $env:REQUESTED_RELEASE_TAG.Trim()) {
+            $releaseTag = $env:REQUESTED_RELEASE_TAG.Trim()
+          }
+
+          $normalizedTagVersion = $releaseTag.TrimStart("v", "V")
+          if ($normalizedTagVersion -ne $pyVersion) {
+            throw "Release Tag ($releaseTag) 与源码版本号 ($pyVersion) 不匹配"
+          }
+
+          "APP_VERSION=$pyVersion" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "RELEASE_TAG=$releaseTag" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          Write-Host "Resolved APP_VERSION=$pyVersion, RELEASE_TAG=$releaseTag"
+
+      - name: Install frontend dependencies
+        working-directory: gui
+        run: |
+          npm ci
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Build and verify frozen Python backend
+        run: |
+          uv run --with pyinstaller python build_backend.py
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+          $requiredPaths = @(
+            "dist/autovisor-backend/autovisor-backend.exe",
+            "dist/autovisor-backend/internal/python3.dll",
+            "dist/autovisor-backend/internal/numpy",
+            "dist/autovisor-backend/internal/cv2",
+            "dist/autovisor-backend/resources/stealth.min.js",
+            "dist/autovisor-backend/resources/mirrors.json",
+            "dist/autovisor-backend/resources/config.ini.example",
+            "dist/autovisor-backend/resources/scripts/zhs_dom_extract.js",
+            "dist/autovisor-backend/resources/scripts/zhs_tab_switch.js"
+          )
+          foreach ($p in $requiredPaths) {
+            if (-not (Test-Path -LiteralPath $p)) {
+              throw "内置后端缺少必需文件或目录: $p"
+            }
+          }
+
+      - name: Build Windows NSIS Setup Installer
+        run: |
+          pwsh -NoProfile -ExecutionPolicy Bypass -File gui/build-installer.ps1 -SkipBackendBuild
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Build Windows Portable Package
+        run: |
+          $ErrorActionPreference = "Stop"
+          pwsh -NoProfile -ExecutionPolicy Bypass -File gui/build-portable.ps1 -SkipBackendBuild -SkipTauriBuild
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+          $portableDirName = "Autovisor-GUI-$($env:APP_VERSION)-windows-amd64"
+          $portableDir = Join-Path "dist" $portableDirName
+          $portableBackendExe = Join-Path $portableDir "runtime/autovisor-backend.exe"
+
+          foreach ($item in @(
+            (Join-Path $portableDir "Autovisor GUI.exe"),
+            (Join-Path $portableDir ".portable"),
+            $portableBackendExe
+          )) {
+            if (-not (Test-Path -LiteralPath $item)) {
+              throw "便携版目录缺少关键文件: $item"
+            }
+          }
+
+          & $portableBackendExe --verify-deps
+          if ($LASTEXITCODE -ne 0) {
+            throw "便携版内置后端依赖自检失败 (exit=$LASTEXITCODE)"
+          }
+          $strayLogs = Join-Path $portableDir "runtime/logs"
+          if (Test-Path -LiteralPath $strayLogs) {
+            Remove-Item -Recurse -Force -LiteralPath $strayLogs
+          }
+
+          $portableZip = Join-Path "dist" "$portableDirName.zip"
+          if (Test-Path -LiteralPath $portableZip) {
+            Remove-Item -Force -LiteralPath $portableZip
+          }
+          Push-Location "dist"
+          try {
+            7z a -tzip "$portableDirName.zip" "$portableDirName" -mx=7 | Out-Null
+            if ($LASTEXITCODE -ne 0) {
+              throw "7z 打包便携版失败 (exit=$LASTEXITCODE)"
+            }
+          } finally {
+            Pop-Location
+          }
+
+      - name: Verify release artifacts and generate SHA256SUMS
+        run: |
+          $ErrorActionPreference = "Stop"
+          $installerName = "Autovisor-GUI-Setup-$($env:APP_VERSION)-windows-x64.exe"
+          $portableZipName = "Autovisor-GUI-$($env:APP_VERSION)-windows-amd64.zip"
+          $installerPath = Join-Path "dist" $installerName
+          $portableZipPath = Join-Path "dist" $portableZipName
+
+          foreach ($artifact in @($installerPath, $portableZipPath)) {
+            if (-not (Test-Path -LiteralPath $artifact)) {
+              throw "未找到发行产物: $artifact"
+            }
+            $size = (Get-Item -LiteralPath $artifact).Length
+            if ($size -lt 1048576) {
+              throw "发行产物体积异常 ($size bytes): $artifact"
+            }
+          }
+
+          $zipListing = (7z l $portableZipPath) -join "`n"
+          foreach ($entry in @("Autovisor GUI.exe", ".portable", "autovisor-backend.exe")) {
+            if ($zipListing -notmatch [regex]::Escape($entry)) {
+              throw "便携版压缩包缺少条目: $entry"
+            }
+          }
+
+          $sumLines = @()
+          foreach ($fileName in @($installerName, $portableZipName)) {
+            $filePath = Join-Path "dist" $fileName
+            $hash = (Get-FileHash -LiteralPath $filePath -Algorithm SHA256).Hash.ToLowerInvariant()
+            $line = "$hash  $fileName"
+            $line | Set-Content -LiteralPath "$filePath.sha256" -Encoding ascii
+            $sumLines += $line
+          }
+          $sumLines | Set-Content -LiteralPath "dist/SHA256SUMS.txt" -Encoding ascii
+          Get-Content -LiteralPath "dist/SHA256SUMS.txt"
+
+      - name: Upload Windows Setup Installer Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Autovisor-GUI-Setup-${{ env.APP_VERSION }}-windows-x64
+          path: dist/Autovisor-GUI-Setup-${{ env.APP_VERSION }}-windows-x64.exe
+          if-no-files-found: error
+
+      - name: Upload Windows Portable Zip Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Autovisor-GUI-${{ env.APP_VERSION }}-windows-amd64
+          path: dist/Autovisor-GUI-${{ env.APP_VERSION }}-windows-amd64.zip
+          if-no-files-found: error
+
+      - name: Upload SHA256SUMS Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: SHA256SUMS-${{ env.APP_VERSION }}
+          path: |
+            dist/SHA256SUMS.txt
+            dist/*.sha256
+          if-no-files-found: error
+
+      - name: Publish GitHub Release
+        if: success() && (startsWith(github.ref, 'refs/tags/') || (github.event_name == 'workflow_dispatch' && inputs.publish_release))
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.RELEASE_TAG }}
+          name: Autovisor GUI ${{ env.RELEASE_TAG }}
+          target_commitish: ${{ github.sha }}
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          files: |
+            dist/Autovisor-GUI-Setup-${{ env.APP_VERSION }}-windows-x64.exe
+            dist/Autovisor-GUI-${{ env.APP_VERSION }}-windows-amd64.zip
+            dist/SHA256SUMS.txt

@@ -1,0 +1,220 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    color-scheme: light;
+
+    /* Material Design 3 Light Scheme — Academic Sapphire Seed (#3B62C6) */
+    --md-primary: 54 91 182;                    /* #365BB6 */
+    --md-on-primary: 255 255 255;               /* #FFFFFF */
+    --md-primary-container: 217 226 255;        /* #D9E2FF */
+    --md-on-primary-container: 0 25 71;         /* #001947 */
+
+    --md-secondary: 87 94 113;                  /* #575E71 */
+    --md-on-secondary: 255 255 255;             /* #FFFFFF */
+    --md-secondary-container: 219 226 249;      /* #DBE2F9 */
+    --md-on-secondary-container: 20 27 44;      /* #141B2C */
+
+    --md-tertiary: 113 85 115;                  /* #715573 */
+    --md-on-tertiary: 255 255 255;              /* #FFFFFF */
+    --md-tertiary-container: 252 215 251;       /* #FCD7FB */
+    --md-on-tertiary-container: 41 19 45;       /* #29132D */
+
+    --md-surface: 250 248 255;                  /* #FAF8FF */
+    --md-surface-dim: 218 217 224;              /* #DAD9E0 */
+    --md-surface-container-lowest: 255 255 255; /* #FFFFFF */
+    --md-surface-container-low: 243 243 250;    /* #F3F3FA */
+    --md-surface-container: 237 237 244;        /* #EDEDF4 */
+    --md-surface-container-high: 231 232 238;   /* #E7E8EE */
+    --md-surface-container-highest: 226 226 233;/* #E2E2E9 */
+
+    --md-on-surface: 26 27 32;                  /* #1A1B20 */
+    --md-on-surface-variant: 68 71 79;          /* #44474F */
+    --md-outline: 116 119 127;                  /* #74777F */
+    --md-outline-variant: 196 198 208;          /* #C4C6D0 */
+
+    --md-error: 186 26 26;                      /* #BA1A1A */
+    --md-on-error: 255 255 255;                 /* #FFFFFF */
+    --md-error-container: 255 218 214;          /* #FFDAD6 */
+    --md-on-error-container: 65 0 2;            /* #410002 */
+
+    --md-success: 23 114 70;                    /* #177246 */
+    --md-success-container: 204 242 220;        /* #CCF2DC */
+    --md-on-success-container: 6 56 32;         /* #063820 */
+
+    --md-warning: 158 96 0;                     /* #9E6000 */
+    --md-warning-container: 255 231 194;        /* #FFE7C2 */
+    --md-on-warning-container: 54 31 0;         /* #361F00 */
+  }
+
+  .dark {
+    color-scheme: dark;
+
+    /* Material Design 3 Dark Scheme — Academic Sapphire Seed (#3B62C6) */
+    --md-primary: 176 198 255;                  /* #B0C6FF */
+    --md-on-primary: 0 44 113;                  /* #002C71 */
+    --md-primary-container: 24 67 156;          /* #18439C */
+    --md-on-primary-container: 217 226 255;     /* #D9E2FF */
+
+    --md-secondary: 191 198 220;                /* #BFC6DC */
+    --md-on-secondary: 41 48 66;                /* #293042 */
+    --md-secondary-container: 63 71 89;         /* #3F4759 */
+    --md-on-secondary-container: 219 226 249;   /* #DBE2F9 */
+
+    --md-tertiary: 223 187 222;                 /* #DFBBDE */
+    --md-on-tertiary: 64 40 67;                 /* #402843 */
+    --md-tertiary-container: 88 62 91;          /* #583E5B */
+    --md-on-tertiary-container: 252 215 251;    /* #FCD7FB */
+
+    --md-surface: 17 19 24;                     /* #111318 */
+    --md-surface-dim: 17 19 24;                 /* #111318 */
+    --md-surface-container-lowest: 12 14 19;    /* #0C0E13 */
+    --md-surface-container-low: 25 28 34;       /* #191C22 */
+    --md-surface-container: 29 32 38;           /* #1D2026 */
+    --md-surface-container-high: 40 42 49;      /* #282A31 */
+    --md-surface-container-highest: 51 53 60;   /* #33353C */
+
+    --md-on-surface: 226 226 233;               /* #E2E2E9 */
+    --md-on-surface-variant: 196 198 208;       /* #C4C6D0 */
+    --md-outline: 142 144 153;                  /* #8E9099 */
+    --md-outline-variant: 68 71 79;             /* #44474F */
+
+    --md-error: 255 180 171;                    /* #FFB4AB */
+    --md-on-error: 105 0 5;                     /* #690005 */
+    --md-error-container: 147 0 10;             /* #93000A */
+    --md-on-error-container: 255 218 214;       /* #FFDAD6 */
+
+    --md-success: 129 216 168;                  /* #81D8A8 */
+    --md-success-container: 12 79 47;           /* #0C4F2F */
+    --md-on-success-container: 204 242 220;     /* #CCF2DC */
+
+    --md-warning: 255 190 107;                  /* #FFBE6B */
+    --md-warning-container: 97 58 0;            /* #613A00 */
+    --md-on-warning-container: 255 231 194;     /* #FFE7C2 */
+  }
+
+  * {
+    @apply border-outline-variant;
+  }
+
+  html {
+    min-width: 320px;
+    font-size: clamp(93.75%, calc(89.0625% + 0.1vw), 106.25%);
+    -webkit-font-smoothing: antialiased;
+    text-rendering: optimizeLegibility;
+    scroll-behavior: smooth;
+  }
+
+  body {
+    @apply bg-surface text-on-surface font-sans;
+    min-width: 320px;
+    min-height: 100vh;
+    overflow-x: hidden;
+  }
+
+  #root {
+    min-height: 100vh;
+  }
+
+  ::selection {
+    background: rgb(var(--md-primary) / 0.22);
+  }
+
+  .tnum {
+    font-variant-numeric: tabular-nums;
+  }
+
+  * {
+    scrollbar-width: thin;
+    scrollbar-color: rgb(var(--md-outline-variant)) transparent;
+  }
+  *::-webkit-scrollbar { width: 6px; height: 6px; }
+  *::-webkit-scrollbar-thumb {
+    border-radius: 9999px;
+    background: rgb(var(--md-outline-variant) / 0.85);
+  }
+  *::-webkit-scrollbar-thumb:hover {
+    background: rgb(var(--md-outline));
+  }
+  *::-webkit-scrollbar-track { background: transparent; }
+}
+
+@layer components {
+  /* M3 Range Slider */
+  .m3-slider {
+    -webkit-appearance: none;
+    appearance: none;
+    height: 6px;
+    border-radius: 9999px;
+    background: rgb(var(--md-surface-container-highest));
+    outline: none;
+  }
+
+  .m3-slider::-webkit-slider-thumb {
+    -webkit-appearance: none;
+    appearance: none;
+    width: 20px;
+    height: 20px;
+    border-radius: 9999px;
+    background: rgb(var(--md-primary));
+    border: 3px solid rgb(var(--md-surface-container-low));
+    box-shadow: 0 1px 3px rgb(0 0 0 / 0.25);
+    cursor: pointer;
+    transition: transform 150ms cubic-bezier(0.2, 0, 0, 1), box-shadow 150ms cubic-bezier(0.2, 0, 0, 1);
+  }
+
+  .m3-slider:hover::-webkit-slider-thumb {
+    transform: scale(1.1);
+    box-shadow: 0 0 0 6px rgb(var(--md-primary) / 0.14);
+  }
+
+  .m3-slider:focus-visible::-webkit-slider-thumb {
+    box-shadow: 0 0 0 8px rgb(var(--md-primary) / 0.22);
+  }
+
+  .m3-slider::-moz-range-thumb {
+    width: 20px;
+    height: 20px;
+    border-radius: 9999px;
+    background: rgb(var(--md-primary));
+    border: 3px solid rgb(var(--md-surface-container-low));
+    box-shadow: 0 1px 3px rgb(0 0 0 / 0.25);
+    cursor: pointer;
+    transition: transform 150ms cubic-bezier(0.2, 0, 0, 1);
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    *,
+    *::before,
+    *::after {
+      animation-duration: 0.01ms !important;
+      animation-iteration-count: 1 !important;
+      transition-duration: 0.01ms !important;
+      scroll-behavior: auto !important;
+    }
+  }
+}
+
+[hidden] { display: none !important; }
+
+@media (min-width: 768px) {
+  .m3-app-shell {
+    display: flex;
+    height: 100dvh;
+    overflow: hidden;
+  }
+  .m3-shell-body {
+    display: flex;
+    flex-direction: column;
+    flex: 1;
+    min-width: 0;
+    min-height: 0;
+    overflow: hidden;
+  }
+  .m3-workspace-grid {
+    flex: 1;
+    min-height: 0;
+  }
+}

@@ -212,5 +212,42 @@ class SummarizeExceptionTests(unittest.TestCase):
         self.assertTrue(re.match(r"^.+$", Logger._source_location()))
 
 
+class LogRotationTests(unittest.TestCase):
+    def test_rotates_and_prunes_oldest_logs_beyond_max_log_files(self):
+        logger = Logger()
+        orig_log_dir = logger.log_dir
+        orig_filename = logger.filename
+        orig_max = Logger.MAX_LOG_FILES
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                logger.log_dir = tmp
+                Logger.MAX_LOG_FILES = 3
+
+                # Create Log2.txt and Log5.txt (gap in numbering)
+                p2 = os.path.join(tmp, "Log2.txt")
+                p5 = os.path.join(tmp, "Log5.txt")
+                with open(p2, "w", encoding="utf-8") as f:
+                    f.write("old 2")
+                with open(p5, "w", encoding="utf-8") as f:
+                    f.write("old 5")
+                os.utime(p2, (1000, 1000))
+                os.utime(p5, (2000, 2000))
+
+                # Next file uses max_index + 1 -> Log6.txt
+                p6 = logger._open_new_log_file()
+                self.assertEqual(os.path.basename(p6), "Log6.txt")
+                self.assertEqual(sorted(os.listdir(tmp)), ["Log2.txt", "Log5.txt", "Log6.txt"])
+                os.utime(p6, (3000, 3000))
+
+                # Opening a 4th log prunes the oldest (Log2.txt) keeping MAX_LOG_FILES = 3
+                p7 = logger._open_new_log_file()
+                self.assertEqual(os.path.basename(p7), "Log7.txt")
+                self.assertEqual(sorted(os.listdir(tmp)), ["Log5.txt", "Log6.txt", "Log7.txt"])
+        finally:
+            Logger.MAX_LOG_FILES = orig_max
+            logger.log_dir = orig_log_dir
+            logger.filename = orig_filename
+
+
 if __name__ == "__main__":
     unittest.main()

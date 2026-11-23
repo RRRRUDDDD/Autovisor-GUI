@@ -21,6 +21,9 @@ logger = Logger()
 # 同一 URL 10 分钟内不重复作答
 ANSWERED = {}
 _ANSWER_COOLDOWN = 600
+# 智慧树 AI 连续失败后暂时冷却, 避免每次弹题/测验页都反复等超时
+_ZHIDAO_COOLDOWN = 120
+_ZHIDAO_FAILED_UNTIL = 0.0
 
 _SUBMIT_TEXTS = ("提交", "交卷", "完成测验", "完成考试", "确认提交")
 _CONFIRM_TEXTS = ("确定", "确认", "继续提交")
@@ -194,6 +197,26 @@ def _norm(s: str) -> str:
     return re.sub(r"[\s\u3000]+", "", s or "")
 
 
+def _brief(text: str, limit: int = 60) -> str:
+    cleaned = " ".join(str(text or "").split())
+    if len(cleaned) <= limit:
+        return cleaned
+    return f"{cleaned[:limit]}..."
+
+
+def _format_selected_options(q: dict, answers: list[int]) -> str:
+    opts = q.get("options") or []
+    letters = "ABCDEFGH"
+    parts = []
+    for idx in answers:
+        prefix = f"{letters[idx]}." if 0 <= idx < len(letters) else f"#{idx}"
+        if 0 <= idx < len(opts):
+            parts.append(f"{prefix}{_brief(opts[idx], 36)}")
+        else:
+            parts.append(prefix)
+    return "; ".join(parts) or str(answers)
+
+
 def _sim(a: str, b: str) -> float:
     a, b = _norm(a), _norm(b)
     if not a or not b:
@@ -298,6 +321,7 @@ async def _try_submit(page):
         clicked = await page.evaluate(JS_FIND_BUTTON, list(_SUBMIT_TEXTS))
         if not clicked:
             logger.warn("测验页未找到提交按钮, 请手动提交.")
+            logger.event("测验提交", 结果="未找到按钮")
             return
         await page.wait_for_timeout(1200)
         for _ in range(3):
@@ -305,8 +329,10 @@ async def _try_submit(page):
                 break
             await page.wait_for_timeout(800)
         logger.info("测验页已点击提交并处理确认弹窗.")
+        logger.event("测验提交", 结果="已提交")
     except Exception as exc:
         logger.warn(f"自动提交失败, 请手动提交: {exc}")
+        logger.event("测验提交", 结果="异常", 错误=logger.summarize_exception(exc))
 
 
 async def _fill_blank(page, q: dict) -> bool:
@@ -327,19 +353,62 @@ async def _answer_questions_once(page, questions, groups, pass_name: str):
     ok, fail, filled = 0, 0, 0
     for i, q in enumerate(questions):
         num = q.get("index") or i + 1
+        q_short = _brief(q.get("question", ""), 32)
+        q_full = _brief(q.get("question", ""), 80)
+        q_type = q.get("type", "?")
+        conf = q.get("confidence", "?")
+        reason = _brief(q.get("reason", ""), 80)
         try:
-            if q.get("type") == "fill":
+            if q_type == "fill":
+                ans_raw = (
+                    (q.get("answer") or [""])[0]
+                    if isinstance(q.get("answer"), list)
+                    else str(q.get("answer") or "")
+                )
+                ans_short = _brief(ans_raw, 60)
                 if await _fill_blank(page, q):
                     filled += 1
+                    logger.info(
+                        f"  [{pass_name}] 题{num} 已填空: {q_short} -> 「{ans_short}」 (置信度:{conf})"
+                    )
+                    logger.event(
+                        "测验答题",
+                        阶段=pass_name,
+                        题号=num,
+                        题型="fill",
+                        题目=q_full,
+                        答案=ans_short,
+                        置信度=conf,
+                        理由=reason or None,
+                        结果="已填空",
+                    )
                 else:
                     fail += 1
-                    logger.warn(f"  [{pass_name}] 题{num} 填空失败: 无可用输入框")
+                    logger.warn(f"  [{pass_name}] 题{num} 填空失败: 无可用输入框 ({q_short})")
+                    logger.event(
+                        "测验答题",
+                        阶段=pass_name,
+                        题号=num,
+                        题型="fill",
+                        题目=q_full,
+                        答案=ans_short,
+                        结果="填空失败",
+                    )
                 continue
             answers = [a for a in (q.get("answer") or []) if isinstance(a, int)]
             if not answers:
                 fail += 1
-                logger.warn(f"  [{pass_name}] 题{num} 答案为空")
+                logger.warn(f"  [{pass_name}] 题{num} 答案为空 ({q_short})")
+                logger.event(
+                    "测验答题",
+                    阶段=pass_name,
+                    题号=num,
+                    题型=q_type,
+                    题目=q_full,
+                    结果="答案为空",
+                )
                 continue
+            ans_display = _format_selected_options(q, answers)
             group = match_group(q, groups)
             if group:
                 sel = {o["idx"] for o in group.get("options", []) if o.get("sel")}
@@ -347,7 +416,19 @@ async def _answer_questions_once(page, questions, groups, pass_name: str):
                 wrong = sorted(sel - set(answers))
                 if not need and not wrong:
                     ok += 1
-                    logger.info(f"  [{pass_name}] 题{num} 与已选一致, 跳过点击")
+                    logger.info(
+                        f"  [{pass_name}] 题{num} 与已选一致, 跳过点击: {q_short} -> {ans_display}"
+                    )
+                    logger.event(
+                        "测验答题",
+                        阶段=pass_name,
+                        题号=num,
+                        题型=q_type,
+                        题目=q_full,
+                        答案=ans_display,
+                        置信度=conf,
+                        结果="已选一致",
+                    )
                     continue
                 plan = list(need)
                 if wrong and group.get("type") == "checkbox":
@@ -360,9 +441,22 @@ async def _answer_questions_once(page, questions, groups, pass_name: str):
                         detail.append(f"补选{len(need)}项")
                     if wrong:
                         detail.append(f"取消错选{len(wrong)}项" if group.get("type") == "checkbox" else "更正单选")
+                    action_text = ", ".join(detail) or "点击完成"
                     logger.info(
-                        f"  [{pass_name}] 题{num} 已作答: {q.get('question', '')[:24]}"
-                        f" ({', '.join(detail) or '点击完成'}, 置信度:{q.get('confidence', '?')})"
+                        f"  [{pass_name}] 题{num} 已作答: {q_short} -> {ans_display}"
+                        f" ({action_text}, 置信度:{conf})"
+                    )
+                    logger.event(
+                        "测验答题",
+                        阶段=pass_name,
+                        题号=num,
+                        题型=q_type,
+                        题目=q_full,
+                        答案=ans_display,
+                        操作=action_text,
+                        置信度=conf,
+                        理由=reason or None,
+                        结果="已作答",
                     )
                     await page.wait_for_timeout(150)
                     continue
@@ -380,8 +474,20 @@ async def _answer_questions_once(page, questions, groups, pass_name: str):
                 ok += 1
                 kept = statuses.count("already")
                 logger.info(
-                    f"  [{pass_name}] 题{num} 已作答(文本匹配): {q.get('question', '')[:24]}"
+                    f"  [{pass_name}] 题{num} 已作答(文本匹配): {q_short} -> {ans_display}"
                     + (f" (保持已选{kept}项, 补点{statuses.count('clicked')}项)" if kept else "")
+                )
+                logger.event(
+                    "测验答题",
+                    阶段=pass_name,
+                    题号=num,
+                    题型=q_type,
+                    题目=q_full,
+                    答案=ans_display,
+                    方式="文本匹配",
+                    置信度=conf,
+                    理由=reason or None,
+                    结果="已作答",
                 )
                 # 自定义 UI: 检查有没有选错的 (只告警不反选, 避免误伤)
                 try:
@@ -397,16 +503,76 @@ async def _answer_questions_once(page, questions, groups, pass_name: str):
                     pass
             else:
                 fail += 1
-                logger.warn(f"  [{pass_name}] 题{num} 未能匹配选项控件")
+                logger.warn(f"  [{pass_name}] 题{num} 未能匹配选项控件 (期望答案: {ans_display})")
+                logger.event(
+                    "测验答题",
+                    阶段=pass_name,
+                    题号=num,
+                    题型=q_type,
+                    题目=q_full,
+                    答案=ans_display,
+                    结果="匹配控件失败",
+                )
         except TargetClosedError:
             raise
         except Exception as exc:
             fail += 1
-            logger.debug(f"  [{pass_name}] 题{num} 作答异常: {exc}")
+            logger.warn(f"  [{pass_name}] 题{num} 作答异常: {exc}")
+            logger.event(
+                "测验答题",
+                阶段=pass_name,
+                题号=num,
+                题目=q_full,
+                结果="异常",
+                错误=logger.summarize_exception(exc),
+            )
     return ok, fail, filled
 
 
-async def _answer_all_pages(page, pass_name: str) -> dict:
+def reset_zhidao_cooldown() -> None:
+    """重置智慧树 AI 失败冷却计时（供测试或新任务启动时调用）。"""
+    global _ZHIDAO_FAILED_UNTIL
+    _ZHIDAO_FAILED_UNTIL = 0.0
+
+
+async def make_zhidao_answerer(page, config=None):
+    """用当前浏览器 Cookie 构造智慧树 AI 答题源; 不可用时返回 None。"""
+    global _ZHIDAO_FAILED_UNTIL
+    if config is not None and not getattr(config, "enableZhidaoQuiz", True):
+        return None
+    if time.time() < _ZHIDAO_FAILED_UNTIL:
+        return None
+    try:
+        cookies = await page.context.cookies()
+        user_agent = await page.evaluate("navigator.userAgent")
+    except Exception:
+        return None
+    from modules.exam_ctx import ZhidaoAnswerer, build_session
+
+    answerer = ZhidaoAnswerer(
+        build_session(
+            cookies,
+            proxy=getattr(config, "proxy", "") if config is not None else "",
+            user_agent=user_agent,
+        ),
+        timeout=45,
+    )
+
+    def ask(prompt: str) -> str:
+        global _ZHIDAO_FAILED_UNTIL
+        try:
+            return answerer.chat(prompt)
+        except Exception:
+            _ZHIDAO_FAILED_UNTIL = time.time() + _ZHIDAO_COOLDOWN
+            raise
+
+    return ask
+
+
+_make_zhidao_answerer = make_zhidao_answerer
+
+
+async def _answer_all_pages(page, pass_name: str, answerer=None) -> dict:
     """逐页作答循环 (含确认/翻页/补救阶梯), 不负责提交。返回统计。"""
     total = {"ok": 0, "fail": 0, "fill": 0, "pages": 0}
     last_sig = None
@@ -416,7 +582,7 @@ async def _answer_all_pages(page, pass_name: str) -> dict:
             text = (await page.inner_text("body"))[:60000]
         except TargetClosedError:
             raise
-        questions = await llm.solve_quiz_page(text)
+        questions = await llm.solve_quiz_page(text, answerer)
         if not questions:
             logger.info(f"[{pass_name}] 当前页未识别出题目, 测验可能已到最后一页或已结束.")
             break
@@ -484,16 +650,31 @@ def _summary(r: dict) -> str:
 
 async def auto_answer_new_page(page, config=None):
     """context.on('page') 回调: 捕获新开页面并自动作答测验。"""
+    entered = False
     try:
         await asyncio.sleep(2)
         url = page.url or ""
         if not any(d in url for d in ("zhihuishu.com", "polymas.com")):
             return
-        if not llm.enabled():
-            logger.debug("检测到新开页面, 但未配置 DeepSeek API, 跳过自动答题.")
-            return
         now = time.time()
         if url in ANSWERED and now - ANSWERED[url] < _ANSWER_COOLDOWN:
+            return
+        if (
+            config is not None
+            and getattr(config, "enableReviewExamApi", False)
+            and "studentReviewTestOrExam" in url
+        ):
+            ANSWERED[url] = now
+            entered = True
+            logger.info("捕获到复习/模拟考试页, 改用接口直接作答交卷...")
+            logger.event("复习考试捕获", 地址=url)
+            from modules.exam_ctx import answer_review_exam_page
+
+            await answer_review_exam_page(page, config)
+            return
+        answerer = await _make_zhidao_answerer(page, config)
+        if not llm.enabled() and answerer is None:
+            logger.debug("检测到新开页面, 但未配置可用答题源, 跳过自动答题.")
             return
         try:
             await page.wait_for_load_state("domcontentloaded", timeout=20000)
@@ -505,10 +686,16 @@ async def auto_answer_new_page(page, config=None):
             return
 
         ANSWERED[url] = now
+        entered = True
         logger.info("捕获到测验页面, 进入逐题自动作答模式...")
-        logger.event("测验页面捕获", 地址=url)
+        llm_label = llm.provider_label() if llm.enabled() else "未配置大模型"
+        logger.event(
+            "测验页面捕获",
+            地址=url,
+            答案源=f"智慧树AI->{llm_label}" if answerer else llm_label,
+        )
 
-        r1 = await _answer_all_pages(page, "首答")
+        r1 = await _answer_all_pages(page, "首答", answerer)
         logger.info(f"[首答] 完成: {_summary(r1)}")
         logger.event("测验页面首答", **r1)
 
@@ -529,11 +716,14 @@ async def auto_answer_new_page(page, config=None):
             if not await _click_prev(page):
                 break
             await page.wait_for_timeout(800)
-        r2 = await _answer_all_pages(page, "复核")
+        r2 = await _answer_all_pages(page, "复核", answerer)
         logger.info(f"[复核] 完成: {_summary(r2)}")
         await _try_submit(page)
         logger.event("测验页面作答", 首答=_summary(r1), 复核=_summary(r2), 已提交=True)
     except TargetClosedError:
         pass
     except Exception as exc:
-        logger.debug(f"测验页面自动作答跳过: {exc}")
+        if entered:
+            logger.log_exception("测验页面自动作答异常.", exc)
+        else:
+            logger.debug(f"测验页面自动作答跳过: {exc}")

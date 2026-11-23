@@ -8,7 +8,7 @@ def print_banner():
         " ╚═╝  ╚═╝ ╚═════╝    ╚═╝    ╚═════╝   ╚═══╝  ╚═╝╚══════╝ ╚═════╝ ╚═╝  ╚═╝",
     ]
     signature_lines = [
-        "by Github CXRunfree",
+        "by Github CXRunfree & RRRRUDDDD",
     ]
     width = max(len(line) for line in banner_lines)
     print()

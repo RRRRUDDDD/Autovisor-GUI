@@ -195,10 +195,10 @@ class FusionAdapter:
             )
 
     @staticmethod
-    async def skip_ai_exercise(page: Page) -> bool:
+    async def skip_ai_exercise(page: Page, answerer=None, config=None) -> bool:
         """检测 AI 随堂弹窗并自动选选项+提交, 成功(或已处理)返回 True。
 
-        顺序: 每道题优先大模型选题(未启用或未命中时自动选第一个选项) -> 点提交
+        顺序: 每道题优先智慧树 AI / 大模型选题(未启用或未命中时自动选第一个选项) -> 点提交
         -> 等已完成/弹窗消失 -> 点关闭图标 -> 恢复播放。
         未作答的题不能提交也不能关闭; 只点第一题会把播放循环卡死。
         """
@@ -214,7 +214,13 @@ class FusionAdapter:
                     await FusionAdapter.resume_video(page)
                     return True
 
-            if llm.enabled():
+            if answerer is None and config is not None:
+                from modules.quiz_page import make_zhidao_answerer
+
+                answerer = await make_zhidao_answerer(page, config)
+
+            llm_selected = 0
+            if answerer is not None or llm.enabled():
                 try:
                     question_roots = await page.query_selector_all(
                         f"{AI_CLASS_EXERCISE_DIALOG} .ques-list .item"
@@ -222,7 +228,7 @@ class FusionAdapter:
                     if not question_roots:
                         dlg = await page.query_selector(AI_CLASS_EXERCISE_DIALOG)
                         question_roots = [dlg] if dlg else []
-                    for root in question_roots:
+                    for q_idx, root in enumerate(question_roots, 1):
                         if await root.query_selector(".class-question-select.isSelect"):
                             continue
                         option_handles = await root.query_selector_all(".option")
@@ -237,12 +243,15 @@ class FusionAdapter:
                             except Exception:
                                 option_texts.append("")
                         question_text = " ".join((await root.inner_text()).split())
-                        chosen_idx = await pick_option(question_text, option_texts)
+                        chosen_idx = await pick_option(
+                            question_text, option_texts, answerer=answerer
+                        )
                         if chosen_idx >= 0:
                             logger.info(
-                                f"AI 随堂练习使用大模型选择: {option_texts[chosen_idx]}"
+                                f"AI 随堂练习第 {q_idx} 题使用 AI 选择: {option_texts[chosen_idx]}"
                             )
                             await option_handles[chosen_idx].click(timeout=2000)
+                            llm_selected += 1
                 except Exception as exc:
                     logger.debug_throttled(
                         "fusion:ai_llm",
@@ -253,7 +262,16 @@ class FusionAdapter:
             selected = int(result.get("selected") or 0)
             questions = int(result.get("questions") or 0)
             if questions:
-                logger.info(f"AI随堂已选择 {selected}/{questions} 题.")
+                logger.info(
+                    f"AI 随堂练习选题完成: 共 {questions} 题, "
+                    f"大模型作答 {llm_selected} 题, 默认补选 {selected} 题."
+                )
+                logger.event(
+                    "AI随堂练习",
+                    题目数=questions,
+                    大模型作答=llm_selected,
+                    默认补选=selected,
+                )
             elif not selected:
                 logger.debug_throttled("fusion:ai_opt", "未找到选项按钮")
             await page.wait_for_timeout(500)
@@ -274,9 +292,11 @@ class FusionAdapter:
 
             if closed:
                 logger.info("AI 随堂练习已自动提交关闭.")
+                logger.event("AI随堂练习", 状态="已提交关闭")
                 await FusionAdapter.resume_video(page)
                 return True
             logger.warn("AI 随堂练习仍未关闭,稍后重试.")
+            logger.event("AI随堂练习", 状态="未关闭重试")
             await page.wait_for_timeout(1500)
             return True
         except TargetClosedError:
@@ -306,21 +326,41 @@ class FusionAdapter:
 
         logger.info("检测到课中练习面板, 自动选择并提交.")
         try:
-            handled = bool(
-                await page.evaluate(
-                    f"""() => {{
-                        const root = document.querySelector({json.dumps(QUESTION_PANEL_SELECTOR)});
-                        if (!root) return false;
-                        const opt = root.querySelector('.option');
-                        if (opt) opt.click();
-                        const submit = root.querySelector(
-                            '.submit-btn .submits, .submit-footer .submit-btn, .submit-btn'
-                        );
-                        if (submit) submit.click();
-                        return Boolean(opt || submit);
-                    }}"""
-                )
+            raw = await page.evaluate(
+                f"""() => {{
+                    const root = document.querySelector({json.dumps(QUESTION_PANEL_SELECTOR)});
+                    if (!root) return {{handled: false, question: '', option: ''}};
+                    const qText = (root.innerText || '').replace(/\\s+/g, ' ').trim().slice(0, 80);
+                    const opt = root.querySelector('.option');
+                    const optText = opt ? (opt.innerText || '').replace(/\\s+/g, ' ').trim().slice(0, 60) : '';
+                    if (opt) opt.click();
+                    const submit = root.querySelector(
+                        '.submit-btn .submits, .submit-footer .submit-btn, .submit-btn'
+                    );
+                    if (submit) submit.click();
+                    return {{handled: Boolean(opt || submit), question: qText, option: optText}};
+                }}"""
             )
+            if isinstance(raw, dict):
+                handled = bool(raw.get("handled"))
+                q_text = str(raw.get("question") or "").strip()
+                opt_text = str(raw.get("option") or "").strip()
+            else:
+                handled = bool(raw)
+                q_text = ""
+                opt_text = ""
+            if handled:
+                logger.info(
+                    f"课中练习面板已作答并提交"
+                    + (f": 选择「{opt_text}」" if opt_text else ".")
+                )
+                logger.event(
+                    "课中练习面板",
+                    题目=q_text or None,
+                    选项=opt_text or None,
+                    方式="默认选择",
+                    状态="已提交",
+                )
             await page.wait_for_timeout(800)
             await page.evaluate(
                 f"""() => {{
@@ -342,8 +382,10 @@ class FusionAdapter:
             return False
 
     @staticmethod
-    async def skip_blocking_quizzes(page: Page) -> bool:
+    async def skip_blocking_quizzes(page: Page, answerer=None, config=None) -> bool:
         """处理当前挡住播放的 AI 随堂弹窗或课中练习面板。"""
-        skipped = await FusionAdapter.skip_ai_exercise(page)
+        skipped = await FusionAdapter.skip_ai_exercise(
+            page, answerer=answerer, config=config
+        )
         skipped = await FusionAdapter.skip_question_panel(page) or skipped
         return skipped

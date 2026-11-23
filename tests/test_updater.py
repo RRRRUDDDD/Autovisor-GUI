@@ -5,13 +5,13 @@ import unittest
 import requests
 
 from modules import updater
-from modules.version import __version__
+from modules.version import __gui_version__, __version__
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
-RELEASE_PAGE = "https://github.com/CXRunfree/Autovisor/releases/tag/x"
+RELEASE_PAGE = "https://github.com/RRRRUDDDD/Autovisor-GUI/releases/tag/x"
 ASSET_URL = (
-    "https://github.com/CXRunfree/Autovisor/releases/download/3.19.0/"
+    "https://github.com/RRRRUDDDD/Autovisor-GUI/releases/download/3.19.0/"
     "Autovisor-3.19.0-windows-amd64.zip"
 )
 
@@ -44,15 +44,21 @@ class FakeLogger:
 
 
 class FakeResponse:
-    def __init__(self, payload, error=None):
+    def __init__(self, payload=None, error=None, *, status_code=200, url="", text="", headers=None):
         self._payload = payload
         self._error = error
+        self.status_code = status_code
+        self.url = url
+        self.text = text
+        self.headers = headers or {}
 
     def raise_for_status(self):
         if self._error:
             raise self._error
 
     def json(self):
+        if isinstance(self._payload, Exception):
+            raise self._payload
         return self._payload
 
 
@@ -282,6 +288,260 @@ class VersionSourceTests(unittest.TestCase):
             "pyproject.toml 不应再写死 version",
         )
         self.assertEqual(updater.__version__, __version__)
+        self.assertEqual(__version__, "3.19.0(Autovisor GUI Edition)")
+        self.assertEqual(__gui_version__, "1.0.0")
+
+    def test_desktop_and_python_versions_are_in_sync(self):
+        import json
+
+        tauri_conf_path = os.path.join(PROJECT_ROOT, "gui", "src-tauri", "tauri.conf.json")
+        with open(tauri_conf_path, "r", encoding="utf-8") as f:
+            tauri_conf = json.load(f)
+        self.assertEqual(tauri_conf.get("version"), __gui_version__)
+
+        cargo_toml_path = os.path.join(PROJECT_ROOT, "gui", "src-tauri", "Cargo.toml")
+        with open(cargo_toml_path, "r", encoding="utf-8") as f:
+            cargo_toml = f.read()
+        cargo_match = re.search(r'^version\s*=\s*"([^"]+)"', cargo_toml, re.MULTILINE)
+        self.assertIsNotNone(cargo_match, "Cargo.toml missing package version")
+        self.assertEqual(cargo_match.group(1), __gui_version__)
+
+        package_json_path = os.path.join(PROJECT_ROOT, "gui", "package.json")
+        with open(package_json_path, "r", encoding="utf-8") as f:
+            package_json = json.load(f)
+        self.assertEqual(package_json.get("version"), __gui_version__)
+
+
+class CheckUpdateInfoTests(unittest.TestCase):
+    def test_returns_structured_info_with_windows_setup_exe_priority(self):
+        setup_url = (
+            "https://github.com/RRRRUDDDD/Autovisor-GUI/releases/download/3.19.0/"
+            "Autovisor-GUI-Setup-3.19.0-windows-x64.exe"
+        )
+        payload = {
+            "name": "Autovisor GUI v3.19.0",
+            "tag_name": "v3.19.0",
+            "html_url": RELEASE_PAGE,
+            "body": "## 更新内容\n- 自动检查更新",
+            "published_at": "2026-11-20T10:00:00Z",
+            "assets": [
+                {
+                    "name": "Autovisor-3.19.0-windows-amd64.zip",
+                    "browser_download_url": ASSET_URL,
+                },
+                {
+                    "name": "Autovisor-GUI-Setup-3.19.0-windows-x64.exe",
+                    "browser_download_url": setup_url,
+                },
+                {
+                    "name": "Autovisor-GUI-3.19.0-macos.dmg",
+                    "browser_download_url": "https://github.com/RRRRUDDDD/Autovisor-GUI/releases/download/3.19.0/Autovisor-GUI-3.19.0-macos.dmg",
+                },
+                {
+                    "name": "Autovisor-GUI-3.19.0-linux.AppImage",
+                    "browser_download_url": "https://github.com/RRRRUDDDD/Autovisor-GUI/releases/download/3.19.0/Autovisor-GUI-3.19.0-linux.AppImage",
+                },
+            ],
+        }
+        self.assertEqual(updater.pick_download_url(payload, platform="win32"), setup_url)
+        self.assertTrue(
+            updater.pick_download_url(payload, platform="darwin").endswith(".dmg")
+        )
+        self.assertTrue(
+            updater.pick_download_url(payload, platform="linux").endswith(".AppImage")
+        )
+
+        session = FakeSession(FakeResponse(payload))
+        info = updater.check_update_info(current_version="3.18.4", session=session)
+        self.assertEqual(info["currentVersion"], "3.18.4")
+        self.assertEqual(info["latestVersion"], "3.19.0")
+        self.assertTrue(info["hasUpdate"])
+        self.assertEqual(info["releaseName"], "Autovisor GUI v3.19.0")
+        self.assertEqual(info["releaseUrl"], RELEASE_PAGE)
+        self.assertIn("自动检查更新", info["notes"])
+        self.assertEqual(info["publishedAt"], "2026-11-20T10:00:00Z")
+        if os.name == "nt":
+            self.assertEqual(info["downloadUrl"], setup_url)
+
+    def test_check_update_info_ssl_fallback_and_errors(self):
+        payload = {
+            "name": "Autovisor-3.18.4",
+            "tag_name": "3.18.4",
+            "html_url": "https://evil.example/release",
+            "body": "notes",
+            "published_at": "2026-11-20T00:00:00Z",
+            "assets": [],
+        }
+        session = RetrySession(
+            FakeResponse(payload),
+            error=requests.exceptions.SSLError("cert failed"),
+        )
+        info = updater.check_update_info(current_version="3.18.4", session=session)
+        self.assertFalse(info["hasUpdate"])
+        self.assertEqual(info["releaseUrl"], updater.RELEASE_PAGE_URL)
+        self.assertEqual(len(session.calls), 2)
+
+        fail_session = FakeSession(error=OSError("offline"))
+        with self.assertRaises(RuntimeError):
+            updater.check_update_info(current_version="3.18.4", session=fail_session)
+
+
+class RoutedSession:
+    """按 URL 路由返回不同响应，用于验证 API 限流降级到网页端。"""
+
+    def __init__(self, handler):
+        self.handler = handler
+        self.calls = []
+        self.kwargs = []
+
+    def get(self, url, **kwargs):
+        self.calls.append(url)
+        self.kwargs.append(kwargs)
+        result = self.handler(url, kwargs)
+        if isinstance(result, Exception):
+            raise result
+        return result
+
+
+def make_http_error_response(status_code, message="HTTP error", headers=None):
+    resp = FakeResponse(status_code=status_code, headers=headers)
+    resp._error = requests.exceptions.HTTPError(message, response=resp)
+    return resp
+
+
+class RateLimitWebFallbackTests(unittest.TestCase):
+    def setUp(self):
+        updater._API_RATE_LIMIT_UNTIL.clear()
+
+    def tearDown(self):
+        updater._API_RATE_LIMIT_UNTIL.clear()
+
+    def test_falls_back_to_github_web_on_api_403_rate_limit(self):
+        tag_url = "https://github.com/RRRRUDDDD/Autovisor-GUI/releases/tag/v3.19.0"
+        setup_path = (
+            "/RRRRUDDDD/Autovisor-GUI/releases/download/v3.19.0/"
+            "Autovisor-GUI-Setup-3.19.0-windows-x64.exe"
+        )
+        assets_html = f'''
+        <ul>
+          <li><a href="{setup_path}">Autovisor-GUI-Setup-3.19.0-windows-x64.exe</a></li>
+          <li><a href="https://evil.example/releases/download/v3.19.0/malware-windows-x64.exe">bad</a></li>
+        </ul>
+        '''
+        atom_xml = f'''<?xml version="1.0" encoding="UTF-8"?>
+        <feed xmlns="http://www.w3.org/2005/Atom">
+          <entry>
+            <id>tag:github.com,2008:Repository/1/v3.19.0</id>
+            <updated>2026-11-23T08:00:00Z</updated>
+            <link rel="alternate" type="text/html" href="{tag_url}"/>
+            <title>Autovisor GUI v3.19.0</title>
+            <content type="html">&lt;h2&gt;更新内容&lt;/h2&gt;&lt;ul&gt;&lt;li&gt;修复 API 限流&lt;/li&gt;&lt;/ul&gt;</content>
+          </entry>
+        </feed>
+        '''
+
+        def handler(url, _kwargs):
+            if url == updater.LATEST_RELEASE_API:
+                return make_http_error_response(403, "API rate limit exceeded")
+            if url == updater.RELEASE_PAGE_URL:
+                return FakeResponse(
+                    payload={"id": 1, "tag_name": "v3.19.0"},
+                    url=tag_url,
+                )
+            if "expanded_assets/v3.19.0" in url:
+                return FakeResponse(text=assets_html)
+            if url == updater.RELEASES_ATOM_URL:
+                return FakeResponse(text=atom_xml)
+            raise AssertionError(f"Unexpected URL: {url}")
+
+        session = RoutedSession(handler)
+        info = updater.check_update_info(current_version="3.18.4", session=session)
+        self.assertTrue(info["hasUpdate"])
+        self.assertEqual(info["latestVersion"], "3.19.0")
+        self.assertEqual(info["releaseName"], "Autovisor GUI v3.19.0")
+        self.assertEqual(info["releaseUrl"], tag_url)
+        self.assertEqual(info["publishedAt"], "2026-11-23T08:00:00Z")
+        self.assertIn("修复 API 限流", info["notes"])
+        if os.name == "nt":
+            self.assertEqual(info["downloadUrl"], f"https://github.com{setup_path}")
+
+    def test_falls_back_using_redirect_url_when_web_response_is_html_and_enrich_fails(self):
+        tag_url = "https://github.com/RRRRUDDDD/Autovisor-GUI/releases/tag/v3.20.0"
+
+        def handler(url, _kwargs):
+            if url == updater.LATEST_RELEASE_API:
+                return make_http_error_response(429, "Too Many Requests")
+            if url == updater.RELEASE_PAGE_URL:
+                return FakeResponse(
+                    payload=ValueError("not json"),
+                    url=tag_url,
+                    text="<html>release page</html>",
+                )
+            return OSError("enrichment unavailable")
+
+        session = RoutedSession(handler)
+        info = updater.check_update_info(current_version="3.18.4", session=session)
+        self.assertTrue(info["hasUpdate"])
+        self.assertEqual(info["latestVersion"], "3.20.0")
+        self.assertEqual(info["releaseUrl"], tag_url)
+        self.assertEqual(info["downloadUrl"], "")
+
+    def test_reports_no_release_when_web_fallback_redirects_to_releases_index(self):
+        def handler(url, _kwargs):
+            if url == updater.LATEST_RELEASE_API:
+                return make_http_error_response(403, "API rate limit exceeded")
+            if url == updater.RELEASE_PAGE_URL:
+                return FakeResponse(
+                    payload={"payload": {"releasesIndexRoute": {}}},
+                    url="https://github.com/RRRRUDDDD/Autovisor-GUI/releases",
+                )
+            raise AssertionError(f"Unexpected URL: {url}")
+
+        session = RoutedSession(handler)
+        with self.assertRaises(RuntimeError) as ctx:
+            updater.check_update_info(current_version="3.18.4", session=session)
+        self.assertIn("未找到可用的发行版本", str(ctx.exception))
+
+    def test_reports_rate_limit_and_fallback_failure_when_both_fail(self):
+        def handler(url, _kwargs):
+            if url == updater.LATEST_RELEASE_API:
+                return make_http_error_response(403, "API rate limit exceeded")
+            if url == updater.RELEASE_PAGE_URL:
+                return OSError("connection timed out")
+            raise AssertionError(f"Unexpected URL: {url}")
+
+        session = RoutedSession(handler)
+        with self.assertRaises(RuntimeError) as ctx:
+            updater.check_update_info(current_version="3.18.4", session=session)
+        self.assertIn("GitHub API 请求受限", str(ctx.exception))
+        self.assertIn("备用通道访问失败", str(ctx.exception))
+
+    def test_rejects_untrusted_redirect_in_web_fallback(self):
+        def handler(url, _kwargs):
+            if url == updater.LATEST_RELEASE_API:
+                return make_http_error_response(403, "API rate limit exceeded")
+            if url == updater.RELEASE_PAGE_URL:
+                return FakeResponse(
+                    payload={"tag_name": "v9.9.9"},
+                    url="https://evil.example/releases/tag/v9.9.9",
+                )
+            raise AssertionError(f"Unexpected URL: {url}")
+
+        session = RoutedSession(handler)
+        with self.assertRaises(RuntimeError) as ctx:
+            updater.check_update_info(current_version="3.18.4", session=session)
+        self.assertIn("非 GitHub 官方域名", str(ctx.exception))
+
+    def test_rate_limit_cooldown_is_scoped_by_proxy(self):
+        resp = make_http_error_response(
+            403,
+            "rate limit",
+            headers={"X-RateLimit-Reset": str(int(updater.time.time()) + 600)},
+        )
+        wait_seconds = updater._record_api_rate_limit("http://127.0.0.1:7890", resp)
+        self.assertIsNotNone(wait_seconds)
+        self.assertTrue(updater._is_api_rate_limited("http://127.0.0.1:7890"))
+        self.assertFalse(updater._is_api_rate_limited(""))
 
 
 if __name__ == "__main__":

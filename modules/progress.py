@@ -10,6 +10,24 @@ from modules.logger import Logger
 
 logger = Logger()
 
+_progress_sink = None
+
+
+def set_progress_sink(sink):
+    """注册可选的结构化进度回调（供内置桌面后端使用，不影响 CLI）。"""
+    global _progress_sink
+    _progress_sink = sink
+
+
+def _emit_progress(desc, percent, remaining=None):
+    sink = _progress_sink
+    if sink is None:
+        return
+    try:
+        sink(str(desc or ""), float(percent), None if remaining is None else float(remaining))
+    except Exception:
+        pass
+
 
 # 视频区域内移动鼠标
 async def move_mouse(page: Page):
@@ -46,6 +64,7 @@ def show_course_progress(desc, cur_time=None, limit_time=0):
         length = int(percent * 30 // 100)
         progress = ("█" * length).ljust(30, " ")
         print(f"\r{desc} |{progress}| {percent}%\t".ljust(50), end="", flush=True)
+        _emit_progress(desc, percent, None)
     else:
         cur_time = 0 if cur_time == '' or cur_time is None else cur_time
         if isinstance(cur_time, str):
@@ -58,6 +77,7 @@ def show_course_progress(desc, cur_time=None, limit_time=0):
         length = int(percent * 20 // 100)
         progress = ("█" * length).ljust(20, " ")
         print(f"\r{desc} |{progress}| {percent}%\t剩余 {left_time} min\t".ljust(50), end="", flush=True)
+        _emit_progress(desc, percent, max(0.0, left_time))
 
 
 # 打印通用版进度条
@@ -69,3 +89,4 @@ def show_progress(desc, current, total, suffix="", width=30):
     length = int(percent * width // 100)
     progress = ("█" * length).ljust(width, " ")
     print(f"\r{desc} |{progress}| {percent}%\t{suffix}".ljust(50), end="", flush=True)
+    _emit_progress(desc, max(0, min(percent, 100)), None)

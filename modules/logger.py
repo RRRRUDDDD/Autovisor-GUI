@@ -1,4 +1,5 @@
 import os
+import re
 import sys
 import threading
 import time
@@ -6,10 +7,12 @@ import traceback
 
 # 用于在记录日志来源时跳过日志系统自身的栈帧
 _LOGGER_FILE = os.path.basename(__file__)
+_LOG_FILE_PATTERN = re.compile(r"^Log(\d+)\.txt$", re.IGNORECASE)
 
 
 # 单例模式日志器
 class Logger:
+    MAX_LOG_FILES = 50
     _instance = None
     _lock = threading.Lock()  # 线程安全锁
 
@@ -26,18 +29,90 @@ class Logger:
         os.makedirs(self.log_dir, exist_ok=True)
         if os.name != "nt":
             os.chmod(self.log_dir, 0o700)
-        new_index = len(os.listdir(self.log_dir)) + 1
-        self.filename = os.path.join(self.log_dir, f"Log{new_index}.txt")
         self._write_lock = threading.Lock()
         self._throttled = {}
         self._context = {}
+        self._event_sink = None
+        self.console_debug = False
+        self.emit_debug = False
+        self.filename = ""
+        self._open_new_log_file()
+
+    def _open_new_log_file(self):
+        os.makedirs(self.log_dir, exist_ok=True)
+        existing_logs = []
+        max_index = 0
+        try:
+            entries = os.listdir(self.log_dir)
+        except OSError:
+            entries = []
+        for name in entries:
+            match = _LOG_FILE_PATTERN.match(name)
+            if match:
+                idx = int(match.group(1))
+                if idx > max_index:
+                    max_index = idx
+                full_path = os.path.join(self.log_dir, name)
+                if os.path.isfile(full_path):
+                    existing_logs.append((idx, full_path))
+
+        new_index = max_index + 1
+        while os.path.exists(os.path.join(self.log_dir, f"Log{new_index}.txt")):
+            new_index += 1
+        self.filename = os.path.join(self.log_dir, f"Log{new_index}.txt")
         with open(self.filename, "w", encoding="utf-8"):
             pass
         if os.name != "nt":
             os.chmod(self.filename, 0o600)
 
+        max_files = max(1, int(getattr(self, "MAX_LOG_FILES", 50)))
+        if len(existing_logs) >= max_files:
+            def _sort_key(item):
+                idx, path = item
+                try:
+                    mtime = os.path.getmtime(path)
+                except OSError:
+                    mtime = 0.0
+                return (mtime, idx)
+
+            existing_logs.sort(key=_sort_key)
+            excess = len(existing_logs) - (max_files - 1)
+            for _, old_path in existing_logs[:excess]:
+                if old_path == self.filename:
+                    continue
+                try:
+                    os.remove(old_path)
+                except OSError:
+                    pass
+        return self.filename
+
+    def start_new_run(self):
+        """为长驻后端中的新一轮任务切换独立日志文件并重置上下文。"""
+        with self._write_lock:
+            self.runtime_root = self.get_runtime_root()
+            self.log_dir = os.path.join(self.runtime_root, "logs")
+            self._throttled.clear()
+            self._context.clear()
+            return self._open_new_log_file()
+
+    def set_event_sink(self, sink):
+        """注册可选的结构化事件回调（供内置桌面后端使用，不影响 CLI）。"""
+        self._event_sink = sink
+
+    def _emit(self, kind, **payload):
+        sink = self._event_sink
+        if sink is None:
+            return
+        try:
+            sink(kind, payload)
+        except Exception:
+            pass
+
     @staticmethod
     def get_runtime_root():
+        override = os.environ.get("AUTOVISOR_DATA_DIR", "").strip()
+        if override:
+            return os.path.abspath(override)
         if getattr(sys, "frozen", False):
             return os.path.dirname(sys.executable)
         return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -103,11 +178,16 @@ class Logger:
         self.write_log(f"{tb}\n")
 
     def save(self, inform=True):
+        self._emit("log_file", path=self.filename)
         if inform:
             print(f"\n日志文件已保存至: {self.filename}")
 
     def debug(self, msg):
         self.write_log(f"{msg}\n", level="DEBUG")
+        if getattr(self, "console_debug", False):
+            print(f"[DEBUG] {msg}", flush=True)
+        if getattr(self, "emit_debug", False):
+            self._emit("log", level="debug", message=str(msg))
 
     def debug_throttled(self, key, msg, interval=60):
         """轮询类日志限时折叠: 同一 key 每 interval 秒最多写一条, 期间次数汇总到下一行。"""
@@ -123,6 +203,7 @@ class Logger:
         self.write_log("\n", raw=True)
         self.write_log(f"===== {title} =====\n")
         print(f"\n===== {title} =====")
+        self._emit("section", title=str(title))
 
     def event(self, name, interval=None, **fields):
         """记录关键事件(只写入文件), 字段以 key=value 形式附加; 传 interval 时按间隔折叠。"""
@@ -141,12 +222,14 @@ class Logger:
         if details:
             line = f"{name} | {details}"
         self.write_log(f"{line}\n", level="EVENT")
+        self._emit("event", name=str(name), fields=dict(fields))
 
     def context(self, **fields):
         """更新运行状态(课程、课时、阶段等), 异常日志会自动附带。"""
-        self._context.update(
-            {key: value for key, value in fields.items() if value is not None}
-        )
+        updates = {key: value for key, value in fields.items() if value is not None}
+        self._context.update(updates)
+        if updates:
+            self._emit("context", fields=updates)
 
     def clear_context(self, *keys):
         if not keys:
@@ -175,6 +258,7 @@ class Logger:
             text = f"\r\033[32m[INFO]\033[0m {msg}"
         print(text.ljust(50))
         self.write_log(f"{msg}\n", level="INFO")
+        self._emit("log", level="info", message=str(msg))
 
     def warn(self, msg, shift=False):
         if shift:
@@ -183,6 +267,7 @@ class Logger:
             text = f"\r\033[33m[WARN]\033[0m {msg}"
         print(text.ljust(50))
         self.write_log(f"{msg}\n", level="WARN")
+        self._emit("log", level="warning", message=str(msg))
 
     def error(self, msg, shift=False, with_context=True):
         if shift:
@@ -195,3 +280,4 @@ class Logger:
             state = self.context_text()
             if state:
                 self.write_log(f"运行状态: {state}\n")
+        self._emit("log", level="error", message=str(msg))

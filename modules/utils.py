@@ -14,24 +14,26 @@ from modules.lesson_navigation import (
 )
 import time
 from modules.logger import Logger
+from modules.popups import dismiss_course_popups
 from modules.video_state import COURSE_VIDEO_SELECTOR
+from modules.window_control import (
+    display_window,
+    get_browser_window,
+    hide_window,
+    should_hide_window,
+)
 
 if sys.platform == "win32":
     import ctypes
-    import pygetwindow as gw
-    from pygetwindow import Win32Window
 else:
     ctypes = None
-    gw = None
-    Win32Window = object
 
 logger = Logger()
 
 # 可选元素(弹窗等)的等待上限: 这类元素只在特定条件下出现, 不存在时必须尽快跳过。
 # 打包版把页面默认超时设为 24 小时, 沿用默认值会让整轮学习一直卡在原地。
-# 实测可见弹窗约 4s 出现, 放宽到 20s 以容忍慢网与首屏渲染; 隐藏节点每门课
-# 最多多等这一次, 相对整门课的学习时长可以忽略。
-OPTIONAL_POPUP_TIMEOUT_MS = 20_000
+# 后台 dismiss_popups 任务会持续清理延迟弹出的各类弹窗, 首屏这里只需短暂等待即可。
+OPTIONAL_POPUP_TIMEOUT_MS = 5_000
 
 
 def get_runtime_root():
@@ -40,6 +42,28 @@ def get_runtime_root():
 
 def get_runtime_path(*parts):
     return os.path.join(get_runtime_root(), *parts)
+
+
+def get_resource_path(*parts):
+    """定位只读内置资源（如 stealth.min.js），支持数据目录与程序目录分离。"""
+    res_override = os.environ.get("AUTOVISOR_RESOURCES_DIR", "").strip()
+    if res_override:
+        candidate = os.path.join(os.path.abspath(res_override), *parts)
+        if os.path.exists(candidate):
+            return candidate
+        # 若 AUTOVISOR_RESOURCES_DIR 指向 resources 目录本身，则去掉前缀 resources 再查一次
+        if parts and parts[0] == "resources":
+            candidate = os.path.join(os.path.abspath(res_override), *parts[1:])
+            if os.path.exists(candidate):
+                return candidate
+    if getattr(sys, "frozen", False):
+        exe_candidate = os.path.join(os.path.dirname(sys.executable), *parts)
+        if os.path.exists(exe_candidate):
+            return exe_candidate
+    repo_candidate = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), *parts)
+    if os.path.exists(repo_candidate):
+        return repo_candidate
+    return get_runtime_path(*parts)
 
 def save_cookies(cookies, filename="cookies.json"):
     """保存登录Cookies到文件"""
@@ -168,48 +192,6 @@ def bring_console_to_front():
     return False
 
 
-async def display_window(page: Page) -> None:
-    if sys.platform != "win32":
-        await page.bring_to_front()
-        logger.info("播放标签页已前置.", shift=True)
-        return
-    window = await get_browser_window(page)
-    if window:
-        window.show()
-        window.restore()
-        window.moveTo(100, 100)
-        logger.info("播放窗口已自动前置.", shift=True)
-    else:
-        logger.warn("未找到播放窗口!")
-
-
-async def hide_window(page: Page) -> None:
-    if sys.platform != "win32":
-        logger.warn("macOS 不支持隐藏单个 Chrome 窗口,将保持可见以便处理验证.")
-        return
-    window = await get_browser_window(page)
-    if window:
-        window.hide()
-        logger.info("播放窗口已自动隐藏,将在需要安全验证时显示.")
-    else:
-        logger.warn("未找到播放窗口!")
-
-
-async def get_browser_window(page: Page) -> object | None:
-    if sys.platform != "win32":
-        return None
-    custom_title = "Autovisor - Playwright"
-    await page.wait_for_load_state("domcontentloaded")
-    await page.evaluate(f'document.title = "{custom_title}"')
-    # 获取所有窗口并尝试匹配 Playwright 窗口
-    await page.wait_for_timeout(1000)
-    win_list = gw.getWindowsWithTitle(custom_title)
-    if win_list:
-        return win_list[0]
-    else:
-        return None
-
-
 async def evaluate_js(page: Page, wait_selector, js: str, timeout=None, is_hike_class=False) -> None:
     """等待可选元素(如弹窗)后执行页面脚本; 元素未出现时跳过, 不无期限等待。"""
     if timeout is None:
@@ -261,6 +243,16 @@ async def optimize_page(
     page: Page, config: Config, catalog: CatalogSelectors
 ) -> None:
     try:
+        closed_initial = await dismiss_course_popups(
+            page,
+            max_rounds=5,
+            settle_ms=250,
+            remove_floating_tips=(catalog.name == "legacy"),
+        )
+        for item in closed_initial:
+            logger.info(f"已关闭课程弹窗: {item['title']} ({item['button']})")
+            logger.event("关闭弹窗", 标题=item["title"], 操作=item["button"], 方式=item.get("strategy", "button"))
+
         preread_close = page.locator(
             ".ss2077-custom-modal .ss2077-custom-dialog:visible "
             ".ss2077-custom-title > img.icon"
@@ -268,6 +260,7 @@ async def optimize_page(
         if await preread_close.count() and await preread_close.is_visible():
             await preread_close.click(timeout=2000)
             logger.info("已关闭学前必读弹窗.")
+            logger.event("关闭弹窗", 标题="学前必读", 操作="icon", 方式="close_icon")
 
         if catalog.name == "legacy":
             # "学习时长/学前必读"弹窗(.studytime-div)只在未读过时显示: 节点常驻 DOM,
@@ -284,6 +277,16 @@ async def optimize_page(
             await evaluate_on_element(page, ".exploreTip", "el=>el.remove()", timeout=1500)
             await evaluate_on_element(page, ".ai-helper-Index2", "el=>el.remove()", timeout=1500)
             await evaluate_on_element(page, ".aiMsg.once", "el=>el.remove()", timeout=1500)
+
+        closed_after = await dismiss_course_popups(
+            page,
+            max_rounds=4,
+            settle_ms=250,
+            remove_floating_tips=(catalog.name == "legacy"),
+        )
+        for item in closed_after:
+            logger.info(f"已关闭课程弹窗: {item['title']} ({item['button']})")
+            logger.event("关闭弹窗", 标题=item["title"], 操作=item["button"], 方式=item.get("strategy", "button"))
 
     except TargetClosedError as e:
         logger.debug(f"浏览器关闭时停止页面优化: {logger.summarize_exception(e)}")
