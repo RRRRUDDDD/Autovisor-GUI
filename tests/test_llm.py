@@ -596,7 +596,7 @@ class _JsonResponse:
 
     def iter_lines(self, decode_unicode=False):
         self.reads += 1
-        yield self.text
+        yield self.text.encode("utf-8")
 
     def close(self):
         self.closed = True
@@ -716,6 +716,25 @@ class OpenAiStreamTests(unittest.TestCase):
         self.assertIn("总时长", str(ctx.exception))
         self.assertTrue(resp.closed)
         self.assertLess(elapsed, 0.8)
+
+    def test_utf8_bytes_sse_with_comments_and_metadata_streams(self):
+        lines = [
+            b": keep-alive",
+            b"event: message",
+            b"id: 1",
+            _sse_delta({"reasoning_content": "先想中文"}).encode("utf-8"),
+            _sse_delta(
+                {"content": "```answer\n[{\"id\": 1, \"note\": \"中文\"}]\n```\n"}
+            ).encode("utf-8"),
+        ]
+        resp = _StreamResponse(lines, delay=0.01)
+        with patch("modules.llm.requests.post", return_value=resp) as post:
+            reply = llm.chat_sync("题目", conf_override=self.CONF, stream=True)
+        self.assertIn('"id": 1', reply)
+        self.assertIn("中文", reply)
+        self.assertNotIn("ï¿½", reply)
+        self.assertEqual(post.call_count, 1)
+        self.assertTrue(resp.closed)
 
     def test_non_sse_endpoint_falls_back_to_plain_json(self):
         payload = {"choices": [{"message": {"content": "普通非流式答案"}}]}

@@ -1,3 +1,4 @@
+import asyncio
 import unittest
 
 from modules.popup_interceptor import (
@@ -8,22 +9,34 @@ from modules.popup_interceptor import (
 )
 
 
-def make_payload(question_id, options):
+def make_question(question_id, options, title=""):
+    return {
+        "testQuestion": {
+            "questionId": question_id,
+            "name": title,
+            "questionOptions": [
+                {"content": content, "result": result}
+                for content, result in options
+            ],
+        }
+    }
+
+
+def make_payload(question_id, options, title=""):
     return {
         "code": 0,
         "data": {
             "lessonTestQuestionUseInterfaceDtos": [
-                {
-                    "testQuestion": {
-                        "questionId": question_id,
-                        "questionOptions": [
-                            {"content": content, "result": result}
-                            for content, result in options
-                        ],
-                    }
-                }
+                make_question(question_id, options, title)
             ]
         },
+    }
+
+
+def make_multi_payload(*questions):
+    return {
+        "code": 0,
+        "data": {"lessonTestQuestionUseInterfaceDtos": list(questions)},
     }
 
 
@@ -70,7 +83,13 @@ class NormalizeTests(unittest.TestCase):
         self.assertEqual(strip_option_prefix("A. 社会主义初级阶段"), "社会主义初级阶段")
         self.assertEqual(strip_option_prefix("(B) 改革开放"), "改革开放")
         self.assertEqual(strip_option_prefix("1、第一项"), "第一项")
+        self.assertEqual(strip_option_prefix("1. 第一项"), "第一项")
         self.assertEqual(strip_option_prefix("无序号选项"), "无序号选项")
+
+    def test_decimal_values_are_not_stripped_as_option_prefix(self):
+        self.assertEqual(strip_option_prefix("1.5"), "1.5")
+        self.assertEqual(strip_option_prefix("2.5"), "2.5")
+        self.assertEqual(strip_option_prefix("1.25 千克"), "1.25 千克")
 
 
 class ExtractionTests(unittest.TestCase):
@@ -141,6 +160,50 @@ class ExtractionTests(unittest.TestCase):
         self.assertEqual(self.interceptor.ingest(payload), 1)
         self.assertTrue(self.interceptor.is_correct("回退字段", question_id=41))
 
+    def test_two_judgement_questions_are_isolated_by_title(self):
+        self.interceptor.ingest(
+            make_multi_payload(
+                make_question(71, [("正确", 1), ("错误", 0)], "地球是圆的"),
+                make_question(72, [("正确", 0), ("错误", 1)], "太阳从西边升起"),
+            )
+        )
+        dom = ["A. 正确", "B. 错误"]
+        self.assertEqual(
+            self.interceptor.match_choices(dom, question_title="地球是圆的"), [0]
+        )
+        self.assertEqual(
+            self.interceptor.match_choices(dom, question_title="太阳从西边升起"), [1]
+        )
+        self.assertEqual(
+            self.interceptor.match_choices(dom, question_id="72"), [1]
+        )
+        self.assertEqual(self.interceptor.match_choices(dom, question_id="71"), [0])
+
+    def test_ambiguous_option_subset_falls_back_without_cross_pollution(self):
+        self.interceptor.ingest(
+            make_multi_payload(
+                make_question(73, [("正确", 1), ("错误", 0)], "判断题一"),
+                make_question(74, [("正确", 0), ("错误", 1)], "判断题二"),
+            )
+        )
+        self.assertEqual(self.interceptor.match_choices(["正确", "错误"]), [])
+        self.assertEqual(self.interceptor.match_choices([]), [])
+
+    def test_single_question_matches_by_option_subset(self):
+        self.interceptor.ingest(
+            make_payload(75, [("甲", 1), ("乙", 0), ("丙", 0)], "任意题干")
+        )
+        self.assertEqual(self.interceptor.match_choices(["A. 甲", "B. 乙"]), [0])
+
+    def test_decimal_options_keep_their_value(self):
+        self.interceptor.ingest(
+            make_payload(76, [("1.5", 0), ("2.5", 1)], "计算题")
+        )
+        self.assertEqual(
+            self.interceptor.match_choices(["1.5", "2.5"], question_title="计算题"),
+            [1],
+        )
+
     def test_ttl_expiry_clears_cache(self):
         self.interceptor = PopupAnswerInterceptor(
             FakePage(), ttl=10, clock=self.clock
@@ -171,6 +234,36 @@ class LifecycleTests(unittest.TestCase):
         interceptor._consume = lambda response: called.append(response)
         interceptor._on_response(FakeResponse("https://example.com/other"))
         self.assertEqual(called, [])
+
+
+class PendingTaskTests(unittest.IsolatedAsyncioTestCase):
+    async def test_response_task_is_tracked_then_consumed(self):
+        interceptor = PopupAnswerInterceptor(FakePage())
+        response = FakeResponse(
+            "https://studyservice.zhihuishu.com/popupAnswer/lessonPopupExam",
+            make_payload(81, [("弹题答案", 1)]),
+        )
+        interceptor._on_response(response)
+        self.assertEqual(len(interceptor._pending_tasks), 1)
+        for _ in range(3):
+            await asyncio.sleep(0)
+        self.assertEqual(interceptor._pending_tasks, set())
+        self.assertTrue(interceptor.is_correct("弹题答案"))
+
+    async def test_detach_cancels_pending_tasks(self):
+        page = FakePage()
+        interceptor = PopupAnswerInterceptor(page)
+        interceptor.attach()
+        response = FakeResponse(
+            "https://studyservice.zhihuishu.com/popupAnswer/lessonPopupExam",
+            make_payload(82, [("延迟答案", 1)]),
+        )
+        interceptor._on_response(response)
+        self.assertEqual(len(interceptor._pending_tasks), 1)
+        interceptor.detach()
+        self.assertEqual(interceptor._pending_tasks, set())
+        for _ in range(3):
+            await asyncio.sleep(0)
 
 
 class ResponseConsumeTests(unittest.IsolatedAsyncioTestCase):

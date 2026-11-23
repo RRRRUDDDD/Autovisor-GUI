@@ -888,9 +888,11 @@ def _consume_openai_stream(
         return False
 
     def _reader() -> None:
-        non_sse_lines: list[str] = []
+        saw_data = False
+        body_lines: list[str] = []
         try:
-            iterator = iter(resp.iter_lines(decode_unicode=True))
+            # decode_unicode=False 避免 requests 缺省按 ISO-8859-1 解码中文乱码.
+            iterator = iter(resp.iter_lines(decode_unicode=False))
             while not stop_event.is_set():
                 try:
                     raw_line = next(iterator)
@@ -899,12 +901,15 @@ def _consume_openai_stream(
                 line = _sse_text(raw_line).strip()
                 if not line:
                     continue
-                if not line.startswith("data:"):
-                    non_sse_lines.append(line)
+                if line.startswith(":"):
+                    # SSE 注释行(如 ": keep-alive")是合法心跳, 刷新 idle 超时.
+                    _emit(("heartbeat", None))
                     continue
-                if non_sse_lines:
-                    _emit(("unsupported", "\n".join(non_sse_lines)))
-                    return
+                if not line.startswith("data:"):
+                    if not line.startswith(("event:", "id:", "retry:")):
+                        body_lines.append(line)
+                    continue
+                saw_data = True
                 payload = line[5:].strip()
                 if payload == "[DONE]":
                     _emit(("done", None))
@@ -928,8 +933,9 @@ def _consume_openai_stream(
                 if choice.get("finish_reason"):
                     _emit(("done", None))
                     return
-            if non_sse_lines and not stop_event.is_set():
-                _emit(("unsupported", "\n".join(non_sse_lines)))
+            if body_lines and not saw_data and not stop_event.is_set():
+                # 整个响应没有任何合法 data: 行, 正文可能是普通 JSON.
+                _emit(("unsupported", "\n".join(body_lines)))
             else:
                 _emit(("done", None))
         except Exception as exc:

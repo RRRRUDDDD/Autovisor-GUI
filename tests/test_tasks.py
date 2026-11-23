@@ -195,6 +195,95 @@ class SkipQuestionsLoggingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(quiz_events[1]["默认选择"], 1)
 
 
+class _QuietLogger:
+    def __getattr__(self, _name):
+        return lambda *args, **kwargs: None
+
+
+class ClickInterceptedAnswersTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        patcher = patch("modules.popup_interceptor.logger", _QuietLogger())
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    @staticmethod
+    def _payload(*questions):
+        return {
+            "data": {
+                "lessonTestQuestionUseInterfaceDtos": [
+                    {
+                        "testQuestion": {
+                            "questionId": question_id,
+                            "name": title,
+                            "questionOptions": [
+                                {"content": text, "result": result}
+                                for text, result in options
+                            ],
+                        }
+                    }
+                    for question_id, title, options in questions
+                ]
+            }
+        }
+
+    @staticmethod
+    def _choice(text):
+        class _Choice:
+            def __init__(self):
+                self.text = text
+                self.clicked = False
+
+            async def inner_text(self):
+                return self.text
+
+            async def click(self, timeout=500):
+                self.clicked = True
+
+        return _Choice()
+
+    async def test_title_isolates_each_popup_question(self):
+        from modules.popup_interceptor import PopupAnswerInterceptor
+
+        class _Title:
+            async def inner_text(self):
+                return " 地球是圆的 "
+
+        class _Page(_FakePage):
+            async def query_selector(self, selector):
+                return _Title() if selector == ".topic-title" else None
+
+        interceptor = PopupAnswerInterceptor(_Page())
+        interceptor.ingest(
+            self._payload(
+                (101, "地球是圆的", [("正确", 1), ("错误", 0)]),
+                (102, "太阳从西边升起", [("正确", 0), ("错误", 1)]),
+            )
+        )
+        choices = [self._choice("A. 正确"), self._choice("B. 错误")]
+        clicked = await tasks.click_intercepted_answers(_Page(), interceptor, choices)
+        self.assertTrue(clicked)
+        self.assertEqual([choice.clicked for choice in choices], [True, False])
+
+    async def test_conflicting_answers_click_nothing(self):
+        from modules.popup_interceptor import PopupAnswerInterceptor
+
+        class _Page(_FakePage):
+            async def query_selector(self, selector):
+                return None
+
+        interceptor = PopupAnswerInterceptor(_Page())
+        interceptor.ingest(
+            self._payload(
+                (103, "判断题一", [("正确", 1), ("错误", 0)]),
+                (104, "判断题二", [("正确", 0), ("错误", 1)]),
+            )
+        )
+        choices = [self._choice("A. 正确"), self._choice("B. 错误")]
+        clicked = await tasks.click_intercepted_answers(_Page(), interceptor, choices)
+        self.assertFalse(clicked)
+        self.assertEqual([choice.clicked for choice in choices], [False, False])
+
+
 class WaitForVerifyWindowControlTests(unittest.IsolatedAsyncioTestCase):
     async def _run_verify_once(self, *, enable_hide_window: bool, attach_existing_chrome: bool):
         from types import SimpleNamespace

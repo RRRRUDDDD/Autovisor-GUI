@@ -289,27 +289,57 @@ async def play_video(
             continue
 
 
-async def click_intercepted_answers(page, interceptor, choices) -> bool:
+async def read_popup_title(page) -> str:
+    """读取当前弹题题干文本, 用于按题隔离匹配拦截答案."""
+    try:
+        element = await page.query_selector(".topic-title")
+        if element is None:
+            return ""
+        return " ".join((await element.inner_text()).split())
+    except TargetClosedError:
+        raise
+    except Exception:
+        return ""
+
+
+async def click_intercepted_answers(
+    page, interceptor, choices, *, question_title=None
+) -> bool:
     """按接口拦截到的标准答案点选 DOM 选项; 未命中返回 False 静默回退."""
     if interceptor is None or not choices:
         return False
-    clicked = 0
+    handles = []
+    texts = []
+    for choice in choices:
+        try:
+            text = await choice.inner_text()
+        except TargetClosedError:
+            raise
+        except Exception:
+            continue
+        handles.append(choice)
+        texts.append(text or "")
+    if not texts:
+        return False
+    title = question_title
+    if title is None:
+        title = await read_popup_title(page)
     try:
-        for choice in choices:
-            try:
-                text = await choice.inner_text()
-            except TargetClosedError:
-                raise
-            except Exception:
-                continue
-            if not text or not interceptor.is_correct(text):
-                continue
-            await choice.click(timeout=500)
-            clicked += 1
-    except TargetClosedError:
-        raise
+        indices = interceptor.match_choices(texts, question_title=title or "")
     except Exception as exc:
-        logger.debug(f"接口拦截答案点选失败: {logger.summarize_exception(exc)}")
+        logger.debug(f"接口拦截答案匹配失败: {logger.summarize_exception(exc)}")
+        return False
+    clicked = 0
+    for index in indices:
+        if index < 0 or index >= len(handles):
+            continue
+        try:
+            await handles[index].click(timeout=500)
+            clicked += 1
+        except TargetClosedError:
+            raise
+        except Exception:
+            continue
     return clicked > 0
 
 
