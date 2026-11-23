@@ -72,6 +72,18 @@ enableExamApi = True
 enableReviewExamApi = False
 ;课中弹题: 是否优先用智慧树 AI 作答, 失败回退自定义大模型 (默认:True)
 enableZhidaoQuiz = True
+;播放页: 只读拦截课中弹题接口, 直接取服务端正确答案 (默认:True)
+enablePopupIntercept = True
+;知到作业: 命中作业页时优先走加密 API 明文作答, 失败回退视觉模型 (默认:True)
+enableHomeworkApi = True
+;知到作业达标得分率 0-100, 低于该值自动重做 (默认:100)
+homeworkThreshold = 100
+;知到作业单份最大重做次数 (默认:3, 0=使用默认轮次)
+homeworkMaxRedo = 3
+;知到正式考试: 命中考试页时由加密 API 接管, 交卷受 data/llm.json 的 auto_submit 控制 (默认:True)
+enableFormalExamApi = True
+;AI智慧课: 自动提取知识点 PPT 课件文本作为答题参考 (默认:True)
+enablePptReference = True
 ;掌握度目标百分比 (1-100, 默认:100)
 masteryTarget = 100
 

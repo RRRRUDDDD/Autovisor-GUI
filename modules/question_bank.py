@@ -185,6 +185,24 @@ class QuestionBankClient:
     def stats(self) -> tuple[int, int]:
         return self._hit_count, self._total_queries
 
+    def probe(self) -> dict:
+        """连通性自检: 只读 GET /info, 不查询题目、不消耗次数."""
+        if not self.enabled():
+            return {"ok": False, "message": "未配置第三方题库 Token"}
+        payload = self._get_json(self.info_url, {"token": self.token})
+        if not isinstance(payload, dict):
+            return {"ok": False, "message": "题库请求失败, 请检查网络或查询地址"}
+        remaining = _extract_remaining(payload)
+        if remaining is None:
+            return {"ok": True, "remaining": None, "message": "题库连接正常"}
+        self._remaining = remaining
+        self._remaining_loaded = True
+        return {
+            "ok": True,
+            "remaining": remaining,
+            "message": f"题库连接正常, 剩余 {remaining} 次",
+        }
+
     def log_stats(self) -> None:
         if not self.enabled() or not self._total_queries:
             return

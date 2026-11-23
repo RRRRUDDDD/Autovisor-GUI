@@ -555,7 +555,7 @@ const WorkspaceView = ({
                     if (urlError) setUrlError('');
                     if (manualFeedback) setManualFeedback('');
                   }}
-                  placeholder={'粘贴单条或多行课程播放页 https:// 链接\n支持直接粘贴 config.ini 的 URL1 = https://... 块'}
+                  placeholder={'粘贴单条或多行 https:// 链接（课程 / 知到作业 / 正式考试 / AI 学习页均可）\n支持直接粘贴 config.ini 的 URL1 = https://... 块'}
                   aria-label="补充课程链接"
                   className="w-full resize-y rounded-xl border border-outline/60 bg-surface-container-lowest py-2 pl-8 pr-3 font-mono text-xs text-on-surface placeholder:text-on-surface-variant/75 focus:border-primary focus:outline-none focus:ring-2 focus:ring-primary/30"
                 />
@@ -584,6 +584,9 @@ const WorkspaceView = ({
                   {urlError}
                 </p>
               )}
+              <p className="text-[11px] text-on-surface-variant">
+                支持课程播放页、知到作业 / 正式考试直达链接，以及 learnPage / knowledgeStudy / testDetail 学习页
+              </p>
               {manualFeedback && !urlError && (
                 <p role="status" className="text-xs font-medium text-success">
                   {manualFeedback}

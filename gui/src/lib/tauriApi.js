@@ -278,6 +278,13 @@ async function call(cmd, args = {}) {
       }
       return `[演示模式] 连接成功（128ms），模型 ${model} 回复：OK`;
     }
+    case 'test_question_bank': {
+      const token = String(args.token || '').trim();
+      if (!token) {
+        throw new Error('未配置第三方题库 Token');
+      }
+      return '[演示模式] 题库连接正常, 剩余 100 次';
+    }
     case 'fetch_llm_models': {
       const llm = args.llm || {};
       const apiKey = String(llm.apiKey || '').trim();
@@ -353,6 +360,11 @@ export const tauriApi = {
     call('test_notification', { provider, url, tgChatId, proxy }),
   testLlmConnection: ({ llm, proxy = '' }) =>
     call('test_llm_connection', { llm, proxy }),
+  testQuestionBank: ({ token = '', url = '', proxy = '' }) =>
+    call('test_question_bank', { token, url, proxy }),
+  exportQuestionCache: (courseId = '') =>
+    call('export_question_cache', { courseId: courseId || null }),
+  importQuestionCache: () => call('import_question_cache'),
   fetchLlmModels: ({ llm, proxy = '' }) =>
     call('fetch_llm_models', { llm, proxy }),
   setDebugLog: (enabled) => call('set_debug_log', { enabled: Boolean(enabled) }),

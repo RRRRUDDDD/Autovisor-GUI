@@ -95,6 +95,13 @@ class Config:
             self.enableHomeworkApi = self.get_bool_field('course-option', 'enableHomeworkApi', fallback=True)
             # 知到正式考试: 命中考试页时由加密 API 接管 (默认开启)
             self.enableFormalExamApi = self.get_bool_field('course-option', 'enableFormalExamApi', fallback=True)
+            # AI 智慧课: 自动提取知识点 PPT 文本作为答题参考 (默认开启)
+            self.enablePptReference = self.get_bool_field('course-option', 'enablePptReference', fallback=True)
+            # 播放页: 只读拦截课中弹题接口, 直接取服务端正确答案 (默认开启)
+            self.enablePopupIntercept = self.get_bool_field('course-option', 'enablePopupIntercept', fallback=True)
+            # 知到作业: 达标得分率与单份最大重做次数 (0=使用默认轮次)
+            self.homeworkThreshold = self._safe_get_float('course-option', 'homeworkThreshold', 100.0)
+            self.homeworkMaxRedo = int(self._safe_get_float('course-option', 'homeworkMaxRedo', 3.0))
             self.course_match_rule = re.compile("https://[-A-Za-z0-9+&@#/%?=~_|!:,.;]+[-A-Za-z0-9+&@#/%=~_|]")
             self.course_urls = self.get_course_urls()
         # 登录
@@ -351,6 +358,14 @@ enableZhidaoQuiz = True
 enableHomeworkApi = True
 ;知到正式考试: 命中考试页时由加密 API 接管, 含自动交卷 (默认:True)
 enableFormalExamApi = True
+;AI智慧课: 自动提取知识点 PPT 课件文本作为答题参考 (默认:True)
+enablePptReference = True
+;播放页: 只读拦截课中弹题接口, 直接取服务端正确答案 (默认:True)
+enablePopupIntercept = True
+;知到作业达标得分率 0-100, 低于该值自动重做 (默认:100)
+homeworkThreshold = 100
+;知到作业单份最大重做次数 (默认:3, 0=使用默认轮次)
+homeworkMaxRedo = 3
 ;掌握度目标百分比 (1-100, 默认:100)
 masteryTarget = 100
 

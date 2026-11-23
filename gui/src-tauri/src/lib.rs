@@ -367,6 +367,97 @@ async fn test_llm_connection(
 }
 
 #[tauri::command]
+async fn test_question_bank(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    token: String,
+    url: String,
+    proxy: String,
+) -> Result<String, String> {
+    let backend = Arc::clone(&state.backend);
+    let payload = serde_json::json!({
+        "token": token,
+        "url": url,
+        "proxy": proxy,
+    });
+    let resp = tauri::async_runtime::spawn_blocking(move || {
+        backend.post_json(Some(&app), "/api/question-bank/test", &payload, 25)
+    })
+    .await
+    .map_err(|e| format!("题库连通性测试异常: {e}"))??;
+    let ok = resp.get("ok").and_then(|v| v.as_bool()).unwrap_or(false);
+    let message = resp
+        .get("message")
+        .and_then(|v| v.as_str())
+        .unwrap_or("题库连通性测试返回格式异常");
+    if ok {
+        Ok(message.to_string())
+    } else {
+        Err(message.to_string())
+    }
+}
+
+#[tauri::command]
+async fn export_question_cache(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    course_id: Option<String>,
+) -> Result<Option<String>, String> {
+    let backend = Arc::clone(&state.backend);
+    let payload = serde_json::json!({ "courseId": course_id.unwrap_or_default() });
+    let resp = tauri::async_runtime::spawn_blocking(move || {
+        backend.post_json(Some(&app), "/api/cache/export", &payload, 60)
+    })
+    .await
+    .map_err(|e| format!("导出题库缓存异常: {e}"))??;
+    let data = resp
+        .get("data")
+        .cloned()
+        .ok_or_else(|| "导出题库缓存返回格式异常".to_string())?;
+    let Some(path) = rfd::FileDialog::new()
+        .set_title("导出 SQLite 题库缓存")
+        .add_filter("JSON 文件", &["json"])
+        .set_file_name("autovisor-question-bank.json")
+        .save_file()
+    else {
+        return Ok(None);
+    };
+    let text = serde_json::to_string_pretty(&data)
+        .map_err(|e| format!("序列化题库缓存失败: {e}"))?;
+    fs::write(&path, text).map_err(|e| format!("写入题库缓存失败: {e}"))?;
+    Ok(Some(path.to_string_lossy().to_string()))
+}
+
+#[tauri::command]
+async fn import_question_cache(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<Option<serde_json::Value>, String> {
+    let Some(path) = rfd::FileDialog::new()
+        .set_title("导入 SQLite 题库缓存")
+        .add_filter("JSON 文件", &["json"])
+        .pick_file()
+    else {
+        return Ok(None);
+    };
+    let raw = fs::read_to_string(&path).map_err(|e| format!("读取题库缓存失败: {e}"))?;
+    let parsed: serde_json::Value = serde_json::from_str(raw.trim_start_matches('\u{feff}'))
+        .map_err(|e| format!("解析题库缓存失败: {e}"))?;
+    let body = if parsed.get("data").is_some() {
+        parsed
+    } else {
+        serde_json::json!({ "data": parsed })
+    };
+    let backend = Arc::clone(&state.backend);
+    let resp = tauri::async_runtime::spawn_blocking(move || {
+        backend.post_json(Some(&app), "/api/cache/import", &body, 60)
+    })
+    .await
+    .map_err(|e| format!("导入题库缓存异常: {e}"))??;
+    Ok(Some(resp))
+}
+
+#[tauri::command]
 async fn fetch_llm_models(
     app: AppHandle,
     state: State<'_, AppState>,
@@ -721,6 +812,9 @@ pub fn run() {
             run_diagnostic,
             test_notification,
             test_llm_connection,
+            test_question_bank,
+            export_question_cache,
+            import_question_cache,
             fetch_llm_models,
             set_debug_log,
             start_qr_login,

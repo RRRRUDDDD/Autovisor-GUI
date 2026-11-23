@@ -177,6 +177,63 @@ describe('Desktop Parity features (Phases 1-6)', () => {
     expect(cfg.password).toBe('');
   });
 
+  it('exposes phase 9 answer enhancements, question bank test, and cache export/import in SettingsView', async () => {
+    let cfg = {
+      ...defaultConfig(),
+      proxy: 'http://127.0.0.1:7890',
+      llm: { ...defaultConfig().llm, questionBankToken: 'bank-token' },
+    };
+    const onChangeConfig = vi.fn((updater) => {
+      cfg = typeof updater === 'function' ? updater(cfg) : updater;
+    });
+    const onTestQuestionBank = vi.fn().mockResolvedValue('题库连接正常, 剩余 5 次');
+    const onExportQuestionCache = vi.fn().mockResolvedValue('C:\\out.json');
+    const onImportQuestionCache = vi.fn().mockResolvedValue({ questions: 3, answers: 4 });
+
+    render(
+      <SettingsView
+        config={cfg}
+        onChangeConfig={onChangeConfig}
+        runtime={{ platform: 'windows' }}
+        onListLogFiles={vi.fn().mockResolvedValue([])}
+        onTestQuestionBank={onTestQuestionBank}
+        onExportQuestionCache={onExportQuestionCache}
+        onImportQuestionCache={onImportQuestionCache}
+      />
+    );
+
+    expect(screen.getByLabelText('作业达标得分率（%）').value).toBe('100');
+    expect(screen.getByLabelText('作业错题重做轮数').value).toBe('3');
+    expect(screen.getByLabelText('日志上限（MB）').value).toBe('10');
+    expect(screen.getByLabelText('流式总超时（秒）').value).toBe('120');
+    expect(screen.getByLabelText('第三方题库 Token（可选）').value).toBe('bank-token');
+
+    fireEvent.click(screen.getByRole('checkbox', { name: /知到作业优先走加密 API/ }));
+    expect(cfg.enableHomeworkApi).toBe(false);
+
+    fireEvent.change(screen.getByLabelText('作业达标得分率（%）'), {
+      target: { value: '85' },
+    });
+    expect(cfg.homeworkThreshold).toBe(85);
+
+    fireEvent.click(screen.getByRole('button', { name: '测试题库连通性' }));
+    await waitFor(() => expect(onTestQuestionBank).toHaveBeenCalledTimes(1));
+    expect(onTestQuestionBank).toHaveBeenCalledWith({
+      token: 'bank-token',
+      url: 'https://tk.enncy.cn/query',
+      proxy: 'http://127.0.0.1:7890',
+    });
+    expect(await screen.findByText('题库连接正常, 剩余 5 次')).toBeTruthy();
+
+    fireEvent.click(screen.getByRole('button', { name: '导出题库缓存' }));
+    expect(await screen.findByText(/题库缓存已导出到 C:\\out\.json/)).toBeTruthy();
+
+    fireEvent.click(screen.getByRole('button', { name: '导入题库缓存' }));
+    expect(
+      await screen.findByText('题库缓存导入完成：题目 3，答案 4')
+    ).toBeTruthy();
+  });
+
   it('syncs exePath when switching browser driver in SettingsView', () => {
     let cfg = {
       ...defaultConfig(),

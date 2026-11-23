@@ -71,6 +71,47 @@ class QuestionBankClientTests(unittest.TestCase):
         self.assertEqual(session.calls, [])
         self.assertEqual(client.stats(), (0, 0))
 
+    def test_probe_reports_disabled_without_network(self):
+        def handler(url, kwargs):  # pragma: no cover - 不应被调用
+            raise AssertionError(f"空 token 不应发起请求: {url}")
+
+        client, session = self._client(handler, token="")
+        result = client.probe()
+        self.assertFalse(result["ok"])
+        self.assertIn("Token", result["message"])
+        self.assertEqual(session.calls, [])
+
+    def test_probe_reads_remaining_from_info(self):
+        def handler(url, kwargs):
+            self.assertTrue(url.endswith("/info"))
+            return _Response({"code": 1, "data": {"times": 42}})
+
+        client, session = self._client(handler)
+        result = client.probe()
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["remaining"], 42)
+        self.assertIn("42", result["message"])
+        self.assertEqual(len(session.calls), 1)
+        self.assertEqual(client.remaining, 42)
+
+    def test_probe_without_remaining_still_succeeds(self):
+        def handler(url, kwargs):
+            return _Response({"code": 1, "data": {}})
+
+        client, _ = self._client(handler)
+        result = client.probe()
+        self.assertTrue(result["ok"])
+        self.assertIsNone(result["remaining"])
+
+    def test_probe_degrades_on_network_error(self):
+        def handler(url, kwargs):
+            return RuntimeError("boom")
+
+        client, _ = self._client(handler)
+        result = client.probe()
+        self.assertFalse(result["ok"])
+        self.assertIn("失败", result["message"])
+
     def test_info_is_lazy_loaded_once_before_first_query(self):
         def handler(url, kwargs):
             if url.endswith("/info"):

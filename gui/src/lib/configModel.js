@@ -56,6 +56,10 @@ export function defaultLlmConfig() {
     visionModel: '',
     apiVersion: '',
     autoSubmit: false,
+    streamTimeout: 120,
+    streamIdleTimeout: 30,
+    questionBankToken: '',
+    questionBankUrl: 'https://tk.enncy.cn/query',
   };
 }
 
@@ -91,6 +95,16 @@ export function defaultConfig() {
     enableZhidaoQuiz: true,
     enableMastery: true,
     masteryTarget: 100,
+    enablePptReference: true,
+    enablePopupIntercept: true,
+    enableHomeworkApi: true,
+    homeworkThreshold: 100,
+    homeworkMaxRedo: 3,
+    enableFormalExamApi: true,
+    logMaxSizeMb: 10,
+    logRetentionDays: 14,
+    logMaxFiles: 200,
+    logCompressAfterDays: 3,
     llm: defaultLlmConfig(),
     courses: [],
     mirrors: {
@@ -120,6 +134,15 @@ export function isValidLlmApiBase(raw) {
 
 export function detectCourseType(rawUrl) {
   const url = String(rawUrl || '').toLowerCase();
+  if (/\/dohomework\//.test(url)) {
+    return { key: 'homework', label: '知到作业', cls: 'bg-primary-container text-on-primary-container' };
+  }
+  if (/\/doexam\//.test(url)) {
+    return { key: 'exam', label: '知到考试', cls: 'bg-error-container text-on-error-container' };
+  }
+  if (/\/testdetail\//.test(url)) {
+    return { key: 'test-detail', label: 'AI 测试详情', cls: 'bg-tertiary-container text-on-tertiary-container' };
+  }
   if (url.includes('ai-smart-course-student-pro.zhihuishu.com')) {
     return { key: 'ai-smart', label: 'AI 智慧课', cls: 'bg-tertiary-container text-on-tertiary-container' };
   }
@@ -189,9 +212,19 @@ export function extractCourseUrlsFromText(text) {
 export function normalizeConfig(raw) {
   const base = defaultConfig();
   if (!raw || typeof raw !== 'object') return base;
+  const numberOrNaN = (value) => {
+  if (value === undefined || value === null || value === '') return NaN;
+  return Number(value);
+};
   const speed = Number(raw.limitSpeed);
   const limitMaxTime = Number(raw.limitMaxTime);
   const masteryTarget = Number(raw.masteryTarget);
+  const homeworkThreshold = numberOrNaN(raw.homeworkThreshold);
+  const homeworkMaxRedo = numberOrNaN(raw.homeworkMaxRedo);
+  const logMaxSizeMb = numberOrNaN(raw.logMaxSizeMb);
+  const logRetentionDays = numberOrNaN(raw.logRetentionDays);
+  const logMaxFiles = numberOrNaN(raw.logMaxFiles);
+  const logCompressAfterDays = numberOrNaN(raw.logCompressAfterDays);
   const courses = Array.isArray(raw.courses)
     ? raw.courses
         .filter((item) => item && typeof item.url === 'string' && item.url.trim())
@@ -218,6 +251,10 @@ export function normalizeConfig(raw) {
     rawProvider
   );
   const llmProvider = rawProvider || inferLlmProvider(llmApiBase, llmApiFormat);
+  const llmStreamTimeout = Number(rawLlm.streamTimeout ?? rawLlm.stream_timeout);
+  const llmStreamIdleTimeout = Number(
+    rawLlm.streamIdleTimeout ?? rawLlm.stream_idle_timeout
+  );
   const llm = {
     provider: llmProvider,
     apiFormat: llmApiFormat,
@@ -227,6 +264,18 @@ export function normalizeConfig(raw) {
     visionModel: String(rawLlm.visionModel ?? rawLlm.vision_model ?? '').trim(),
     apiVersion: String(rawLlm.apiVersion ?? rawLlm.api_version ?? '').trim(),
     autoSubmit: Boolean(rawLlm.autoSubmit ?? rawLlm.auto_submit),
+    streamTimeout:
+      Number.isFinite(llmStreamTimeout) && llmStreamTimeout > 0 ? llmStreamTimeout : 120,
+    streamIdleTimeout:
+      Number.isFinite(llmStreamIdleTimeout) && llmStreamIdleTimeout > 0
+        ? llmStreamIdleTimeout
+        : 30,
+    questionBankToken: String(
+      rawLlm.questionBankToken ?? rawLlm.question_bank_token ?? ''
+    ).trim(),
+    questionBankUrl:
+      String(rawLlm.questionBankUrl ?? rawLlm.question_bank_url ?? '').trim() ||
+      'https://tk.enncy.cn/query',
   };
 
   return {
@@ -265,6 +314,34 @@ export function normalizeConfig(raw) {
     masteryTarget: Number.isFinite(masteryTarget) && masteryTarget > 0
       ? Math.min(100, Math.max(1, Math.round(masteryTarget)))
       : 100,
+    enablePptReference:
+      raw.enablePptReference !== undefined ? Boolean(raw.enablePptReference) : true,
+    enablePopupIntercept:
+      raw.enablePopupIntercept !== undefined ? Boolean(raw.enablePopupIntercept) : true,
+    enableHomeworkApi:
+      raw.enableHomeworkApi !== undefined ? Boolean(raw.enableHomeworkApi) : true,
+    homeworkThreshold:
+      Number.isFinite(homeworkThreshold)
+        ? Math.min(100, Math.max(0, Math.round(homeworkThreshold)))
+        : 100,
+    homeworkMaxRedo:
+      Number.isFinite(homeworkMaxRedo) && homeworkMaxRedo >= 0
+        ? Math.max(0, Math.round(homeworkMaxRedo))
+        : 3,
+    enableFormalExamApi:
+      raw.enableFormalExamApi !== undefined ? Boolean(raw.enableFormalExamApi) : true,
+    logMaxSizeMb:
+      Number.isFinite(logMaxSizeMb) && logMaxSizeMb > 0 ? Math.round(logMaxSizeMb) : 10,
+    logRetentionDays:
+      Number.isFinite(logRetentionDays) && logRetentionDays > 0
+        ? Math.round(logRetentionDays)
+        : 14,
+    logMaxFiles:
+      Number.isFinite(logMaxFiles) && logMaxFiles > 0 ? Math.round(logMaxFiles) : 200,
+    logCompressAfterDays:
+      Number.isFinite(logCompressAfterDays) && logCompressAfterDays > 0
+        ? Math.round(logCompressAfterDays)
+        : 3,
     llm,
     courses,
     mirrors: raw.mirrors && typeof raw.mirrors === 'object' && Object.keys(raw.mirrors).length > 0

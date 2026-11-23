@@ -69,6 +69,7 @@ describe('App UI flows', () => {
     const settingsHeadings = screen.getAllByRole('heading', { level: 2 }).map((el) => el.textContent);
     expect(settingsHeadings).toEqual([
       '大模型智能答题',
+      '答题增强与题库',
       '完成后关机',
       '桌面窗口',
       '浏览器与网络',

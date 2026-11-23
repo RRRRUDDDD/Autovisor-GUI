@@ -377,6 +377,7 @@ async def run_exam_stage(page: Page, course_url: str, config, logger) -> dict:
         payload["classId"],
         api,
         target=int(config.masteryTarget),
+        enable_ppt=getattr(config, "enablePptReference", True),
     )
     logger.info(f"开始接口考试: 知识点 {len(nodes)} 个, 目标掌握度 {int(config.masteryTarget)}%")
     logger.event("接口考试范围", 知识点=len(nodes), 目标掌握度=int(config.masteryTarget))

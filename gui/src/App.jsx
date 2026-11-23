@@ -605,6 +605,18 @@ export default function App() {
     return tauriApi.fetchLlmModels(payload);
   }, []);
 
+  const handleTestQuestionBank = useCallback(async (payload) => {
+    return tauriApi.testQuestionBank(payload);
+  }, []);
+
+  const handleExportQuestionCache = useCallback(async () => {
+    return tauriApi.exportQuestionCache();
+  }, []);
+
+  const handleImportQuestionCache = useCallback(async () => {
+    return tauriApi.importQuestionCache();
+  }, []);
+
   const handleCheckUpdate = useCallback(async ({ silent = false } = {}) => {
     setCheckingUpdate(true);
     if (!silent) {
@@ -1029,6 +1041,9 @@ export default function App() {
               onTestNotification={handleTestNotification}
               onTestLlmConnection={handleTestLlmConnection}
               onFetchLlmModels={handleFetchLlmModels}
+              onTestQuestionBank={handleTestQuestionBank}
+              onExportQuestionCache={handleExportQuestionCache}
+              onImportQuestionCache={handleImportQuestionCache}
               onImportCookies={handleImportCookies}
               onClearCookies={handleClearCookies}
               onOpenPath={handleOpenPath}

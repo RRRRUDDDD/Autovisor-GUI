@@ -65,6 +65,9 @@ const SettingsView = ({
   onTestNotification,
   onTestLlmConnection,
   onFetchLlmModels,
+  onTestQuestionBank,
+  onExportQuestionCache,
+  onImportQuestionCache,
   onImportCookies,
   onClearCookies,
   onOpenPath,
@@ -95,6 +98,9 @@ const SettingsView = ({
   const [showUpdateNotes, setShowUpdateNotes] = useState(false);
   const [editingCredentials, setEditingCredentials] = useState(false);
   const [showSavedPassword, setShowSavedPassword] = useState(false);
+  const [testingBank, setTestingBank] = useState(false);
+  const [bankResult, setBankResult] = useState(null);
+  const [cacheBusy, setCacheBusy] = useState(false);
 
   const refreshLogs = useCallback(async () => {
     if (!onListLogFiles) return;
@@ -244,6 +250,76 @@ const SettingsView = ({
       setFetchModelsError(err?.message || String(err) || '拉取模型列表失败');
     } finally {
       setFetchingModels(false);
+    }
+  };
+
+  const handleTestQuestionBank = async () => {
+    if (!onTestQuestionBank) return;
+    setTestingBank(true);
+    setBankResult(null);
+    try {
+      const message = await onTestQuestionBank({
+        token: llm.questionBankToken || '',
+        url: llm.questionBankUrl || '',
+        proxy: config.proxy || '',
+      });
+      setBankResult({ type: 'success', message: message || '题库连接正常' });
+    } catch (err) {
+      setBankResult({
+        type: 'error',
+        message: err?.message || String(err) || '题库连通性测试失败',
+      });
+    } finally {
+      setTestingBank(false);
+    }
+  };
+
+  const handleExportCache = async () => {
+    if (!onExportQuestionCache) return;
+    setCacheBusy(true);
+    setBankResult(null);
+    try {
+      const path = await onExportQuestionCache();
+      setBankResult(
+        path
+          ? { type: 'success', message: `题库缓存已导出到 ${path}` }
+          : { type: 'info', message: '已取消导出' }
+      );
+    } catch (err) {
+      setBankResult({
+        type: 'error',
+        message: err?.message || String(err) || '导出题库缓存失败',
+      });
+    } finally {
+      setCacheBusy(false);
+    }
+  };
+
+  const handleImportCache = async () => {
+    if (!onImportQuestionCache) return;
+    setCacheBusy(true);
+    setBankResult(null);
+    try {
+      const result = await onImportQuestionCache();
+      if (!result) {
+        setBankResult({ type: 'info', message: '已取消导入' });
+      } else {
+        const parts = [
+          result.questions != null ? `题目 ${result.questions}` : '',
+          result.answers != null ? `答案 ${result.answers}` : '',
+        ].filter(Boolean);
+        setBankResult({
+          type: 'success',
+          message: parts.length ? `题库缓存导入完成：${parts.join('，')}` : '题库缓存导入完成',
+        });
+      }
+    } catch (err) {
+      setBankResult({
+        type: 'error',
+        message: err?.message || String(err) || '导入题库缓存失败',
+      });
+    } finally {
+      setCacheBusy(false);
     }
   };
 
@@ -564,6 +640,216 @@ const SettingsView = ({
                   </p>
                 )}
               </div>
+            </div>
+          </div>
+        </section>
+
+        {/* 卡片 1.5：答题增强与题库 */}
+        <section className="flex flex-col rounded-[24px] bg-surface-container-low p-6 lg:col-span-2">
+          <div className="mb-5 flex items-center justify-between gap-3">
+            <div className="flex items-center gap-3">
+              <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-2xl bg-tertiary-container text-on-tertiary-container">
+                <Sparkles className="h-5 w-5" aria-hidden="true" />
+              </div>
+              <div>
+                <h2 className="text-base font-semibold text-on-surface">答题增强与题库</h2>
+                <p className="text-xs text-on-surface-variant">
+                  知到作业/考试接口、弹题拦截、PPT 参考与第三方题库（写入 config.ini 与 data/llm.json）
+                </p>
+              </div>
+            </div>
+          </div>
+
+          <div className="space-y-3">
+            <Switch
+              id="enableHomeworkApi"
+              checked={config.enableHomeworkApi !== false}
+              onChange={(enableHomeworkApi) => updateField({ enableHomeworkApi })}
+              label="知到作业优先走加密 API"
+              description="关闭后仅使用视觉模型作答；开启时图片题仍会自动回退视觉模型"
+            />
+            <Switch
+              id="enableFormalExamApi"
+              checked={config.enableFormalExamApi !== false}
+              onChange={(enableFormalExamApi) => updateField({ enableFormalExamApi })}
+              label="接管知到正式考试接口"
+              description="交卷仍受大模型设置中的「测验 / 作业自动提交」控制"
+            />
+            <Switch
+              id="enablePptReference"
+              checked={config.enablePptReference !== false}
+              onChange={(enablePptReference) => updateField({ enablePptReference })}
+              label="PPT 课件辅助答题"
+              description="自动提取 AI 智慧课知识点的 PPT 文本并注入答题参考"
+            />
+            <Switch
+              id="enablePopupIntercept"
+              checked={config.enablePopupIntercept !== false}
+              onChange={(enablePopupIntercept) => updateField({ enablePopupIntercept })}
+              label="课中弹题接口拦截"
+              description="只读监听官方 AI 弹题响应，未命中时静默回退大模型"
+            />
+
+            <div className="grid grid-cols-1 gap-3 border-t border-outline-variant/60 pt-3 sm:grid-cols-2">
+              <div className="space-y-1.5">
+                <Label htmlFor="homeworkThreshold">作业达标得分率（%）</Label>
+                <Input
+                  id="homeworkThreshold"
+                  type="number"
+                  min="0"
+                  max="100"
+                  value={config.homeworkThreshold ?? 100}
+                  onChange={(e) => updateField({ homeworkThreshold: Number(e.target.value) })}
+                />
+              </div>
+              <div className="space-y-1.5">
+                <Label htmlFor="homeworkMaxRedo">作业错题重做轮数</Label>
+                <Input
+                  id="homeworkMaxRedo"
+                  type="number"
+                  min="0"
+                  value={config.homeworkMaxRedo ?? 3}
+                  onChange={(e) => updateField({ homeworkMaxRedo: Number(e.target.value) })}
+                />
+              </div>
+            </div>
+
+            <div className="grid grid-cols-2 gap-3 border-t border-outline-variant/60 pt-3 lg:grid-cols-4">
+              <div className="space-y-1.5">
+                <Label htmlFor="logMaxSizeMb">日志上限（MB）</Label>
+                <Input
+                  id="logMaxSizeMb"
+                  type="number"
+                  min="1"
+                  value={config.logMaxSizeMb ?? 10}
+                  onChange={(e) => updateField({ logMaxSizeMb: Number(e.target.value) })}
+                />
+              </div>
+              <div className="space-y-1.5">
+                <Label htmlFor="logRetentionDays">保留天数</Label>
+                <Input
+                  id="logRetentionDays"
+                  type="number"
+                  min="1"
+                  value={config.logRetentionDays ?? 14}
+                  onChange={(e) => updateField({ logRetentionDays: Number(e.target.value) })}
+                />
+              </div>
+              <div className="space-y-1.5">
+                <Label htmlFor="logMaxFiles">文件数上限</Label>
+                <Input
+                  id="logMaxFiles"
+                  type="number"
+                  min="1"
+                  value={config.logMaxFiles ?? 200}
+                  onChange={(e) => updateField({ logMaxFiles: Number(e.target.value) })}
+                />
+              </div>
+              <div className="space-y-1.5">
+                <Label htmlFor="logCompressAfterDays">压缩归档天数</Label>
+                <Input
+                  id="logCompressAfterDays"
+                  type="number"
+                  min="1"
+                  value={config.logCompressAfterDays ?? 3}
+                  onChange={(e) => updateField({ logCompressAfterDays: Number(e.target.value) })}
+                />
+              </div>
+            </div>
+
+            <div className="grid grid-cols-1 gap-3 border-t border-outline-variant/60 pt-3 sm:grid-cols-2">
+              <div className="space-y-1.5">
+                <Label htmlFor="llmStreamTimeout">流式总超时（秒）</Label>
+                <Input
+                  id="llmStreamTimeout"
+                  type="number"
+                  min="1"
+                  value={llm.streamTimeout ?? 120}
+                  onChange={(e) => updateLlmField({ streamTimeout: Number(e.target.value) })}
+                />
+              </div>
+              <div className="space-y-1.5">
+                <Label htmlFor="llmStreamIdleTimeout">流式空闲超时（秒）</Label>
+                <Input
+                  id="llmStreamIdleTimeout"
+                  type="number"
+                  min="1"
+                  value={llm.streamIdleTimeout ?? 30}
+                  onChange={(e) =>
+                    updateLlmField({ streamIdleTimeout: Number(e.target.value) })
+                  }
+                />
+              </div>
+            </div>
+
+            <div className="grid grid-cols-1 gap-3 border-t border-outline-variant/60 pt-3 sm:grid-cols-2">
+              <div className="space-y-1.5">
+                <Label htmlFor="llmQuestionBankToken">第三方题库 Token（可选）</Label>
+                <Input
+                  id="llmQuestionBankToken"
+                  value={llm.questionBankToken || ''}
+                  onChange={(e) => updateLlmField({ questionBankToken: e.target.value })}
+                  placeholder="留空则不启用第三方题库"
+                  className="font-mono text-xs"
+                />
+              </div>
+              <div className="space-y-1.5">
+                <Label htmlFor="llmQuestionBankUrl">题库查询地址</Label>
+                <Input
+                  id="llmQuestionBankUrl"
+                  value={llm.questionBankUrl || ''}
+                  onChange={(e) => updateLlmField({ questionBankUrl: e.target.value })}
+                  placeholder="https://tk.enncy.cn/query"
+                  className="font-mono text-xs"
+                />
+              </div>
+            </div>
+
+            <div className="flex flex-wrap items-center gap-3 border-t border-outline-variant/60 pt-3">
+              <Button
+                type="button"
+                variant="tonal"
+                size="sm"
+                onClick={handleTestQuestionBank}
+                disabled={testingBank || !String(llm.questionBankToken || '').trim()}
+              >
+                {testingBank ? (
+                  <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden="true" />
+                ) : (
+                  <PlugZap className="h-3.5 w-3.5" aria-hidden="true" />
+                )}
+                {testingBank ? '测试中...' : '测试题库连通性'}
+              </Button>
+              <Button
+                type="button"
+                variant="tonal"
+                size="sm"
+                onClick={handleExportCache}
+                disabled={cacheBusy}
+              >
+                <Download className="h-3.5 w-3.5" aria-hidden="true" />
+                导出题库缓存
+              </Button>
+              <Button
+                type="button"
+                variant="tonal"
+                size="sm"
+                onClick={handleImportCache}
+                disabled={cacheBusy}
+              >
+                <RefreshCw className="h-3.5 w-3.5" aria-hidden="true" />
+                导入题库缓存
+              </Button>
+              {bankResult && (
+                <p
+                  role={bankResult.type === 'error' ? 'alert' : 'status'}
+                  className={`text-xs font-medium ${
+                    bankResult.type === 'error' ? 'text-error' : 'text-success'
+                  }`}
+                >
+                  {bankResult.message}
+                </p>
+              )}
             </div>
           </div>
         </section>

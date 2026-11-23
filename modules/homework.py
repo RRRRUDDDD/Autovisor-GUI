@@ -139,7 +139,9 @@ def is_homework_url(url: str) -> bool:
     low = (url or "").lower()
     if "zhihuishu.com" not in low or "onlineexamh5" not in low:
         return False
-    return "/dohomework/" in low or "/doexam/" in low
+    from modules.url_router import parse_exam_url
+
+    return parse_exam_url(url).get("kind") in ("dohomework", "doexam")
 
 
 def is_non_quiz_exam_page(url: str) -> bool:
@@ -427,12 +429,16 @@ async def _try_zhidao_api(page, config, params: dict) -> dict:
     course_id = params.get("courseId", "")
 
     if params["kind"] == "dohomework":
+        threshold = getattr(config, "homeworkThreshold", 100)
+        max_redo = getattr(config, "homeworkMaxRedo", 3)
         worker = ZhidaoHomeworkWorker(
             ZhidaoHomeworkApi(client),
             course_id=course_id,
             store=store,
             analysis_api=AiAnalysisApi(proxy=proxy),
             auto_submit=auto_submit,
+            target_score=float(threshold or 0),
+            max_rounds=int(max_redo or 0) or 3,
         )
         return await asyncio.to_thread(
             worker.run,

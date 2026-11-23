@@ -19,6 +19,15 @@ describe('configModel', () => {
     expect(detectCourseType('https://studywisdomh5.zhihuishu.com/course').key).toBe('hike');
     expect(detectCourseType('https://wisdom-mooc.zhihuishu.com/play/123').key).toBe('ai-mooc');
     expect(detectCourseType('https://ai-smart-course-student-pro.zhihuishu.com/learnPage?courseId=1').key).toBe('ai-smart');
+    expect(
+      detectCourseType('https://studentexam-api.zhihuishu.com/webExamList/dohomework/1/2/3/4/5').key
+    ).toBe('homework');
+    expect(
+      detectCourseType('https://exam.zhihuishu.com/webExamList/doexam/1/2/3/4/5').key
+    ).toBe('exam');
+    expect(
+      detectCourseType('https://ai-smart-course-student-pro.zhihuishu.com/testDetail/1/2/3/4').key
+    ).toBe('test-detail');
   });
 
   it('validates proxy URLs and normalizes notification settings', () => {
@@ -125,6 +134,41 @@ describe('configModel', () => {
     expect(normalizeConfig({}).enableZhidaoQuiz).toBe(true);
     expect(normalizeConfig({}).reviewMode).toBe(false);
     expect(normalizeConfig({ reviewMode: true }).reviewMode).toBe(true);
+    expect(normalizeConfig({}).enableHomeworkApi).toBe(true);
+    expect(normalizeConfig({ enableHomeworkApi: false }).enableHomeworkApi).toBe(false);
+    expect(normalizeConfig({}).enableFormalExamApi).toBe(true);
+    expect(normalizeConfig({ enableFormalExamApi: false }).enableFormalExamApi).toBe(false);
+    expect(normalizeConfig({}).enablePptReference).toBe(true);
+    expect(normalizeConfig({ enablePptReference: false }).enablePptReference).toBe(false);
+    expect(normalizeConfig({}).enablePopupIntercept).toBe(true);
+    expect(normalizeConfig({ enablePopupIntercept: false }).enablePopupIntercept).toBe(false);
+    expect(normalizeConfig({}).homeworkThreshold).toBe(100);
+    expect(normalizeConfig({ homeworkThreshold: 0 }).homeworkThreshold).toBe(0);
+    expect(normalizeConfig({ homeworkThreshold: 120 }).homeworkThreshold).toBe(100);
+    expect(normalizeConfig({}).homeworkMaxRedo).toBe(3);
+    expect(normalizeConfig({ homeworkMaxRedo: 0 }).homeworkMaxRedo).toBe(0);
+    expect(normalizeConfig({}).logMaxSizeMb).toBe(10);
+    expect(normalizeConfig({}).logRetentionDays).toBe(14);
+    expect(normalizeConfig({}).logMaxFiles).toBe(200);
+    expect(normalizeConfig({}).logCompressAfterDays).toBe(3);
+    expect(normalizeConfig({ logMaxSizeMb: 5, logRetentionDays: 7 }).logMaxSizeMb).toBe(5);
+    expect(normalizeConfig({ logMaxFiles: 500 }).logMaxFiles).toBe(500);
+    expect(normalizeConfig({}).llm.streamTimeout).toBe(120);
+    expect(normalizeConfig({}).llm.streamIdleTimeout).toBe(30);
+    expect(normalizeConfig({}).llm.questionBankToken).toBe('');
+    expect(normalizeConfig({}).llm.questionBankUrl).toBe('https://tk.enncy.cn/query');
+    const llmOverrides = normalizeConfig({
+      llm: {
+        stream_timeout: 60,
+        stream_idle_timeout: 15,
+        question_bank_token: '  bank-token  ',
+        question_bank_url: '  https://tk.example.com/query  ',
+      },
+    });
+    expect(llmOverrides.llm.streamTimeout).toBe(60);
+    expect(llmOverrides.llm.streamIdleTimeout).toBe(15);
+    expect(llmOverrides.llm.questionBankToken).toBe('bank-token');
+    expect(llmOverrides.llm.questionBankUrl).toBe('https://tk.example.com/query');
     expect(cfg.llm).toEqual({
       provider: 'custom',
       apiFormat: 'openai',
@@ -134,6 +178,10 @@ describe('configModel', () => {
       visionModel: 'Qwen/Qwen2.5-VL-72B-Instruct',
       apiVersion: '',
       autoSubmit: true,
+      streamTimeout: 120,
+      streamIdleTimeout: 30,
+      questionBankToken: '',
+      questionBankUrl: 'https://tk.enncy.cn/query',
     });
 
     const claudeCfg = normalizeConfig({

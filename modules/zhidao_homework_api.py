@@ -7,8 +7,8 @@
 from __future__ import annotations
 
 import json
-import re
-from urllib.parse import unquote
+
+from modules.url_router import parse_exam_url
 
 HOMEWORK_BASE = "https://studentexam-api.zhihuishu.com/studentExam/gateway/t/v1"
 
@@ -22,32 +22,14 @@ GET_STU_ANSWER_INFO = f"{HOMEWORK_BASE}/student/getStuAnswerInfo"
 
 QUESTION_TYPE_NAMES = {1: "single", 2: "multiple", 3: "fill", 14: "judge"}
 
-_EXAM_PAGE_RE = re.compile(
-    r"/webExamList/(dohomework|doexam)/([^?#]+)", re.IGNORECASE
-)
-
 
 def parse_exam_page_url(url: str | None) -> dict:
-    """解析作业/考试页 URL 参数.
+    """解析作业/考试页 URL 参数, 与 ``modules.url_router`` 共用同一套规则.
 
     hash 路径形如 ``/webExamList/dohomework/{recruitId}/{stuExamId}/{examId}/{courseId}/{schoolId}``,
     末尾可能还有额外段, 忽略即可.
     """
-    raw = unquote(str(url or ""))
-    match = _EXAM_PAGE_RE.search(raw)
-    if not match:
-        return {}
-    parts = [part for part in match.group(2).split("/") if part]
-    if len(parts) < 5:
-        return {}
-    return {
-        "kind": match.group(1).lower(),
-        "recruitId": parts[0],
-        "stuExamId": parts[1],
-        "examId": parts[2],
-        "courseId": parts[3],
-        "schoolId": parts[4],
-    }
+    return parse_exam_url(url)
 
 
 def question_type_id(value) -> int:

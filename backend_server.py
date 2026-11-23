@@ -1150,6 +1150,18 @@ class BackendRequestHandler(BaseHTTPRequestHandler):
                 self._send_json(HTTPStatus.BAD_GATEWAY, {"error": str(exc)})
             return
 
+        if path == "/api/question-bank/test":
+            from modules.question_bank import DEFAULT_QUERY_URL, QuestionBankClient
+            from modules.llm import question_bank_conf
+
+            conf = question_bank_conf()
+            token = str(body.get("token") or conf.get("token") or "").strip()
+            query_url = str(body.get("url") or conf.get("url") or DEFAULT_QUERY_URL).strip()
+            proxy = str(body.get("proxy") or "").strip()
+            client = QuestionBankClient(token=token, query_url=query_url, proxy=proxy)
+            self._send_json(HTTPStatus.OK, client.probe())
+            return
+
         if path == "/api/llm/test":
             from modules.llm import test_connection
 

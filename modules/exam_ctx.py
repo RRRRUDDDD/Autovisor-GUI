@@ -1354,6 +1354,7 @@ class ExamRunner:
         max_attempts: int = MAX_EXAM_ATTEMPTS,
         op_extra: dict | None = None,
         bank: AnswerBank | None = None,
+        enable_ppt: bool = True,
     ):
         self.course_id = course_id
         self.class_id = class_id
@@ -1362,6 +1363,7 @@ class ExamRunner:
         self.max_attempts = max_attempts
         self.op_extra = op_extra or {}
         self.bank = bank or AnswerBank(course_id)
+        self.enable_ppt = bool(enable_ppt)
         self.extractor = PptExtractor(
             proxy=getattr(api, "proxy", ""),
             session=getattr(api, "session", None),
@@ -1442,7 +1444,9 @@ class ExamRunner:
                 f"知识点「{name}」第 {attempt}/{self.max_attempts} 轮考试, "
                 f"当前掌握度 {mastery:g}."
             )
-            reference_materials = self._collect_materials(knowledge_id, name)
+            reference_materials = (
+                self._collect_materials(knowledge_id, name) if self.enable_ppt else []
+            )
             ctx = ExamCtx(
                 api=self.api,
                 course_id=self.course_id,

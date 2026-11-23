@@ -25,6 +25,14 @@ enableAutoCaptcha = False
 enableHideWindow = False
 ;刷课任务完成后自动关机(默认:False)
 shutdownOnComplete = False
+;单个日志文件体积上限/MB, 超过后轮转 (默认:10)
+log_max_size_mb = 10
+;日志保留天数, 过期归档清理 (默认:14)
+log_retention_days = 14
+;日志文件最大保留数量 (默认:200)
+log_max_files = 200
+;日志归档多少天后压缩 (默认:3)
+log_compress_after_days = 3
 
 [notification]
 ;可选: 远程消息推送(ServerChan / Qmsg / Bark / Telegram)
@@ -48,6 +56,21 @@ enableExamApi = True
 enableReviewExamApi = False
 ;课中弹题: 是否优先用智慧树 AI 作答, 失败回退自定义大模型 (默认:True)
 enableZhidaoQuiz = True
+;弹题响应监听: 只读捕获官方 AI 答案, 未命中回退大模型 (默认:True)
+enablePopupIntercept = True
+;知到作业: 是否自动刷作业并按目标分重做错题 (默认:True)
+enableHomeworkApi = True
+;作业目标分 (0-100, 默认:100)
+homeworkThreshold = 100
+;作业错题重做最大轮数 (默认:3)
+homeworkMaxRedo = 3
+;正式考试: 是否用接口自动作答交卷, 交卷受 llm.json 的 auto_submit 控制 (默认:True)
+enableFormalExamApi = True
+;考试参考资料: 自动抓取课程知识点 PPT 作为答题参考 (默认:True)
+enablePptReference = True
+;掌握度目标(%), 仅开启掌握度模式时生效 (默认:85)
+enableMastery = True
+masteryTarget = 85
 
 [course-url]
 URL1 =

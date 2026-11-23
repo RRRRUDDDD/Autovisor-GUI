@@ -51,6 +51,42 @@ fn default_llm_model() -> String {
     "deepseek-chat".to_string()
 }
 
+fn default_stream_timeout() -> f64 {
+    120.0
+}
+
+fn default_stream_idle_timeout() -> f64 {
+    30.0
+}
+
+fn default_question_bank_url() -> String {
+    "https://tk.enncy.cn/query".to_string()
+}
+
+fn default_homework_threshold() -> f64 {
+    100.0
+}
+
+fn default_homework_max_redo() -> i64 {
+    3
+}
+
+fn default_log_max_size_mb() -> i64 {
+    10
+}
+
+fn default_log_retention_days() -> i64 {
+    14
+}
+
+fn default_log_max_files() -> i64 {
+    200
+}
+
+fn default_log_compress_after_days() -> i64 {
+    3
+}
+
 pub fn infer_llm_api_format(api_base: &str, provider: &str) -> String {
     let prov = provider.trim().to_ascii_lowercase();
     match prov.as_str() {
@@ -129,6 +165,23 @@ pub fn infer_llm_provider(api_base: &str, api_format: &str) -> String {
     .to_string()
 }
 
+fn normalize_positive(value: f64, fallback: f64) -> f64 {
+    if value.is_finite() && value > 0.0 {
+        value
+    } else {
+        fallback
+    }
+}
+
+fn normalize_question_bank_url(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        default_question_bank_url()
+    } else {
+        trimmed.to_string()
+    }
+}
+
 fn normalize_llm_api_format(raw: &str, api_base: &str, provider: &str) -> String {
     let fmt = raw.trim().to_ascii_lowercase();
     match fmt.as_str() {
@@ -156,6 +209,14 @@ pub struct LlmConfig {
     pub api_version: String,
     #[serde(default)]
     pub auto_submit: bool,
+    #[serde(default = "default_stream_timeout")]
+    pub stream_timeout: f64,
+    #[serde(default = "default_stream_idle_timeout")]
+    pub stream_idle_timeout: f64,
+    #[serde(default)]
+    pub question_bank_token: String,
+    #[serde(default = "default_question_bank_url")]
+    pub question_bank_url: String,
 }
 
 impl Default for LlmConfig {
@@ -169,6 +230,10 @@ impl Default for LlmConfig {
             vision_model: String::new(),
             api_version: String::new(),
             auto_submit: false,
+            stream_timeout: default_stream_timeout(),
+            stream_idle_timeout: default_stream_idle_timeout(),
+            question_bank_token: String::new(),
+            question_bank_url: default_question_bank_url(),
         }
     }
 }
@@ -191,6 +256,14 @@ struct LlmDiskConfig {
     api_version: String,
     #[serde(default)]
     auto_submit: bool,
+    #[serde(default = "default_stream_timeout")]
+    stream_timeout: f64,
+    #[serde(default = "default_stream_idle_timeout")]
+    stream_idle_timeout: f64,
+    #[serde(default)]
+    question_bank_token: String,
+    #[serde(default = "default_question_bank_url")]
+    question_bank_url: String,
 }
 
 impl From<&LlmConfig> for LlmDiskConfig {
@@ -223,6 +296,13 @@ impl From<&LlmConfig> for LlmDiskConfig {
             vision_model: v.vision_model.trim().to_string(),
             api_version: v.api_version.trim().to_string(),
             auto_submit: v.auto_submit,
+            stream_timeout: normalize_positive(v.stream_timeout, default_stream_timeout()),
+            stream_idle_timeout: normalize_positive(
+                v.stream_idle_timeout,
+                default_stream_idle_timeout(),
+            ),
+            question_bank_token: v.question_bank_token.trim().to_string(),
+            question_bank_url: normalize_question_bank_url(&v.question_bank_url),
         }
     }
 }
@@ -257,6 +337,13 @@ impl From<LlmDiskConfig> for LlmConfig {
             vision_model: v.vision_model.trim().to_string(),
             api_version: v.api_version.trim().to_string(),
             auto_submit: v.auto_submit,
+            stream_timeout: normalize_positive(v.stream_timeout, default_stream_timeout()),
+            stream_idle_timeout: normalize_positive(
+                v.stream_idle_timeout,
+                default_stream_idle_timeout(),
+            ),
+            question_bank_token: v.question_bank_token.trim().to_string(),
+            question_bank_url: normalize_question_bank_url(&v.question_bank_url),
         }
     }
 }
@@ -314,6 +401,26 @@ pub struct AutovisorConfig {
     pub enable_mastery: bool,
     #[serde(default = "default_mastery_target")]
     pub mastery_target: f64,
+    #[serde(default = "default_true")]
+    pub enable_ppt_reference: bool,
+    #[serde(default = "default_true")]
+    pub enable_popup_intercept: bool,
+    #[serde(default = "default_true")]
+    pub enable_homework_api: bool,
+    #[serde(default = "default_homework_threshold")]
+    pub homework_threshold: f64,
+    #[serde(default = "default_homework_max_redo")]
+    pub homework_max_redo: i64,
+    #[serde(default = "default_true")]
+    pub enable_formal_exam_api: bool,
+    #[serde(default = "default_log_max_size_mb")]
+    pub log_max_size_mb: i64,
+    #[serde(default = "default_log_retention_days")]
+    pub log_retention_days: i64,
+    #[serde(default = "default_log_max_files")]
+    pub log_max_files: i64,
+    #[serde(default = "default_log_compress_after_days")]
+    pub log_compress_after_days: i64,
     #[serde(default)]
     pub llm: LlmConfig,
     pub courses: Vec<CourseItem>,
@@ -368,6 +475,16 @@ impl Default for AutovisorConfig {
             enable_zhidao_quiz: true,
             enable_mastery: true,
             mastery_target: 100.0,
+            enable_ppt_reference: true,
+            enable_popup_intercept: true,
+            enable_homework_api: true,
+            homework_threshold: 100.0,
+            homework_max_redo: 3,
+            enable_formal_exam_api: true,
+            log_max_size_mb: 10,
+            log_retention_days: 14,
+            log_max_files: 200,
+            log_compress_after_days: 3,
             llm: LlmConfig::default(),
             courses: Vec::new(),
             mirrors,
@@ -487,6 +604,34 @@ pub fn parse_ini_str(content: &str) -> (AutovisorConfig, Vec<String>) {
                 "enablehidewindow" => cfg.enable_hide_window = parse_bool(&val, true),
                 "shutdownoncomplete" => cfg.shutdown_on_complete = parse_bool(&val, false),
                 "enabledebuglog" => cfg.enable_debug_log = parse_bool(&val, false),
+                "log_max_size_mb" => {
+                    if let Ok(num) = val.parse::<i64>() {
+                        if num > 0 {
+                            cfg.log_max_size_mb = num;
+                        }
+                    }
+                }
+                "log_retention_days" => {
+                    if let Ok(num) = val.parse::<i64>() {
+                        if num > 0 {
+                            cfg.log_retention_days = num;
+                        }
+                    }
+                }
+                "log_max_files" => {
+                    if let Ok(num) = val.parse::<i64>() {
+                        if num > 0 {
+                            cfg.log_max_files = num;
+                        }
+                    }
+                }
+                "log_compress_after_days" => {
+                    if let Ok(num) = val.parse::<i64>() {
+                        if num > 0 {
+                            cfg.log_compress_after_days = num;
+                        }
+                    }
+                }
                 _ => {}
             },
             "notification" => match key.as_str() {
@@ -539,6 +684,28 @@ pub fn parse_ini_str(content: &str) -> (AutovisorConfig, Vec<String>) {
                             cfg.mastery_target = num.clamp(1.0, 100.0);
                         }
                     }
+                }
+                "enablepptreference" => cfg.enable_ppt_reference = parse_bool(&val, true),
+                "enablepopupintercept" => {
+                    cfg.enable_popup_intercept = parse_bool(&val, true);
+                }
+                "enablehomeworkapi" => cfg.enable_homework_api = parse_bool(&val, true),
+                "homeworkthreshold" => {
+                    if let Ok(num) = val.parse::<f64>() {
+                        if num.is_finite() {
+                            cfg.homework_threshold = num.clamp(0.0, 100.0);
+                        }
+                    }
+                }
+                "homeworkmaxredo" => {
+                    if let Ok(num) = val.parse::<i64>() {
+                        if num >= 0 {
+                            cfg.homework_max_redo = num;
+                        }
+                    }
+                }
+                "enableformalexamapi" => {
+                    cfg.enable_formal_exam_api = parse_bool(&val, true);
                 }
                 _ => {}
             },
@@ -595,6 +762,17 @@ pub fn render_ini_str(cfg: &AutovisorConfig) -> String {
         format!("shutdownOnComplete = {}", format_bool(cfg.shutdown_on_complete)),
         ";是否在桌面端实时输出 DEBUG 调试日志(默认:False)".to_string(),
         format!("enableDebugLog = {}", format_bool(cfg.enable_debug_log)),
+        ";单个日志文件体积上限/MB, 超过后轮转 (默认:10)".to_string(),
+        format!("log_max_size_mb = {}", cfg.log_max_size_mb.max(1)),
+        ";日志保留天数, 过期归档清理 (默认:14)".to_string(),
+        format!("log_retention_days = {}", cfg.log_retention_days.max(1)),
+        ";日志文件最大保留数量 (默认:200)".to_string(),
+        format!("log_max_files = {}", cfg.log_max_files.max(1)),
+        ";日志归档多少天后压缩 (默认:3)".to_string(),
+        format!(
+            "log_compress_after_days = {}",
+            cfg.log_compress_after_days.max(1)
+        ),
         String::new(),
         "[notification]".to_string(),
         ";通知服务商（默认:Windows，留空表示禁用通知）。可选值: Windows / ServerChan / Qmsg / Bark / Telegram"
@@ -636,6 +814,31 @@ pub fn render_ini_str(cfg: &AutovisorConfig) -> String {
         format!(
             "masteryTarget = {}",
             format_number(cfg.mastery_target.clamp(1.0, 100.0))
+        ),
+        ";弹题响应监听: 只读捕获官方 AI 答案, 未命中回退大模型 (默认:True)".to_string(),
+        format!(
+            "enablePopupIntercept = {}",
+            format_bool(cfg.enable_popup_intercept)
+        ),
+        ";知到作业: 是否自动刷作业并按目标分重做错题 (默认:True)".to_string(),
+        format!("enableHomeworkApi = {}", format_bool(cfg.enable_homework_api)),
+        ";作业达标得分率 (0-100, 默认:100)".to_string(),
+        format!(
+            "homeworkThreshold = {}",
+            format_number(cfg.homework_threshold.clamp(0.0, 100.0))
+        ),
+        ";作业错题重做最大轮数 (默认:3)".to_string(),
+        format!("homeworkMaxRedo = {}", cfg.homework_max_redo.max(0)),
+        ";正式考试: 是否用接口自动作答交卷, 交卷受 llm.json 的 auto_submit 控制 (默认:True)"
+            .to_string(),
+        format!(
+            "enableFormalExamApi = {}",
+            format_bool(cfg.enable_formal_exam_api)
+        ),
+        ";考试参考资料: 自动抓取课程知识点 PPT 作为答题参考 (默认:True)".to_string(),
+        format!(
+            "enablePptReference = {}",
+            format_bool(cfg.enable_ppt_reference)
         ),
         String::new(),
         "[course-url]".to_string(),
@@ -910,6 +1113,16 @@ mod tests {
         cfg.mastery_target = 85.0;
         cfg.enable_hide_window = false;
         cfg.enable_debug_log = true;
+        cfg.enable_ppt_reference = false;
+        cfg.enable_popup_intercept = false;
+        cfg.enable_homework_api = false;
+        cfg.homework_threshold = 80.0;
+        cfg.homework_max_redo = 5;
+        cfg.enable_formal_exam_api = false;
+        cfg.log_max_size_mb = 20;
+        cfg.log_retention_days = 7;
+        cfg.log_max_files = 99;
+        cfg.log_compress_after_days = 2;
         cfg.courses = vec![
             CourseItem {
                 id: "1".into(),
@@ -962,6 +1175,16 @@ mod tests {
         assert!((parsed.mastery_target - 85.0).abs() < 1e-6);
         assert!(!parsed.enable_hide_window);
         assert!(parsed.enable_debug_log);
+        assert!(!parsed.enable_ppt_reference);
+        assert!(!parsed.enable_popup_intercept);
+        assert!(!parsed.enable_homework_api);
+        assert!((parsed.homework_threshold - 80.0).abs() < 1e-6);
+        assert_eq!(parsed.homework_max_redo, 5);
+        assert!(!parsed.enable_formal_exam_api);
+        assert_eq!(parsed.log_max_size_mb, 20);
+        assert_eq!(parsed.log_retention_days, 7);
+        assert_eq!(parsed.log_max_files, 99);
+        assert_eq!(parsed.log_compress_after_days, 2);
         assert_eq!(urls, vec!["https://studyvideoh5.zhihuishu.com/stuStudy?id=1"]);
     }
 
@@ -984,6 +1207,10 @@ mod tests {
             vision_model: "claude-sonnet-4-20250514".to_string(),
             api_version: "2023-06-01".to_string(),
             auto_submit: true,
+            stream_timeout: 90.0,
+            stream_idle_timeout: 20.0,
+            question_bank_token: "bank-key".to_string(),
+            question_bank_url: "https://tk.example/query".to_string(),
         };
         let saved = save_config_to_dir(&dir, &cfg).unwrap();
         assert_eq!(saved.llm, cfg.llm);
@@ -998,6 +1225,10 @@ mod tests {
         assert_eq!(disk["vision_model"], "claude-sonnet-4-20250514");
         assert_eq!(disk["api_version"], "2023-06-01");
         assert_eq!(disk["auto_submit"], true);
+        assert_eq!(disk["stream_timeout"], 90.0);
+        assert_eq!(disk["stream_idle_timeout"], 20.0);
+        assert_eq!(disk["question_bank_token"], "bank-key");
+        assert_eq!(disk["question_bank_url"], "https://tk.example/query");
 
         // Verify legacy 4-field llm.json still loads cleanly and infers provider/format
         fs::write(
