@@ -19,7 +19,9 @@ import base64
 import difflib
 import json
 import os
+import queue
 import re
+import threading
 import time
 from urllib.parse import urlparse
 
@@ -49,6 +51,27 @@ SUPPORTED_API_FORMATS = (
 DEFAULT_AZURE_API_VERSION = "2024-10-21"
 DEFAULT_ANTHROPIC_VERSION = "2023-06-01"
 
+DEFAULT_STREAM_TIMEOUT = 120.0
+DEFAULT_STREAM_IDLE_TIMEOUT = 30.0
+DEFAULT_STREAM_RETRIES = 3
+_STREAM_QUEUE_SIZE = 256
+
+# 这些状态码重试也不会成功, 直接快速失败, 避免坏 Key / 欠费卡住整份试卷.
+NON_RETRYABLE_STATUS = frozenset({400, 401, 402, 403, 404, 405, 409, 413, 422})
+RETRYABLE_STATUS = frozenset({408, 425, 429})
+
+_HTTP_STATUS_HINTS = {
+    400: "请求参数错误",
+    401: "API Key 无效",
+    402: "余额不足",
+    403: "无访问权限或已被封禁",
+    404: "接口地址或模型不存在",
+    405: "请求方法不被允许",
+    409: "请求冲突",
+    413: "请求体过大",
+    422: "请求参数校验失败",
+}
+
 DEFAULT_CONF = {
     "provider": "deepseek",
     "api_format": "openai",
@@ -58,7 +81,48 @@ DEFAULT_CONF = {
     "vision_model": "",
     "api_version": "",
     "auto_submit": False,
+    "stream_timeout": DEFAULT_STREAM_TIMEOUT,
+    "stream_idle_timeout": DEFAULT_STREAM_IDLE_TIMEOUT,
 }
+
+
+class NonRetryableLLMError(RuntimeError):
+    """不可重试的大模型接口错误(如 401/402), 调用方应停止后续请求."""
+
+    def __init__(self, message: str, status: int | None = None):
+        super().__init__(message)
+        self.status = status
+
+
+class StreamNotSupportedError(RuntimeError):
+    """接口未按 SSE 返回流式数据, 调用方应回退非流式请求."""
+
+    def __init__(self, payload: str = ""):
+        super().__init__("接口不支持流式响应")
+        self.payload = payload
+
+
+def _http_error_message(status: int, detail: str = "") -> str:
+    hint = _HTTP_STATUS_HINTS.get(status, "")
+    prefix = f"HTTP {status} {hint}" if hint else f"HTTP {status}"
+    detail = (detail or "").strip()
+    return f"{prefix}: {detail}" if detail else prefix
+
+
+def _is_retryable_status(status: int) -> bool:
+    return status in RETRYABLE_STATUS or 500 <= status < 600
+
+
+def _retry_delay(attempt: int) -> float:
+    return min(0.5 * (2 ** attempt), 4.0)
+
+
+def _positive_float(value, default: float) -> float:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return default
+    return parsed if parsed > 0 else default
 
 _LOCAL_HOSTS = {"localhost", "127.0.0.1", "::1", "0.0.0.0"}
 
@@ -212,6 +276,18 @@ def normalize_conf(raw: dict | None) -> dict:
     provider = raw_provider or infer_provider(api_base, api_format)
     api_version = str(src.get("api_version") or src.get("apiVersion") or "").strip()
     auto_submit = bool(src.get("auto_submit", src.get("autoSubmit", False)))
+    stream_timeout = _positive_float(
+        src.get("stream_timeout", src.get("streamTimeout")), DEFAULT_STREAM_TIMEOUT
+    )
+    stream_idle_timeout = _positive_float(
+        src.get("stream_idle_timeout", src.get("streamIdleTimeout")),
+        DEFAULT_STREAM_IDLE_TIMEOUT,
+    )
+    if stream_idle_timeout > stream_timeout:
+        logger.debug(
+            "stream_idle_timeout 不能大于 stream_timeout, 已自动收敛为总超时值."
+        )
+        stream_idle_timeout = stream_timeout
     return {
         "provider": provider,
         "api_format": api_format,
@@ -221,6 +297,8 @@ def normalize_conf(raw: dict | None) -> dict:
         "vision_model": vision_model,
         "api_version": api_version,
         "auto_submit": auto_submit,
+        "stream_timeout": stream_timeout,
+        "stream_idle_timeout": stream_idle_timeout,
     }
 
 
@@ -697,30 +775,257 @@ def _post_with_fallback(
     fallback_body: dict | None,
     proxies: dict | None,
     timeout: int = 120,
+    retries: int = DEFAULT_STREAM_RETRIES,
 ):
-    kwargs = {"headers": headers, "json": body, "timeout": timeout}
-    if proxies:
-        kwargs["proxies"] = proxies
-    resp = requests.post(url, **kwargs)
-    if (
-        getattr(resp, "status_code", 200) == 400
-        and fallback_body is not None
-        and fallback_body != body
-    ):
-        logger.debug(f"模型接口返回 400, 去掉可选参数后重试: {url}")
-        fallback_kwargs = {"headers": headers, "json": fallback_body, "timeout": timeout}
+    """发送请求; 400 先剥离可选参数重试, 408/429/5xx 退避重试, 401/402 等快速失败."""
+    current_body = body
+    fallback_used = False
+    attempt = 0
+    while True:
+        kwargs = {"headers": headers, "json": current_body, "timeout": timeout}
         if proxies:
-            fallback_kwargs["proxies"] = proxies
-        resp = requests.post(url, **fallback_kwargs)
-    if getattr(resp, "status_code", 200) >= 400:
-        detail = _extract_error_detail(resp)
+            kwargs["proxies"] = proxies
         try:
-            resp.raise_for_status()
+            resp = requests.post(url, **kwargs)
         except Exception as exc:
-            if detail:
-                raise RuntimeError(f"HTTP {resp.status_code}: {detail}") from exc
-            raise
-    return resp.json()
+            if attempt >= retries:
+                raise RuntimeError(f"请求失败: {exc}") from exc
+            time.sleep(_retry_delay(attempt))
+            attempt += 1
+            continue
+
+        status = getattr(resp, "status_code", 200)
+        if (
+            status == 400
+            and fallback_body is not None
+            and fallback_body != current_body
+            and not fallback_used
+        ):
+            logger.debug(f"模型接口返回 400, 去掉可选参数后重试: {url}")
+            fallback_used = True
+            current_body = fallback_body
+            continue
+
+        if status >= 400:
+            detail = _extract_error_detail(resp)
+            message = _http_error_message(status, detail)
+            if status in NON_RETRYABLE_STATUS:
+                raise NonRetryableLLMError(message, status=status)
+            if _is_retryable_status(status) and attempt < retries:
+                logger.debug(f"模型接口返回 {status}, 第 {attempt + 1} 次退避重试: {url}")
+                time.sleep(_retry_delay(attempt))
+                attempt += 1
+                continue
+            raise RuntimeError(message)
+        return resp.json()
+
+
+def _close_response(resp) -> None:
+    close = getattr(resp, "close", None)
+    if callable(close):
+        try:
+            close()
+        except Exception:
+            pass
+
+
+def _sse_text(raw) -> str:
+    if isinstance(raw, bytes):
+        try:
+            return raw.decode("utf-8", "replace")
+        except Exception:
+            return ""
+    return str(raw or "")
+
+
+def _has_aim_block(text: str, aim_start: str, aim_end: str) -> bool:
+    if not aim_start or not aim_end:
+        return False
+    return re.search(
+        re.escape(aim_start) + r".*?" + re.escape(aim_end), text, re.DOTALL
+    ) is not None
+
+
+def _consume_openai_stream(
+    resp,
+    *,
+    aim_start: str,
+    aim_end: str,
+    total_timeout: float,
+    idle_timeout: float,
+) -> str:
+    """后台线程读取 SSE, 主线程双超时等待; 命中目标代码块后立即断开连接."""
+    deadline = time.monotonic() + max(float(total_timeout), 0.001)
+    stop_event = threading.Event()
+    chunks: queue.Queue = queue.Queue(maxsize=_STREAM_QUEUE_SIZE)
+
+    def _emit(item) -> bool:
+        while not stop_event.is_set():
+            try:
+                chunks.put(item, timeout=0.2)
+                return True
+            except queue.Full:
+                continue
+        return False
+
+    def _reader() -> None:
+        non_sse_lines: list[str] = []
+        try:
+            iterator = iter(resp.iter_lines(decode_unicode=True))
+            while not stop_event.is_set():
+                try:
+                    raw_line = next(iterator)
+                except StopIteration:
+                    break
+                line = _sse_text(raw_line).strip()
+                if not line:
+                    continue
+                if not line.startswith("data:"):
+                    non_sse_lines.append(line)
+                    continue
+                if non_sse_lines:
+                    _emit(("unsupported", "\n".join(non_sse_lines)))
+                    return
+                payload = line[5:].strip()
+                if payload == "[DONE]":
+                    _emit(("done", None))
+                    return
+                try:
+                    data = json.loads(payload)
+                except (ValueError, TypeError):
+                    continue
+                choices = data.get("choices") if isinstance(data, dict) else None
+                if not choices:
+                    continue
+                choice = choices[0] if isinstance(choices[0], dict) else {}
+                delta = choice.get("delta") or {}
+                content = delta.get("content")
+                reasoning = delta.get("reasoning_content") or delta.get("reasoning")
+                if content:
+                    _emit(("chunk", str(content)))
+                elif reasoning:
+                    # 推理模型思考期间 content 为空, 用空心跳刷新 idle 超时.
+                    _emit(("heartbeat", None))
+                if choice.get("finish_reason"):
+                    _emit(("done", None))
+                    return
+            if non_sse_lines and not stop_event.is_set():
+                _emit(("unsupported", "\n".join(non_sse_lines)))
+            else:
+                _emit(("done", None))
+        except Exception as exc:
+            _emit(("error", exc))
+        finally:
+            _close_response(resp)
+
+    reader = threading.Thread(target=_reader, daemon=True, name="llm-sse-reader")
+    reader.start()
+
+    parts: list[str] = []
+    collected = ""
+    try:
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                stop_event.set()
+                _close_response(resp)
+                raise RuntimeError(
+                    f"流式响应超时: 总时长超过 {float(total_timeout):g} 秒"
+                )
+            try:
+                kind, payload = chunks.get(timeout=min(remaining, idle_timeout))
+            except queue.Empty:
+                stop_event.set()
+                _close_response(resp)
+                raise RuntimeError(
+                    f"流式响应超时: {float(idle_timeout):g} 秒内未收到新数据"
+                )
+            if kind == "heartbeat":
+                continue
+            if kind == "chunk":
+                parts.append(payload)
+                collected += payload
+                if _has_aim_block(collected, aim_start, aim_end):
+                    stop_event.set()
+                    _close_response(resp)
+                    return _strip_think_tags(collected)
+                continue
+            if kind == "done":
+                break
+            if kind == "unsupported":
+                stop_event.set()
+                _close_response(resp)
+                raise StreamNotSupportedError(payload)
+            if kind == "error":
+                stop_event.set()
+                _close_response(resp)
+                raise RuntimeError(f"流式读取失败: {payload}")
+    finally:
+        stop_event.set()
+
+    return _strip_think_tags("".join(parts))
+
+
+def _chat_openai_stream(
+    endpoint: str,
+    headers: dict,
+    body: dict,
+    proxies: dict | None,
+    *,
+    aim_start: str = "```answer",
+    aim_end: str = "```",
+    total_timeout: float = DEFAULT_STREAM_TIMEOUT,
+    idle_timeout: float = DEFAULT_STREAM_IDLE_TIMEOUT,
+    retries: int = DEFAULT_STREAM_RETRIES,
+) -> str:
+    """OpenAI 兼容接口的流式作答; 双超时 + 命中目标代码块立即断开."""
+    stream_body = dict(body)
+    stream_body["stream"] = True
+    total_timeout = _positive_float(total_timeout, DEFAULT_STREAM_TIMEOUT)
+    idle_timeout = _positive_float(idle_timeout, DEFAULT_STREAM_IDLE_TIMEOUT)
+    if idle_timeout > total_timeout:
+        idle_timeout = total_timeout
+
+    attempt = 0
+    while True:
+        kwargs = {
+            "headers": headers,
+            "json": stream_body,
+            "timeout": (10, total_timeout + 5),
+            "stream": True,
+        }
+        if proxies:
+            kwargs["proxies"] = proxies
+        try:
+            resp = requests.post(endpoint, **kwargs)
+        except Exception as exc:
+            if attempt >= retries:
+                raise RuntimeError(f"流式请求失败: {exc}") from exc
+            time.sleep(_retry_delay(attempt))
+            attempt += 1
+            continue
+
+        status = getattr(resp, "status_code", 200)
+        if status >= 400:
+            detail = _extract_error_detail(resp)
+            _close_response(resp)
+            message = _http_error_message(status, detail)
+            if status in NON_RETRYABLE_STATUS:
+                raise NonRetryableLLMError(message, status=status)
+            if _is_retryable_status(status) and attempt < retries:
+                logger.debug(f"流式接口返回 {status}, 第 {attempt + 1} 次退避重试: {endpoint}")
+                time.sleep(_retry_delay(attempt))
+                attempt += 1
+                continue
+            raise RuntimeError(message)
+
+        return _consume_openai_stream(
+            resp,
+            aim_start=aim_start,
+            aim_end=aim_end,
+            total_timeout=total_timeout,
+            idle_timeout=idle_timeout,
+        )
 
 
 def _chat_sync(
@@ -734,6 +1039,9 @@ def _chat_sync(
     api_version: str = "",
     proxy: str | None = None,
     image: tuple[bytes, str] | None = None,
+    stream: bool = False,
+    stream_timeout: float = DEFAULT_STREAM_TIMEOUT,
+    stream_idle_timeout: float = DEFAULT_STREAM_IDLE_TIMEOUT,
 ) -> str:
     fmt = (api_format or "openai").strip().lower()
     proxies = _resolve_proxies(api, proxy)
@@ -842,6 +1150,29 @@ def _chat_sync(
     body = {**base_body, "temperature": 0}
     if json_mode:
         body["response_format"] = {"type": "json_object"}
+    if stream and not image_b64:
+        try:
+            return _chat_openai_stream(
+                api,
+                headers,
+                body,
+                proxies,
+                total_timeout=stream_timeout,
+                idle_timeout=stream_idle_timeout,
+            )
+        except StreamNotSupportedError as exc:
+            if exc.payload:
+                try:
+                    return _extract_openai_content(json.loads(exc.payload))
+                except Exception:
+                    pass
+            logger.debug("当前接口未返回 SSE 流, 已回退非流式请求.")
+        except NonRetryableLLMError as exc:
+            if exc.status != 400:
+                raise
+            logger.debug("流式接口返回 400, 回退非流式并剥离可选参数重试.")
+            data = _post_with_fallback(api, headers, base_body, base_body, proxies)
+            return _extract_openai_content(data)
     data = _post_with_fallback(api, headers, body, base_body, proxies)
     return _extract_openai_content(data)
 
@@ -882,13 +1213,12 @@ def chat_sync(
     json_mode: bool = False,
     conf_override: dict | None = None,
     proxy: str | None = None,
+    stream: bool = False,
 ) -> str:
     """使用当前（或指定）LLM 配置发起一次同步对话，自动适配协议格式。"""
     c = normalize_conf(conf_override) if conf_override is not None else _conf()
     fmt = c.get("api_format") or infer_api_format(c.get("api_base", ""), c.get("provider", ""))
     api = build_endpoint(c["api_base"], c["model"], fmt, c.get("api_version", ""))
-    if fmt == "openai" and proxy is None and not c.get("api_version"):
-        return _chat_sync(api, c["api_key"], c["model"], prompt, json_mode)
     return _chat_sync(
         api,
         c["api_key"],
@@ -898,6 +1228,9 @@ def chat_sync(
         api_format=fmt,
         api_version=c.get("api_version", ""),
         proxy=proxy,
+        stream=stream,
+        stream_timeout=c.get("stream_timeout", DEFAULT_STREAM_TIMEOUT),
+        stream_idle_timeout=c.get("stream_idle_timeout", DEFAULT_STREAM_IDLE_TIMEOUT),
     )
 
 

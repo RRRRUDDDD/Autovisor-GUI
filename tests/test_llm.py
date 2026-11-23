@@ -1,4 +1,6 @@
 import asyncio
+import json
+import time
 import unittest
 from unittest.mock import MagicMock, patch
 
@@ -547,6 +549,216 @@ class LlmAnsweringLogTests(unittest.TestCase):
         self.assertEqual(content[0]["type"], "image")
         self.assertEqual(content[0]["source"]["media_type"], "image/jpeg")
         self.assertEqual(content[1]["type"], "text")
+
+
+def _sse_delta(delta: dict) -> str:
+    return "data: " + json.dumps({"choices": [{"delta": delta}]}, ensure_ascii=False)
+
+
+class _StreamResponse:
+    """模拟 requests 的流式响应: 按行产出 SSE, close 后停止继续读取."""
+
+    def __init__(self, lines, delay: float = 0.02):
+        self._lines = list(lines)
+        self._delay = delay
+        self.status_code = 200
+        self.headers = {"Content-Type": "text/event-stream"}
+        self.text = ""
+        self.closed = False
+        self.reads = 0
+
+    def iter_lines(self, decode_unicode=False):
+        for line in self._lines:
+            if self._delay:
+                time.sleep(self._delay)
+            if self.closed:
+                return
+            self.reads += 1
+            yield line
+
+    def close(self):
+        self.closed = True
+
+    def json(self):
+        raise ValueError("stream response is not json")
+
+
+class _JsonResponse:
+    """忽略 stream 参数, 直接返回整段 JSON 的兼容接口."""
+
+    def __init__(self, payload):
+        self._payload = payload
+        self.status_code = 200
+        self.headers = {"Content-Type": "application/json"}
+        self.text = json.dumps(payload, ensure_ascii=False)
+        self.closed = False
+        self.reads = 0
+
+    def iter_lines(self, decode_unicode=False):
+        self.reads += 1
+        yield self.text
+
+    def close(self):
+        self.closed = True
+
+    def json(self):
+        return self._payload
+
+
+class LlmFailFastTests(unittest.TestCase):
+    CONF = {
+        "provider": "openai",
+        "api_format": "openai",
+        "api_key": "sk-test",
+        "api_base": "https://api.openai.com/v1",
+        "model": "gpt-4o-mini",
+    }
+
+    def tearDown(self):
+        llm.reset_cache()
+        llm.set_proxy("")
+
+    def test_401_and_402_fail_fast_without_retry(self):
+        for status, hint in ((401, "API Key 无效"), (402, "余额不足")):
+            resp = _mock_response({"error": {"message": "denied"}}, status_code=status)
+            with patch("modules.llm.requests.post", return_value=resp) as post, patch(
+                "modules.llm.time.sleep"
+            ):
+                with self.assertRaises(llm.NonRetryableLLMError) as ctx:
+                    llm.chat_sync("题目", conf_override=self.CONF)
+            self.assertEqual(post.call_count, 1)
+            self.assertIn(hint, str(ctx.exception))
+            self.assertIn(f"HTTP {status}", str(ctx.exception))
+
+    def test_retryable_statuses_are_retried_then_succeed(self):
+        good = _mock_response({"choices": [{"message": {"content": "重试成功"}}]})
+        for status in (429, 502):
+            bad = _mock_response({"error": {"message": "busy"}}, status_code=status)
+            with patch(
+                "modules.llm.requests.post", side_effect=[bad, good]
+            ) as post, patch("modules.llm.time.sleep") as sleep:
+                reply = llm.chat_sync("题目", conf_override=self.CONF)
+            self.assertEqual(reply, "重试成功")
+            self.assertEqual(post.call_count, 2)
+            self.assertEqual(sleep.call_count, 1)
+
+    def test_non_retryable_error_is_runtime_error(self):
+        self.assertTrue(issubclass(llm.NonRetryableLLMError, RuntimeError))
+
+
+class OpenAiStreamTests(unittest.TestCase):
+    CONF = {
+        "provider": "openai",
+        "api_format": "openai",
+        "api_key": "sk-test",
+        "api_base": "https://api.openai.com/v1",
+        "model": "deepseek-reasoner",
+        "stream_timeout": 2,
+        "stream_idle_timeout": 0.8,
+    }
+
+    def tearDown(self):
+        llm.reset_cache()
+        llm.set_proxy("")
+
+    def test_stream_stops_reading_after_answer_block_is_closed(self):
+        lines = [
+            _sse_delta({"reasoning_content": "先思考一下"}),
+            _sse_delta({"content": "依据略。\n```answer\n[{\"id\": 2}]\n```\n"}),
+            _sse_delta({"content": "LATE-CONTENT"}),
+        ]
+        resp = _StreamResponse(lines, delay=0.03)
+        started = time.monotonic()
+        with patch("modules.llm.requests.post", return_value=resp) as post:
+            reply = llm.chat_sync("题目", conf_override=self.CONF, stream=True)
+        elapsed = time.monotonic() - started
+        self.assertIn("```answer", reply)
+        self.assertIn('"id": 2', reply)
+        self.assertNotIn("LATE-CONTENT", reply)
+        self.assertTrue(resp.closed)
+        self.assertLess(elapsed, 1.0)
+        self.assertTrue(post.call_args[1]["stream"])
+        self.assertTrue(post.call_args[1]["json"]["stream"])
+
+    def test_reasoning_heartbeats_keep_stream_alive_beyond_idle_timeout(self):
+        lines = [
+            _sse_delta({"reasoning_content": f"思考{i}"}) for i in range(12)
+        ] + [_sse_delta({"content": "```answer\n[{\"id\": 1}]\n```"})]
+        resp = _StreamResponse(lines, delay=0.04)
+        conf = dict(self.CONF, stream_idle_timeout=0.1, stream_timeout=2)
+        with patch("modules.llm.requests.post", return_value=resp):
+            reply = llm.chat_sync("题目", conf_override=conf, stream=True)
+        self.assertIn('"id": 1', reply)
+
+    def test_idle_timeout_exits_promptly(self):
+        resp = _StreamResponse([_sse_delta({"content": "never"})], delay=0.6)
+        conf = dict(self.CONF, stream_idle_timeout=0.1, stream_timeout=2)
+        started = time.monotonic()
+        with patch("modules.llm.requests.post", return_value=resp):
+            with self.assertRaises(RuntimeError) as ctx:
+                llm.chat_sync("题目", conf_override=conf, stream=True)
+        elapsed = time.monotonic() - started
+        self.assertIn("未收到新数据", str(ctx.exception))
+        self.assertTrue(resp.closed)
+        self.assertLess(elapsed, 0.45)
+
+    def test_total_timeout_stops_long_reasoning(self):
+        lines = [
+            _sse_delta({"reasoning_content": f"思考{i}"}) for i in range(100)
+        ]
+        resp = _StreamResponse(lines, delay=0.05)
+        conf = dict(self.CONF, stream_idle_timeout=0.2, stream_timeout=0.3)
+        started = time.monotonic()
+        with patch("modules.llm.requests.post", return_value=resp):
+            with self.assertRaises(RuntimeError) as ctx:
+                llm.chat_sync("题目", conf_override=conf, stream=True)
+        elapsed = time.monotonic() - started
+        self.assertIn("总时长", str(ctx.exception))
+        self.assertTrue(resp.closed)
+        self.assertLess(elapsed, 0.8)
+
+    def test_non_sse_endpoint_falls_back_to_plain_json(self):
+        payload = {"choices": [{"message": {"content": "普通非流式答案"}}]}
+        resp = _JsonResponse(payload)
+        with patch("modules.llm.requests.post", return_value=resp) as post:
+            reply = llm.chat_sync("题目", conf_override=self.CONF, stream=True)
+        self.assertEqual(reply, "普通非流式答案")
+        self.assertEqual(post.call_count, 1)
+
+    def test_stream_400_falls_back_to_non_stream_without_optional_params(self):
+        bad = _mock_response(
+            {"error": {"message": "temperature not supported"}}, status_code=400
+        )
+        good = _mock_response({"choices": [{"message": {"content": "兼容答案"}}]})
+        with patch(
+            "modules.llm.requests.post", side_effect=[bad, good]
+        ) as post, patch("modules.llm.time.sleep"):
+            reply = llm.chat_sync(
+                "题目", json_mode=True, conf_override=self.CONF, stream=True
+            )
+        self.assertEqual(reply, "兼容答案")
+        self.assertEqual(post.call_count, 2)
+        second_body = post.call_args_list[1][1]["json"]
+        self.assertNotIn("temperature", second_body)
+        self.assertNotIn("response_format", second_body)
+        self.assertNotIn("stream", post.call_args_list[1][1])
+
+    def test_stream_timeout_config_is_normalized(self):
+        defaults = llm.normalize_conf({})
+        self.assertEqual(defaults["stream_timeout"], llm.DEFAULT_STREAM_TIMEOUT)
+        self.assertEqual(
+            defaults["stream_idle_timeout"], llm.DEFAULT_STREAM_IDLE_TIMEOUT
+        )
+        clamped = llm.normalize_conf(
+            {"stream_timeout": 10, "stream_idle_timeout": 30}
+        )
+        self.assertEqual(clamped["stream_timeout"], 10)
+        self.assertEqual(clamped["stream_idle_timeout"], 10)
+        aliased = llm.normalize_conf(
+            {"streamTimeout": 90, "streamIdleTimeout": 15}
+        )
+        self.assertEqual(aliased["stream_timeout"], 90)
+        self.assertEqual(aliased["stream_idle_timeout"], 15)
 
 
 if __name__ == "__main__":

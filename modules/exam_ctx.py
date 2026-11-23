@@ -57,6 +57,8 @@ ZHIDAO_AI_HEADERS = {
 
 QUESTION_TYPE_NAMES = {1: "单选题", 2: "多选题", 14: "判断题"}
 MAX_EXAM_ATTEMPTS = 6
+DEFAULT_PROMPT_CHAR_LIMIT = 28000
+MATERIAL_TRUNCATED_MARK = "\n…[参考资料已截断]"
 
 
 def is_flagged(value) -> bool:
@@ -161,20 +163,41 @@ def select_random_answers(choices: list[dict], count: int) -> list:
     return [choice["id"] for choice in picked]
 
 
+def _trim_reference_materials(materials: list[dict], budget: int) -> str:
+    """按字符预算裁剪参考资料, 超出预算的末尾内容直接截断, 保留可读提示."""
+    if budget <= 0:
+        return ""
+    header = "参考资料：\n"
+    kept: list[str] = []
+    remaining = budget - len(header)
+    for item in materials:
+        name = str(item.get("name", ""))
+        content = str(item.get("content", ""))
+        prefix = f"```{name}\n"
+        suffix = "\n```"
+        block = prefix + content + suffix
+        if len(block) <= remaining:
+            kept.append(block)
+            remaining -= len(block) + 1
+            continue
+        inner_budget = remaining - len(prefix) - len(suffix) - len(MATERIAL_TRUNCATED_MARK)
+        if inner_budget > 0:
+            kept.append(prefix + content[:inner_budget] + MATERIAL_TRUNCATED_MARK + suffix)
+        break
+    if not kept:
+        return ""
+    return header + "\n".join(kept) + "\n"
+
+
 def build_answer_prompt(
     question_type: int,
     question: str,
     choices: list[dict],
     reference_materials: list[dict] | None = None,
     extra: dict | None = None,
+    max_chars: int | None = None,
 ) -> str:
     extra = extra or {}
-    materials = ""
-    if reference_materials:
-        materials = "参考资料：\n" + "\n".join(
-            f"```{item.get('name', '')}\n{item.get('content', '')}\n```"
-            for item in reference_materials
-        )
     type_name = QUESTION_TYPE_NAMES.get(question_type, "客观题")
     background = (
         f"假设你是一名学生，正在学习《{extra.get('courseName', '未知课程')}》，"
@@ -193,15 +216,22 @@ def build_answer_prompt(
 ```
 答案必须是 JSON 列表，单选也要是列表，否则视为无效答案。代码块外可以简短解释依据。
 """
-    return (
-        materials
-        + background
+    body = (
+        background
         + theme
         + knowledge
         + requirement
         + f"现在，请听题：\n\n{question}\n\n"
         + f"选项如下：```choices\n{json.dumps(choices, ensure_ascii=False, indent=4)}\n```\n"
     )
+    materials = ""
+    if reference_materials:
+        try:
+            limit = int(max_chars) if max_chars else DEFAULT_PROMPT_CHAR_LIMIT
+        except (TypeError, ValueError):
+            limit = DEFAULT_PROMPT_CHAR_LIMIT
+        materials = _trim_reference_materials(reference_materials, limit - len(body))
+    return materials + body
 
 
 class AnswerBank:
@@ -506,7 +536,7 @@ class LlmAnswerer:
     def answer(self, prompt: str) -> list:
         if not llm.enabled():
             raise ValueError("未配置可用的大模型接口")
-        content = llm.chat_sync(prompt, json_mode=False, proxy=self.proxy)
+        content = llm.chat_sync(prompt, json_mode=False, proxy=self.proxy, stream=True)
         return parse_answer_ids(content)
 
 
@@ -540,6 +570,8 @@ class ExamCtx:
         )
         self.deepseek_answerer = DeepSeekAnswerer(getattr(api, "proxy", ""))
         self._last_ai_provider = ""
+        self._llm_disabled = False
+        self._llm_warned = False
 
     def open_exam(self, tried: int = 0) -> None:
         data = {
@@ -647,13 +679,27 @@ class ExamCtx:
             choices,
             self.reference_materials,
             self.op_extra,
+            max_chars=self.op_extra.get("promptMaxChars"),
         )
         for name, answerer in (
             ("智慧树AI", self.zhidao_answerer),
             (llm.provider_label(), self.deepseek_answerer),
         ):
+            if name != "智慧树AI" and self._llm_disabled:
+                continue
             try:
                 ids = answerer.answer(prompt)
+            except llm.NonRetryableLLMError as exc:
+                if name != "智慧树AI":
+                    self._llm_disabled = True
+                    if not self._llm_warned:
+                        self._llm_warned = True
+                        logger.warn(
+                            f"自定义大模型不可用({exc}), 本试卷后续题目将跳过 LLM 直接降级.",
+                            shift=True,
+                        )
+                logger.debug(f"{name} 答题快速失败: {exc}")
+                continue
             except Exception as exc:
                 logger.debug(f"{name} 答题失败: {exc}")
                 continue
@@ -697,6 +743,7 @@ class ExamCtx:
             return self._generate_answer(question_type, question, choices), "AI"
         except Exception as exc:
             logger.warn(f"题目 {question_id} AI 作答失败, 改为随机: {exc}")
+        time.sleep(random.uniform(1.5, 3.0))
         if question_type == 2:
             return select_random_answers(choices, 2), "随机"
         return select_random_answers(choices, 1), "随机"

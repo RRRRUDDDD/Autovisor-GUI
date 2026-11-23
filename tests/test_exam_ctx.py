@@ -7,7 +7,7 @@ from unittest.mock import patch
 
 import requests
 
-from modules import zhidao_crypto
+from modules import llm, zhidao_crypto
 from modules.exam_ctx import (
     KNOWLEDGE_RESOURCE_LIST,
     AnswerBank,
@@ -335,6 +335,60 @@ class ExamAnswerTests(unittest.TestCase):
         self.assertIn("讲义", standalone)
         self.assertIn("考点", standalone)
 
+    def test_reference_materials_are_trimmed_before_question_and_choices(self):
+        huge = "课件重点内容" * 6000
+        prompt = build_answer_prompt(
+            1,
+            "核心题干",
+            [{"id": 1, "content": "选项甲"}],
+            [{"name": "课件", "content": huge}],
+        )
+        self.assertLessEqual(len(prompt), 28100)
+        self.assertIn("核心题干", prompt)
+        self.assertIn("选项甲", prompt)
+        self.assertIn("已截断", prompt)
+
+        unlimited = build_answer_prompt(
+            1,
+            "核心题干",
+            [{"id": 1, "content": "选项甲"}],
+            [{"name": "课件", "content": "短资料"}],
+        )
+        self.assertIn("短资料", unlimited)
+        self.assertNotIn("已截断", unlimited)
+
+    def test_question_and_choices_are_never_truncated(self):
+        long_question = "题干" * 20000
+        prompt = build_answer_prompt(
+            1,
+            long_question,
+            [{"id": 1, "content": "选项甲"}],
+            [{"name": "课件", "content": "不应出现"}],
+        )
+        self.assertIn(long_question, prompt)
+        self.assertIn("选项甲", prompt)
+        self.assertNotIn("不应出现", prompt)
+
+    def test_non_retryable_llm_error_warns_once_and_skips_subsequent_llm(self):
+        ctx, _ = self.make_ctx()
+        ctx.zhidao_answerer = StubAnswerer(error=RuntimeError("no cookie"))
+        calls = []
+
+        class _FailFastAnswerer:
+            def answer(self, prompt):
+                calls.append(prompt)
+                raise llm.NonRetryableLLMError("HTTP 401 API Key 无效")
+
+        ctx.deepseek_answerer = _FailFastAnswerer()
+        with patch("modules.exam_ctx.time.sleep"):
+            first, source1 = ctx.get_question_answer(make_question())
+            second, source2 = ctx.get_question_answer(make_question())
+        self.assertEqual(source1, "随机")
+        self.assertEqual(source2, "随机")
+        self.assertEqual(len(calls), 1)
+        self.assertTrue(ctx._llm_disabled)
+        self.assertTrue(ctx._llm_warned)
+
     def test_prefers_zhidao_ai_then_deepseek(self):
         ctx, _ = self.make_ctx()
         zhidao = StubAnswerer(result=[2])
@@ -360,11 +414,12 @@ class ExamAnswerTests(unittest.TestCase):
         ctx, _ = self.make_ctx()
         ctx.zhidao_answerer = StubAnswerer(error=RuntimeError("fail"))
         ctx.deepseek_answerer = StubAnswerer(error=RuntimeError("fail"))
-        for question_type, expected in ((1, 1), (2, 2)):
-            answers, source = ctx.get_question_answer(make_question(question_type))
-            self.assertEqual(source, "随机")
-            self.assertEqual(len(answers), expected)
-            self.assertTrue(set(answers).issubset({1, 2, 3}))
+        with patch("modules.exam_ctx.time.sleep"):
+            for question_type, expected in ((1, 1), (2, 2)):
+                answers, source = ctx.get_question_answer(make_question(question_type))
+                self.assertEqual(source, "随机")
+                self.assertEqual(len(answers), expected)
+                self.assertTrue(set(answers).issubset({1, 2, 3}))
 
     def test_ignores_stale_cache_ids(self):
         ctx, _ = self.make_ctx()
