@@ -27,6 +27,7 @@ from modules.html_utils import extract_plain_text
 from modules.http_utils import build_requests_proxies
 from modules.logger import Logger
 from modules.ppt_extractor import PptExtractor
+from modules.question_bank import QuestionBankClient
 from modules.utils import get_runtime_path
 from modules.zhs_api import (  # noqa: F401  兼容旧的导入路径
     CaptchaRequiredError,
@@ -222,6 +223,12 @@ def build_answer_prompt(
         if extra.get("knowledgePoint")
         else ""
     )
+    bank = str(extra.get("题库参考") or "").strip()
+    bank_section = (
+        f"【第三方题库参考】以下内容来自外部题库, 仅供参考, 请自行判断正确性：\n{bank}\n"
+        if bank
+        else ""
+    )
     requirement = f"""本题为{type_name}，请从选项中选择{'最合适的答案' if question_type == 1 else '所有正确的答案'}，
 回答放到 markdown 代码块中，例如：
 ```answer
@@ -233,6 +240,7 @@ def build_answer_prompt(
         background
         + theme
         + knowledge
+        + bank_section
         + requirement
         + f"现在，请听题：\n\n{question}\n\n"
         + f"选项如下：```choices\n{json.dumps(choices, ensure_ascii=False, indent=4)}\n```\n"
@@ -576,6 +584,7 @@ class AiExamBase(ABC):
         exam_paper_id,
         op_extra: dict | None = None,
         answer_bank: AnswerBank | None = None,
+        question_bank=None,
     ):
         self.api = api
         self.course_id = course_id
@@ -584,6 +593,8 @@ class AiExamBase(ABC):
         self.exam_paper_id = exam_paper_id
         self.op_extra = op_extra or {}
         self.answer_bank = answer_bank or AnswerBank(course_id)
+        self.question_bank = question_bank
+        self._question_bank_ready = question_bank is not None
         self.reference_materials: list[dict] = []
         self.sheet_content: list | None = None
         self._stopped = threading.Event()
@@ -695,13 +706,43 @@ class AiExamBase(ABC):
         finally:
             self._stopped.set()
 
+    def _get_question_bank(self):
+        """懒加载外部题库客户端; 未配置 token 时返回 None."""
+        if self._question_bank_ready:
+            return self.question_bank
+        self._question_bank_ready = True
+        try:
+            self.question_bank = QuestionBankClient.from_config(
+                proxy=getattr(self.api, "proxy", "")
+            )
+        except Exception as exc:
+            logger.debug(f"初始化外部题库失败: {exc}")
+            self.question_bank = None
+        return self.question_bank
+
+    def _bank_reference(self, question: dict, question_type, choices: list[dict]) -> str:
+        bank = self._get_question_bank()
+        if bank is None or not bank.enabled():
+            return ""
+        try:
+            title = extract_plain_text(question.get("content", ""))
+            options = [extract_plain_text(choice.get("content", "")) for choice in choices]
+            return bank.query(title, options, question_type) or ""
+        except Exception as exc:
+            logger.debug(f"外部题库查询降级: {exc}")
+            return ""
+
     def _generate_answer(self, question_type: int, question: dict, choices: list[dict]) -> list:
+        extra = dict(self.op_extra)
+        reference = self._bank_reference(question, question_type, choices)
+        if reference:
+            extra["题库参考"] = reference
         prompt = build_answer_prompt(
             question_type,
             question.get("content", ""),
             choices,
             self.reference_materials,
-            self.op_extra,
+            extra,
             max_chars=self.op_extra.get("promptMaxChars"),
         )
         for name, answerer in (
@@ -890,6 +931,16 @@ class AiExamBase(ABC):
             return self._finish(submit, sheets)
         finally:
             self._stopped.set()
+            self._log_bank_stats()
+
+    def _log_bank_stats(self) -> None:
+        bank = self.question_bank
+        if bank is None:
+            return
+        try:
+            bank.log_stats()
+        except Exception as exc:
+            logger.debug(f"外部题库统计输出失败: {exc}")
 
     def _answer_questions(self, sheets: list) -> None:
         total = len(sheets)

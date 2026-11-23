@@ -11,6 +11,7 @@ from modules import llm
 from modules.answer_store import AiQuestionStore
 from modules.html_utils import extract_plain_text, has_meaningful_image
 from modules.logger import Logger
+from modules.question_bank import QuestionBankClient
 from modules.zhidao_homework_api import (
     QUESTION_TYPE_NAMES,
     build_student_answer_item,
@@ -137,6 +138,7 @@ def build_homework_prompt(
     wrong_combos: list[list[str]] | None = None,
     analysis: str = "",
     excluded: list[str] | None = None,
+    bank_reference: str = "",
 ) -> str:
     qtype = question.get("type", 1)
     type_name = QUESTION_TYPE_NAMES.get(qtype, "single")
@@ -169,6 +171,11 @@ def build_homework_prompt(
         lines.append("【错误选择方式】历史提交中这些组合已被判错：" + " | ".join(rendered))
     if analysis:
         lines.append("【历史AI解析】" + _plain(analysis))
+    if bank_reference:
+        lines.append(
+            "【第三方题库参考】以下内容来自外部题库, 仅供参考, 请自行判断正确性："
+            + _plain(bank_reference)
+        )
     if qtype == 3:
         lines.append(
             '只输出 markdown 代码块：```answer\n["答案一", "答案二"]\n```，不要解释。'
@@ -196,6 +203,7 @@ class ZhidaoHomeworkWorker:
         target_score=60.0,
         max_rounds=3,
         sleep=time.sleep,
+        question_bank=None,
     ):
         self.api = api
         self.course_id = str(course_id)
@@ -207,8 +215,42 @@ class ZhidaoHomeworkWorker:
         self.target_score = float(target_score or 0)
         self.max_rounds = max(1, int(max_rounds or 1))
         self.sleep = sleep
+        self.question_bank = question_bank
+        self._question_bank_ready = question_bank is not None
         self._ai_user_id = None
         self._recruit_id = ""
+
+    # ------------------------------------------------------------- answering
+    def _get_question_bank(self):
+        if self._question_bank_ready:
+            return self.question_bank
+        self._question_bank_ready = True
+        try:
+            self.question_bank = QuestionBankClient.from_config()
+        except Exception as exc:
+            logger.debug(f"初始化外部题库失败: {exc}")
+            self.question_bank = None
+        return self.question_bank
+
+    def _bank_reference(self, question: dict) -> str:
+        bank = self._get_question_bank()
+        if bank is None or not bank.enabled():
+            return ""
+        try:
+            title = _plain(question.get("content"))
+            options = [_plain(option.get("content")) for option in question.get("options") or []]
+            return bank.query(title, options, question.get("type", 1)) or ""
+        except Exception as exc:
+            logger.debug(f"外部题库查询降级: {exc}")
+            return ""
+
+    def _log_bank_stats(self) -> None:
+        if self.question_bank is None:
+            return
+        try:
+            self.question_bank.log_stats()
+        except Exception as exc:
+            logger.debug(f"外部题库统计输出失败: {exc}")
 
     # ------------------------------------------------------------- answering
     def _ask(self, prompt: str) -> str:
@@ -231,6 +273,7 @@ class ZhidaoHomeworkWorker:
 
         if not options and qtype != 3:
             raise ValueError(f"题目 {question.get('eid')} 没有可选项")
+        bank_reference = self._bank_reference(question)
 
         if qtype in (1, 14):
             excluded = []
@@ -242,7 +285,11 @@ class ZhidaoHomeworkWorker:
             if not candidates:
                 candidates = list(options)
             prompt = build_homework_prompt(
-                question, wrong_combos=combos, analysis=analysis, excluded=excluded
+                question,
+                wrong_combos=combos,
+                analysis=analysis,
+                excluded=excluded,
+                bank_reference=bank_reference,
             )
             excluded_set = set(excluded)
             for attempt in range(ROLLBACK_RETRIES):
@@ -255,7 +302,12 @@ class ZhidaoHomeworkWorker:
             pool = candidates or options
             return [str(random.choice(pool)["id"])], "随机"
 
-        prompt = build_homework_prompt(question, wrong_combos=combos, analysis=analysis)
+        prompt = build_homework_prompt(
+            question,
+            wrong_combos=combos,
+            analysis=analysis,
+            bank_reference=bank_reference,
+        )
         wrong_signatures = {tuple(sorted(combo)) for combo in combos}
         last: tuple[list, str] = ([], "")
         for attempt in range(ROLLBACK_RETRIES):
@@ -407,6 +459,28 @@ class ZhidaoHomeworkWorker:
 
     # ------------------------------------------------------------------- run
     def run(
+        self,
+        *,
+        recruit_id,
+        course_id,
+        homework_id,
+        stu_exam_id,
+        exam_id="",
+        school_id="",
+    ) -> dict:
+        try:
+            return self._run(
+                recruit_id=recruit_id,
+                course_id=course_id,
+                homework_id=homework_id,
+                stu_exam_id=stu_exam_id,
+                exam_id=exam_id,
+                school_id=school_id,
+            )
+        finally:
+            self._log_bank_stats()
+
+    def _run(
         self,
         *,
         recruit_id,

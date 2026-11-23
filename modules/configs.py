@@ -373,6 +373,10 @@ LLM_TEMPLATE = {
     "vision_model": "",
     "api_version": "",
     "auto_submit": False,
+    "stream_timeout": 120,
+    "stream_idle_timeout": 30,
+    "question_bank_token": "",
+    "question_bank_url": "https://tk.enncy.cn/query",
 }
 
 DEFAULT_MIRRORS = {

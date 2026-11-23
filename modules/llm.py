@@ -83,6 +83,8 @@ DEFAULT_CONF = {
     "auto_submit": False,
     "stream_timeout": DEFAULT_STREAM_TIMEOUT,
     "stream_idle_timeout": DEFAULT_STREAM_IDLE_TIMEOUT,
+    "question_bank_token": "",
+    "question_bank_url": "https://tk.enncy.cn/query",
 }
 
 
@@ -288,6 +290,12 @@ def normalize_conf(raw: dict | None) -> dict:
             "stream_idle_timeout 不能大于 stream_timeout, 已自动收敛为总超时值."
         )
         stream_idle_timeout = stream_timeout
+    question_bank_token = str(
+        src.get("question_bank_token") or src.get("questionBankToken") or ""
+    ).strip()
+    question_bank_url = str(
+        src.get("question_bank_url") or src.get("questionBankUrl") or ""
+    ).strip() or DEFAULT_CONF["question_bank_url"]
     return {
         "provider": provider,
         "api_format": api_format,
@@ -299,6 +307,8 @@ def normalize_conf(raw: dict | None) -> dict:
         "auto_submit": auto_submit,
         "stream_timeout": stream_timeout,
         "stream_idle_timeout": stream_idle_timeout,
+        "question_bank_token": question_bank_token,
+        "question_bank_url": question_bank_url,
     }
 
 
@@ -330,6 +340,15 @@ def _conf():
         _WARNED = True
         logger.warn("未配置大模型 API Key (data/llm.json), 弹题回退为默认行为.")
     return _LLM_CONF
+
+
+def question_bank_conf() -> dict:
+    """返回外部题库的 token 与查询地址; token 为空表示未启用."""
+    c = _conf()
+    return {
+        "token": c.get("question_bank_token", ""),
+        "url": c.get("question_bank_url", DEFAULT_CONF["question_bank_url"]),
+    }
 
 
 def provider_label(c: dict | None = None) -> str:
