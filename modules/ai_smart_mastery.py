@@ -106,8 +106,9 @@ def parse_exam_url(url: str) -> dict:
 
 
 class AnswerCache:
-    def __init__(self, path: Path):
+    def __init__(self, path: Path, store=None):
         self.path = path
+        self.store = store
         self.items: dict[str, dict] = {}
         if path.is_file():
             try:
@@ -136,6 +137,10 @@ class AnswerCache:
                         best, best_ratio = candidate, ratio
                 if best is not None and best_ratio >= 0.85:
                     record = best
+        if record is None and self.store is not None:
+            stored = self.store.search_in_course("", question)
+            if stored:
+                record = stored.get("question_dict") or {}
         if not record:
             return None
         if record.get("letters"):
@@ -164,6 +169,23 @@ class AnswerCache:
             return
         self.items[key] = record
         self._loose.setdefault(loose_key(key), record)
+        if self.store is not None:
+            if answer.get("letters"):
+                flat = "".join(str(item) for item in answer["letters"])
+            elif answer.get("values"):
+                flat = "；".join(str(item) for item in answer["values"])
+            else:
+                flat = str(answer.get("text") or "")
+            self.store.upsert_ai_question(
+                "",
+                "",
+                key,
+                1,
+                question_plain=question,
+                question_raw=question,
+                answer=flat,
+                question_dict=record,
+            )
         self.save()
 
     def save(self):

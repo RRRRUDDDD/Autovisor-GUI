@@ -21,6 +21,7 @@ from urllib.parse import unquote
 import requests
 
 from modules import llm, zhidao_crypto, zhs_api
+from modules.answer_store import AiQuestionStore
 from modules.http_utils import build_requests_proxies
 from modules.logger import Logger
 from modules.utils import get_runtime_path
@@ -200,16 +201,28 @@ def build_answer_prompt(
 
 
 class AnswerBank:
-    """按课程保存题库: 每题按 questionId + version 缓存, 并合并到 data.json."""
+    """按课程保存题库: 底层写入 SQLite, 同时保留 data.json 快照兼容旧版本."""
 
-    def __init__(self, course_id, base_dir: str | Path | None = None):
+    def __init__(self, course_id, base_dir: str | Path | None = None, store=None):
         self.course_id = str(course_id)
+        explicit_dir = base_dir is not None
         self.base_dir = Path(
             base_dir
             if base_dir is not None
             else get_runtime_path("data", "exam_answers", self.course_id)
         )
+        self.exam_test_id = None
         self.items: dict[str, dict] = {}
+        if store is not None:
+            self.store = store
+        elif explicit_dir:
+            # 显式目录通常来自测试: 数据库与旧 JSON 都隔离在该目录内
+            self.store = AiQuestionStore(
+                self.base_dir / "questions_bank.db", data_root=self.base_dir
+            )
+            self.store.migrate_course_json_dir(self.course_id, self.base_dir)
+        else:
+            self.store = AiQuestionStore()
 
     def _path(self, name: str) -> Path:
         self.base_dir.mkdir(parents=True, exist_ok=True)
@@ -220,6 +233,7 @@ class AnswerBank:
         return str(question_id) if version == 1 else f"{question_id}_{version}"
 
     def load(self, exam_test_id) -> None:
+        self.exam_test_id = exam_test_id
         merged: dict[str, dict] = {}
         if self.base_dir.is_dir():
             for file in self.base_dir.glob("*.json"):
@@ -261,9 +275,22 @@ class AnswerBank:
             "questionDict": answer.get("questionDict", {}),
         }
         self.items[self._key(question_id, version)] = record
+        self.store.upsert_ai_question(
+            self.course_id,
+            self.exam_test_id or "",
+            str(question_id),
+            version,
+            question_plain=record["question"],
+            question_raw=record["question"],
+            answer=record["answer"],
+            answer_content=record["answer_content"],
+            question_dict=record["questionDict"],
+        )
         self.save()
 
     def save(self, exam_test_id=None) -> None:
+        if exam_test_id is not None:
+            self.exam_test_id = exam_test_id
         merged_path = self._path("data.json")
         merged_path.write_text(
             json.dumps(self.items, ensure_ascii=False, indent=2), encoding="utf-8"
@@ -272,6 +299,12 @@ class AnswerBank:
             self._path(f"{exam_test_id}.json").write_text(
                 json.dumps(self.items, ensure_ascii=False, indent=2), encoding="utf-8"
             )
+
+    def search_in_course(self, question: str, exclude_exam_id=None) -> dict | None:
+        """跨 exam_id 检索同课程答案 (精确 -> 宽松 -> 模糊)."""
+        return self.store.search_in_course(
+            self.course_id, question, exclude_exam_id=exclude_exam_id
+        )
 
 
 class ExamApi(zhs_api.ZhsApiClient):

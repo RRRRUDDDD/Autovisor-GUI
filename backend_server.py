@@ -20,7 +20,7 @@ import sys
 import threading
 import time
 import traceback
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
 from modules.shutdown import SHUTDOWN_OUTCOMES, ShutdownManager
 
@@ -1049,6 +1049,18 @@ class BackendRequestHandler(BaseHTTPRequestHandler):
             self._send_json(HTTPStatus.OK, self.server.manager.snapshot())
             return
 
+        if path == "/api/cache/stats":
+            from modules.answer_store import AiQuestionStore
+
+            query = parse_qs(urlparse(self.path).query)
+            course_id = (query.get("courseId") or query.get("course_id") or [""])[0]
+            try:
+                stats = AiQuestionStore().stats(course_id.strip() or None)
+                self._send_json(HTTPStatus.OK, {"ok": True, **stats})
+            except Exception as exc:
+                self._send_json(HTTPStatus.BAD_GATEWAY, {"error": str(exc)})
+            return
+
         if path == "/api/events":
             self._handle_sse()
             return
@@ -1108,6 +1120,30 @@ class BackendRequestHandler(BaseHTTPRequestHandler):
                     proxy=proxy,
                 )
                 self._send_json(HTTPStatus.OK, {"ok": True, "message": msg})
+            except ValueError as exc:
+                self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+            except Exception as exc:
+                self._send_json(HTTPStatus.BAD_GATEWAY, {"error": str(exc)})
+            return
+
+        if path == "/api/cache/export":
+            from modules.answer_store import AiQuestionStore
+
+            course_id = str(body.get("courseId") or body.get("course_id") or "").strip()
+            try:
+                payload = AiQuestionStore().export_data(course_id or None)
+                self._send_json(HTTPStatus.OK, {"ok": True, "data": payload})
+            except Exception as exc:
+                self._send_json(HTTPStatus.BAD_GATEWAY, {"error": str(exc)})
+            return
+
+        if path == "/api/cache/import":
+            from modules.answer_store import AiQuestionStore
+
+            payload = body.get("data") if isinstance(body.get("data"), dict) else body
+            try:
+                counts = AiQuestionStore().import_data(payload)
+                self._send_json(HTTPStatus.OK, {"ok": True, **counts})
             except ValueError as exc:
                 self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
             except Exception as exc:

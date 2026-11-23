@@ -29,6 +29,7 @@ from modules.ai_smart_mastery import (
     enumerate_nodes,
     run_course_mastery,
 )
+from modules.answer_store import AiQuestionStore
 from modules.banner import print_banner
 from modules.browser import BrowserSession, create_browser_session, get_screen_size
 from modules.configs import Config, ConfigError, ensure_config_files
@@ -399,7 +400,10 @@ async def run_mastery_stage(page: Page, course_url: str, config, logger) -> dict
     if not nodes:
         logger.warn("没有枚举到知识点, 跳过掌握度阶段.")
         return {}
-    cache = AnswerCache(Path(get_runtime_path("data", "mastery_answers.json")))
+    cache = AnswerCache(
+        Path(get_runtime_path("data", "mastery_answers.json")),
+        store=AiQuestionStore(),
+    )
     target = int(config.masteryTarget)
     logger.info(f"开始刷掌握度: 知识点 {len(nodes)} 个, 目标 {target}%")
     summary = await run_course_mastery(
