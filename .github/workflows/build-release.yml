@@ -1,10 +1,10 @@
-name: Build & Release Windows Packages
+name: Build & Release Multi-Platform Packages
 
 on:
   workflow_dispatch:
     inputs:
       publish_release:
-        description: Publish the verified build to GitHub Releases
+        description: Publish the verified builds to GitHub Releases
         required: false
         default: false
         type: boolean
@@ -14,8 +14,6 @@ on:
         default: ""
         type: string
   push:
-    branches:
-      - main
     tags:
       - "v*"
       - "[0-9]+.[0-9]+.[0-9]+*"
@@ -27,15 +25,14 @@ concurrency:
   group: build-release-${{ github.ref }}
   cancel-in-progress: true
 
-defaults:
-  run:
-    shell: pwsh
-
 jobs:
   test:
     name: Verify Tests (Windows)
     runs-on: windows-latest
     timeout-minutes: 30
+    defaults:
+      run:
+        shell: pwsh
     env:
       PYTHONUTF8: "1"
     steps:
@@ -92,12 +89,13 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
   build-windows:
-    name: Build Windows Installer & Portable
+    name: Build Windows (x64 Installer & Portable)
     needs: [test]
     runs-on: windows-latest
     timeout-minutes: 90
-    permissions:
-      contents: write
+    defaults:
+      run:
+        shell: pwsh
     env:
       PYTHONUTF8: "1"
     steps:
@@ -234,42 +232,6 @@ jobs:
             Pop-Location
           }
 
-      - name: Verify release artifacts and generate SHA256SUMS
-        run: |
-          $ErrorActionPreference = "Stop"
-          $installerName = "Autovisor-GUI-Setup-$($env:APP_VERSION)-windows-x64.exe"
-          $portableZipName = "Autovisor-GUI-$($env:APP_VERSION)-windows-amd64.zip"
-          $installerPath = Join-Path "dist" $installerName
-          $portableZipPath = Join-Path "dist" $portableZipName
-
-          foreach ($artifact in @($installerPath, $portableZipPath)) {
-            if (-not (Test-Path -LiteralPath $artifact)) {
-              throw "未找到发行产物: $artifact"
-            }
-            $size = (Get-Item -LiteralPath $artifact).Length
-            if ($size -lt 1048576) {
-              throw "发行产物体积异常 ($size bytes): $artifact"
-            }
-          }
-
-          $zipListing = (7z l $portableZipPath) -join "`n"
-          foreach ($entry in @("Autovisor GUI.exe", ".portable", "autovisor-backend.exe")) {
-            if ($zipListing -notmatch [regex]::Escape($entry)) {
-              throw "便携版压缩包缺少条目: $entry"
-            }
-          }
-
-          $sumLines = @()
-          foreach ($fileName in @($installerName, $portableZipName)) {
-            $filePath = Join-Path "dist" $fileName
-            $hash = (Get-FileHash -LiteralPath $filePath -Algorithm SHA256).Hash.ToLowerInvariant()
-            $line = "$hash  $fileName"
-            $line | Set-Content -LiteralPath "$filePath.sha256" -Encoding ascii
-            $sumLines += $line
-          }
-          $sumLines | Set-Content -LiteralPath "dist/SHA256SUMS.txt" -Encoding ascii
-          Get-Content -LiteralPath "dist/SHA256SUMS.txt"
-
       - name: Upload Windows Setup Installer Artifact
         uses: actions/upload-artifact@v4
         with:
@@ -284,13 +246,316 @@ jobs:
           path: dist/Autovisor-GUI-${{ env.APP_VERSION }}-windows-amd64.zip
           if-no-files-found: error
 
+  build-macos:
+    name: Build macOS (${{ matrix.arch }} DMG)
+    needs: [test]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-latest
+            arch: arm64
+          - runner: macos-15-intel
+            arch: x64
+    env:
+      PYTHONUTF8: "1"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+          cache-dependency-path: gui/package-lock.json
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "gui/src-tauri -> target"
+
+      - name: Setup uv & Python
+        uses: astral-sh/setup-uv@v10.1.0
+        with:
+          python-version: "3.12"
+          enable-cache: true
+
+      - name: Install Python dependencies
+        run: uv sync --extra captcha
+
+      - name: Validate version
+        run: |
+          set -euo pipefail
+          PY_VER=$(uv run --no-sync python -c "from modules.version import __gui_version__; print(__gui_version__)" | tail -n 1 | tr -d '[:space:]')
+          echo "APP_VERSION=$PY_VER" >> "$GITHUB_ENV"
+
+      - name: Install frontend dependencies
+        working-directory: gui
+        run: npm ci
+
+      - name: Build and verify frozen Python backend
+        run: |
+          set -euo pipefail
+          uv run --with pyinstaller python build_backend.py
+          test -x dist/autovisor-backend/autovisor-backend
+          test -d dist/autovisor-backend/internal/numpy
+          test -d dist/autovisor-backend/internal/cv2
+          test -f dist/autovisor-backend/resources/stealth.min.js
+
+      - name: Build macOS App Bundle & DMG Installer
+        run: |
+          set -euo pipefail
+          mkdir -p gui/src-tauri/resources/runtime
+          touch gui/src-tauri/resources/runtime/.keep
+          (cd gui && npx tauri build --bundles app)
+
+          APP_BUNDLE=$(find gui/src-tauri/target -maxdepth 5 -name "*.app" -type d | head -n 1)
+          if [ -z "$APP_BUNDLE" ] || [ ! -d "$APP_BUNDLE" ]; then
+            echo "未找到生成的 macOS .app 包" >&2
+            exit 1
+          fi
+          echo "Bundling frozen runtime into: $APP_BUNDLE"
+
+          RUNTIME_DST="$APP_BUNDLE/Contents/Resources/runtime"
+          rm -rf "$RUNTIME_DST"
+          mkdir -p "$(dirname "$RUNTIME_DST")"
+          cp -R dist/autovisor-backend "$RUNTIME_DST"
+          rm -rf "$RUNTIME_DST/logs"
+          chmod +x "$RUNTIME_DST/autovisor-backend"
+
+          "$RUNTIME_DST/autovisor-backend" --verify-deps
+          rm -rf "$RUNTIME_DST/logs"
+
+          codesign --force --deep --sign - "$APP_BUNDLE" || true
+
+          mkdir -p dist
+          DMG_NAME="Autovisor-GUI-${APP_VERSION}-macos-${{ matrix.arch }}.dmg"
+          DMG_PATH="dist/$DMG_NAME"
+          rm -f "$DMG_PATH"
+          STAGE_DIR=$(mktemp -d)
+          cp -R "$APP_BUNDLE" "$STAGE_DIR/Autovisor GUI.app"
+          ln -s /Applications "$STAGE_DIR/Applications"
+          hdiutil create -volname "Autovisor GUI" -srcfolder "$STAGE_DIR" -ov -format UDZO "$DMG_PATH"
+          rm -rf "$STAGE_DIR"
+          ls -lh "$DMG_PATH"
+
+      - name: Upload macOS DMG Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Autovisor-GUI-${{ env.APP_VERSION }}-macos-${{ matrix.arch }}
+          path: dist/Autovisor-GUI-${{ env.APP_VERSION }}-macos-${{ matrix.arch }}.dmg
+          if-no-files-found: error
+
+  build-linux:
+    name: Build Linux (amd64 DEB & Portable)
+    needs: [test]
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      PYTHONUTF8: "1"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install Linux GTK/WebKit and packaging dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libgl1 \
+            libwebkit2gtk-4.1-dev \
+            libgtk-3-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            patchelf \
+            file \
+            dpkg-dev
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+          cache-dependency-path: gui/package-lock.json
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "gui/src-tauri -> target"
+
+      - name: Setup uv & Python
+        uses: astral-sh/setup-uv@v10.1.0
+        with:
+          python-version: "3.12"
+          enable-cache: true
+
+      - name: Install Python dependencies
+        run: uv sync --extra captcha
+
+      - name: Validate version
+        run: |
+          set -euo pipefail
+          PY_VER=$(uv run --no-sync python -c "from modules.version import __gui_version__; print(__gui_version__)" | tail -n 1 | tr -d '[:space:]')
+          echo "APP_VERSION=$PY_VER" >> "$GITHUB_ENV"
+
+      - name: Install frontend dependencies
+        working-directory: gui
+        run: npm ci
+
+      - name: Build and verify frozen Python backend
+        run: |
+          set -euo pipefail
+          uv run --with pyinstaller python build_backend.py
+          test -x dist/autovisor-backend/autovisor-backend
+          test -d dist/autovisor-backend/internal/numpy
+          test -d dist/autovisor-backend/internal/cv2
+          test -f dist/autovisor-backend/resources/stealth.min.js
+
+      - name: Build Linux DEB Installer & Portable Archive
+        run: |
+          set -euo pipefail
+          rm -rf gui/src-tauri/resources/runtime
+          mkdir -p gui/src-tauri/resources
+          cp -a dist/autovisor-backend gui/src-tauri/resources/runtime
+          rm -rf gui/src-tauri/resources/runtime/logs
+          chmod +x gui/src-tauri/resources/runtime/autovisor-backend
+
+          (cd gui && npx tauri build --bundles deb)
+
+          mkdir -p dist
+          DEB_SRC=$(find gui/src-tauri/target/release/bundle/deb -maxdepth 1 -name "*.deb" -type f | head -n 1)
+          if [ -z "$DEB_SRC" ] || [ ! -f "$DEB_SRC" ]; then
+            echo "未找到生成的 Linux .deb 安装包" >&2
+            exit 1
+          fi
+          DEB_DST="dist/Autovisor-GUI-${APP_VERSION}-linux-amd64.deb"
+          cp -f "$DEB_SRC" "$DEB_DST"
+
+          MAIN_BIN=""
+          for candidate in "gui/src-tauri/target/release/Autovisor GUI" "gui/src-tauri/target/release/autovisor-gui"; do
+            if [ -f "$candidate" ]; then
+              MAIN_BIN="$candidate"
+              break
+            fi
+          done
+          if [ -z "$MAIN_BIN" ]; then
+            echo "未找到编译后的 Linux 宿主二进制" >&2
+            exit 1
+          fi
+
+          PORTABLE_NAME="Autovisor-GUI-${APP_VERSION}-linux-amd64"
+          PORTABLE_DIR="dist/$PORTABLE_NAME"
+          rm -rf "$PORTABLE_DIR"
+          mkdir -p "$PORTABLE_DIR"
+          cp -f "$MAIN_BIN" "$PORTABLE_DIR/Autovisor GUI"
+          chmod +x "$PORTABLE_DIR/Autovisor GUI"
+          ln -sf "Autovisor GUI" "$PORTABLE_DIR/autovisor-gui"
+          cp -a dist/autovisor-backend "$PORTABLE_DIR/runtime"
+          rm -rf "$PORTABLE_DIR/runtime/logs"
+          chmod +x "$PORTABLE_DIR/runtime/autovisor-backend"
+          touch "$PORTABLE_DIR/.portable"
+
+          "$PORTABLE_DIR/runtime/autovisor-backend" --verify-deps
+          rm -rf "$PORTABLE_DIR/runtime/logs"
+
+          TAR_DST="dist/${PORTABLE_NAME}.tar.gz"
+          rm -f "$TAR_DST"
+          tar -C dist -czf "$TAR_DST" "$PORTABLE_NAME"
+          ls -lh "$DEB_DST" "$TAR_DST"
+
+      - name: Upload Linux DEB Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Autovisor-GUI-${{ env.APP_VERSION }}-linux-amd64-deb
+          path: dist/Autovisor-GUI-${{ env.APP_VERSION }}-linux-amd64.deb
+          if-no-files-found: error
+
+      - name: Upload Linux Portable Tarball Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Autovisor-GUI-${{ env.APP_VERSION }}-linux-amd64-portable
+          path: dist/Autovisor-GUI-${{ env.APP_VERSION }}-linux-amd64.tar.gz
+          if-no-files-found: error
+
+  publish-release:
+    name: Verify Checksums & Publish GitHub Release
+    needs: [build-windows, build-macos, build-linux]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Resolve version and release tag
+        env:
+          REQUESTED_RELEASE_TAG: ${{ inputs.release_tag }}
+        run: |
+          set -euo pipefail
+          PY_VER=$(python3 -c 'import pathlib, re; text = pathlib.Path("modules/version.py").read_text("utf-8"); print(re.search(r"__gui_version__\s*=\s*\"([^\"]+)\"", text).group(1))')
+          RELEASE_TAG="v$PY_VER"
+          if [ "${GITHUB_REF_TYPE:-}" = "tag" ] && [ -n "${GITHUB_REF_NAME:-}" ]; then
+            RELEASE_TAG="$GITHUB_REF_NAME"
+          elif [ -n "${REQUESTED_RELEASE_TAG:-}" ]; then
+            RELEASE_TAG="$REQUESTED_RELEASE_TAG"
+          fi
+          echo "APP_VERSION=$PY_VER" >> "$GITHUB_ENV"
+          echo "RELEASE_TAG=$RELEASE_TAG" >> "$GITHUB_ENV"
+          echo "Resolved APP_VERSION=$PY_VER, RELEASE_TAG=$RELEASE_TAG"
+
+      - name: Download all platform artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-raw
+
+      - name: Collect and verify all release packages and generate SHA256SUMS
+        run: |
+          set -euo pipefail
+          mkdir -p release-assets
+          find release-raw -type f \( -name "*.exe" -o -name "*.zip" -o -name "*.dmg" -o -name "*.deb" -o -name "*.tar.gz" \) -exec cp -f {} release-assets/ \;
+
+          cd release-assets
+          EXPECTED_FILES=(
+            "Autovisor-GUI-Setup-${APP_VERSION}-windows-x64.exe"
+            "Autovisor-GUI-${APP_VERSION}-windows-amd64.zip"
+            "Autovisor-GUI-${APP_VERSION}-macos-arm64.dmg"
+            "Autovisor-GUI-${APP_VERSION}-macos-x64.dmg"
+            "Autovisor-GUI-${APP_VERSION}-linux-amd64.deb"
+            "Autovisor-GUI-${APP_VERSION}-linux-amd64.tar.gz"
+          )
+          for f in "${EXPECTED_FILES[@]}"; do
+            if [ ! -f "$f" ]; then
+              echo "缺少发行产物: $f" >&2
+              exit 1
+            fi
+            size=$(stat -c%s "$f")
+            if [ "$size" -lt 1048576 ]; then
+              echo "发行产物体积异常 ($size bytes): $f" >&2
+              exit 1
+            fi
+          done
+
+          sha256sum "${EXPECTED_FILES[@]}" | tee SHA256SUMS.txt
+          for f in "${EXPECTED_FILES[@]}"; do
+            sha256sum "$f" > "${f}.sha256"
+          done
+
       - name: Upload SHA256SUMS Artifact
         uses: actions/upload-artifact@v4
         with:
           name: SHA256SUMS-${{ env.APP_VERSION }}
           path: |
-            dist/SHA256SUMS.txt
-            dist/*.sha256
+            release-assets/SHA256SUMS.txt
+            release-assets/*.sha256
           if-no-files-found: error
 
       - name: Publish GitHub Release
@@ -303,6 +568,10 @@ jobs:
           generate_release_notes: true
           fail_on_unmatched_files: true
           files: |
-            dist/Autovisor-GUI-Setup-${{ env.APP_VERSION }}-windows-x64.exe
-            dist/Autovisor-GUI-${{ env.APP_VERSION }}-windows-amd64.zip
-            dist/SHA256SUMS.txt
+            release-assets/Autovisor-GUI-Setup-${{ env.APP_VERSION }}-windows-x64.exe
+            release-assets/Autovisor-GUI-${{ env.APP_VERSION }}-windows-amd64.zip
+            release-assets/Autovisor-GUI-${{ env.APP_VERSION }}-macos-arm64.dmg
+            release-assets/Autovisor-GUI-${{ env.APP_VERSION }}-macos-x64.dmg
+            release-assets/Autovisor-GUI-${{ env.APP_VERSION }}-linux-amd64.deb
+            release-assets/Autovisor-GUI-${{ env.APP_VERSION }}-linux-amd64.tar.gz
+            release-assets/SHA256SUMS.txt

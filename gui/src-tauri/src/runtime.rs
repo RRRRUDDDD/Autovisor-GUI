@@ -269,9 +269,22 @@ fn find_frozen_backend(exe_dir: &Path) -> Option<(PathBuf, PathBuf)> {
         exe_dir.join("backend").join(bin),
         exe_dir.join(bin),
     ];
-    // macOS .app bundle: Contents/MacOS/<exe> -> Contents/Resources/runtime/autovisor-backend
+    // macOS .app bundle (Contents/MacOS/<exe> -> Contents/Resources/runtime/autovisor-backend)
+    // and Linux .deb / system install (/usr/bin/<exe> -> /usr/lib/<app>/runtime/autovisor-backend)
     if let Some(parent) = exe_dir.parent() {
         candidates.push(parent.join("Resources").join("runtime").join(bin));
+        candidates.push(parent.join("Resources").join("resources").join("runtime").join(bin));
+        for lib_subdir in ["Autovisor GUI", "autovisor-gui"] {
+            candidates.push(parent.join("lib").join(lib_subdir).join("runtime").join(bin));
+            candidates.push(
+                parent
+                    .join("lib")
+                    .join(lib_subdir)
+                    .join("resources")
+                    .join("runtime")
+                    .join(bin),
+            );
+        }
     }
     for exe in candidates {
         if exe.is_file() {
@@ -654,6 +667,18 @@ mod tests {
         fs::write(&direct_exe, b"stub").unwrap();
         let (found_direct, _) = find_frozen_backend(&root).expect("should prefer runtime/");
         assert_eq!(found_direct, direct_exe);
+
+        // Linux .deb layout: /usr/bin -> /usr/lib/Autovisor GUI/runtime/<bin>
+        let usr_bin = root.join("usr").join("bin");
+        let usr_lib_rt = root.join("usr").join("lib").join("Autovisor GUI").join("runtime");
+        fs::create_dir_all(&usr_bin).unwrap();
+        fs::create_dir_all(usr_lib_rt.join("resources")).unwrap();
+        let deb_exe = usr_lib_rt.join(bin);
+        fs::write(&deb_exe, b"stub").unwrap();
+        let (found_deb, found_deb_res) =
+            find_frozen_backend(&usr_bin).expect("should find Linux .deb runtime");
+        assert_eq!(found_deb, deb_exe);
+        assert_eq!(found_deb_res, usr_lib_rt.join("resources"));
 
         let _ = fs::remove_dir_all(&root);
     }

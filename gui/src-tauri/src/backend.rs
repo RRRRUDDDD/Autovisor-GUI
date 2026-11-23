@@ -249,6 +249,18 @@ impl BackendManager {
 
         let mut cmd = match &launch {
             BackendLaunchSpec::FrozenExe(exe) => {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    if let Ok(meta) = std::fs::metadata(exe) {
+                        let mode = meta.permissions().mode();
+                        if mode & 0o111 == 0 {
+                            let mut perms = meta.permissions();
+                            perms.set_mode(mode | 0o755);
+                            let _ = std::fs::set_permissions(exe, perms);
+                        }
+                    }
+                }
                 let mut c = Command::new(exe);
                 c.current_dir(&paths.data_dir);
                 c

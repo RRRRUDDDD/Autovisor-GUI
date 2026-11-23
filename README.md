@@ -55,7 +55,7 @@
 - 🔍 自动识别本机 Edge / Chrome / Brave / Vivaldi / 360 / QQ 浏览器 / Chromium，无需手动配置路径
 - 🧩 自动处理登录滑块与课中点选验证，遇到无法自动处理的安全验证时将浏览器前置并推送提醒
 - 🙈 隐藏浏览器窗口后台学习，不影响日常使用电脑
-- 🤖 可选接入大模型辅助答题，兼容 OpenAI / Claude / Gemini / Azure / Ollama 及国内主流模型
+- 🤖 可选接入大模型辅助答题，兼容 OpenAI / Claude / Gemini / Azure / Ollama 及国内主流模型，支持视觉模型自动作答图片题
 - 🔔 Windows 系统通知 / Server 酱 / Qmsg 酱 / Bark / Telegram 推送
 - ⏻ 任务完成后可自动关机（60 秒倒计时，可随时取消）
 - 🌗 浅色 / 深色主题，响应式布局（窄屏自动切换为底部导航）
@@ -66,25 +66,31 @@
 
 ### 系统要求
 
-- Windows 10 / 11（x64）
-- 已安装任意 Chromium 内核浏览器（推荐 Edge 或 Chrome）
-- WebView2 运行时（Windows 11 自带；安装版缺失时会自动静默安装）
+- **操作系统**：Windows 10 / 11（x64）、macOS 12+（Apple Silicon `arm64` / Intel `x64`）、Linux（x64，如 Ubuntu 22.04+ / Debian 12+）
+- **浏览器**：本机已安装任意 Chromium 内核浏览器（推荐 Chrome 或 Edge）
+- **WebView 运行时**：Windows 11 / macOS 自带；Windows 安装版缺失 WebView2 时会自动静默安装；Linux 需系统包含 `libwebkit2gtk-4.1`
 
 ### 获取程序
 
-前往 [Releases](https://github.com/RRRRUDDDD/Autovisor-GUI/releases) 下载以下任意一种：
+前往 [Releases](https://github.com/RRRRUDDDD/Autovisor-GUI/releases) 下载对应系统的发行包：
 
-| 发行形式 | 文件 | 说明 |
-| --- | --- | --- |
-| **安装版**（推荐） | `Autovisor-GUI-Setup-<版本>-windows-x64.exe` | 标准安装向导，创建开始菜单快捷方式，可正常卸载 |
-| **便携版** | `Autovisor-GUI-<版本>-windows-amd64` | 解压后双击 `Autovisor GUI.exe` 即用，所有数据保存在程序目录中，适合 U 盘携带 |
+| 平台 | 发行形式 | 文件 | 说明 |
+| --- | --- | --- | --- |
+| **Windows (x64)** | 安装版（推荐） | `Autovisor-GUI-Setup-<版本>-windows-x64.exe` | 标准安装向导，创建开始菜单快捷方式，可正常卸载 |
+| **Windows (x64)** | 便携版 | `Autovisor-GUI-<版本>-windows-amd64.zip` | 解压后双击 `Autovisor GUI.exe` 即用，所有数据保存在程序目录中，适合 U 盘携带 |
+| **macOS (Apple Silicon)** | DMG 镜像 | `Autovisor-GUI-<版本>-macos-arm64.dmg` | 适用于 M1 / M2 / M3 / M4 芯片 Mac，打开后将 `Autovisor GUI.app` 拖入 `Applications` |
+| **macOS (Intel)** | DMG 镜像 | `Autovisor-GUI-<版本>-macos-x64.dmg` | 适用于 Intel 芯片 Mac，打开后将 `Autovisor GUI.app` 拖入 `Applications` |
+| **Linux (x64)** | DEB 安装包 | `Autovisor-GUI-<版本>-linux-amd64.deb` | 适用于 Ubuntu / Debian 系发行版（`sudo apt install ./Autovisor-GUI-<版本>-linux-amd64.deb`） |
+| **Linux (x64)** | 便携版 | `Autovisor-GUI-<版本>-linux-amd64.tar.gz` | 解压后运行 `./autovisor-gui` 即用，数据保存在程序目录 `userdata/` 下 |
 
 ### 数据目录
 
-| 发行形式 | 配置、Cookie、日志的存放位置 |
+| 平台 / 发行形式 | 配置、Cookie、日志的存放位置 |
 | --- | --- |
-| 安装版 | `%APPDATA%\com.autovisor.gui\userdata\` |
-| 便携版 | 程序目录下的 `userdata\` |
+| Windows 安装版 | `%APPDATA%\com.autovisor.gui\userdata\` |
+| macOS 应用版 | `~/Library/Application Support/com.autovisor.gui/userdata/` |
+| Linux 安装版（`.deb`） | `~/.config/com.autovisor.gui/userdata/` |
+| 便携版（Windows / Linux） | 程序目录下的 `userdata/` |
 
 可在「系统设置 → 运行环境与版本」中一键打开数据目录。
 
@@ -168,7 +174,9 @@ flowchart LR
 | Azure OpenAI | 需填写部署名与 `api_version` |
 | Ollama | 本地 `/api/chat` |
 
-「测验页自动复核并提交」关闭时，程序只填写答案，方便你核对后手动提交。
+**图片题**：作业 / 考试的题干与选项常以图片渲染，DOM 中没有可解析文本。在「视觉模型（图片题）」中填写支持读图的模型 ID（如 `gpt-4o`、`Qwen/Qwen2.5-VL-72B-Instruct`、`glm-4v-plus`），会复用同一服务商的 API Key、地址与协议。填写后程序逐题截图交给视觉模型、按选项顺序点选并点「下一题」保存；留空则跳过图片题。
+
+「测验 / 作业自动提交」关闭时，程序只填写答案，方便你核对后手动提交；作业最后一题会尝试点「暂存作业」保存。
 
 ## 消息推送
 
@@ -187,6 +195,7 @@ flowchart LR
 ## 数据与隐私
 
 - 所有数据（配置、Cookie、日志）**仅保存在本机**数据目录，不上传任何服务器；
+- 启用视觉模型后，作业/考试题目截图会发送给你在设置中配置的大模型服务商；不填写视觉模型则不会发送；
 - 密码**默认不保存**，仅在勾选「记住账号密码」时以明文保存在本机，可在设置中随时清除；
 - 内置引擎只监听本地回环地址，并使用每次启动随机生成的令牌鉴权；
 - 复制日志时会自动遮盖手机号、密码等常见敏感字段，分享前仍建议自行检查；
@@ -294,7 +303,7 @@ powershell -ExecutionPolicy Bypass -File .\build-installer.ps1
 两个脚本都会先构建内置引擎（`build_backend.py`），再构建前端与 Tauri Release；加 `-SkipBackendBuild` 可复用已构建的引擎。版本号以 `gui/src-tauri/tauri.conf.json` 为准。
 
 > [!NOTE]
-> 宿主代码已按平台做了条件编译（进程树托管、浏览器检测、数据目录），macOS / Linux 可从源码构建，但目前官方仅发布 Windows 版本。
+> GitHub Actions 发布流水线会自动并行构建 Windows（NSIS 安装包 + 便携版 `.zip`）、macOS（`arm64` / `x64` `.dmg`）与 Linux（`.deb` + 便携版 `.tar.gz`）三端发行包。
 
 ## 命令行模式
 
