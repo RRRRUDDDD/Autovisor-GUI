@@ -1,4 +1,5 @@
 import json
+import threading
 import time
 import unittest
 
@@ -196,6 +197,40 @@ class CasSsoTests(unittest.TestCase):
         )
         with self.assertRaises(SessionExpiredError):
             client.ensure_exam_sso()
+
+    def test_concurrent_ensure_exam_sso_logs_in_once(self):
+        client = self._client(
+            [
+                FakeResponse(
+                    status_code=302,
+                    headers={"Location": "/cas/login?ticket=ST-1"},
+                ),
+                FakeResponse(status_code=200),
+            ]
+        )
+        errors = []
+
+        def worker():
+            try:
+                client.ensure_exam_sso()
+            except Exception as exc:  # pragma: no cover - 不应发生
+                errors.append(exc)
+
+        threads = [threading.Thread(target=worker) for _ in range(8)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+
+        self.assertEqual(errors, [])
+        self.assertEqual(len(client.session.calls), 2)
+        self.assertTrue(client._exam_sso_ready)
+
+    def test_lock_is_reentrant(self):
+        client = ZhsApiClient([])
+        with client.lock:
+            with client.lock:
+                pass
 
     def test_verify_session_ok(self):
         client = self._client(

@@ -285,6 +285,10 @@ async function call(cmd, args = {}) {
       }
       return '[演示模式] 题库连接正常, 剩余 100 次';
     }
+    case 'export_question_cache':
+      return 'C:\\Autovisor\\autovisor-question-bank.json';
+    case 'import_question_cache':
+      return { ok: true, zhidao_questions: 0, ai_questions: 0 };
     case 'fetch_llm_models': {
       const llm = args.llm || {};
       const apiKey = String(llm.apiKey || '').trim();

@@ -15,6 +15,7 @@ except ImportError:  # pragma: no cover - 运行环境缺失 requests 时整体�
     requests = None
 
 from modules.logger import Logger
+from modules.http_utils import build_requests_proxies
 
 logger = Logger()
 
@@ -99,7 +100,6 @@ class QuestionBankClient:
         proxy="",
         timeout=8.0,
         session=None,
-        clock=None,
     ):
         self.token = _clean(token)
         self.query_url = _clean(query_url) or DEFAULT_QUERY_URL
@@ -119,7 +119,7 @@ class QuestionBankClient:
     # ------------------------------------------------------------- session
     @staticmethod
     def _derive_info_url(query_url: str) -> str:
-        head, sep, _ = query_url.rpartition("/")
+        head, sep, _ = query_url.rstrip("/").rpartition("/")
         return f"{head}/info" if sep else DEFAULT_INFO_URL
 
     def _new_session(self):
@@ -132,6 +132,12 @@ class QuestionBankClient:
 
     @staticmethod
     def _sanitize_session(session) -> None:
+        cookies = getattr(session, "cookies", None)
+        if cookies is not None:
+            try:
+                cookies.clear()
+            except Exception:
+                pass
         headers = getattr(session, "headers", None)
         if headers is None:
             return
@@ -148,18 +154,32 @@ class QuestionBankClient:
         except Exception:
             pass
 
-    def _get_json(self, url: str, params: dict):
+    def _request_json(self, url: str, params: dict):
+        """返回 (payload, error); error 为 None 表示拿到了合法 JSON 响应."""
         if self.session is None:
-            return None
+            return None, "disabled"
         kwargs = {"params": params, "timeout": self.timeout}
-        if self.proxy:
-            kwargs["proxies"] = {"http": self.proxy, "https": self.proxy}
+        proxies = build_requests_proxies(self.proxy)
+        if proxies:
+            kwargs["proxies"] = proxies
         try:
             response = self.session.get(url, **kwargs)
-            return response.json()
         except Exception as exc:
             logger.debug(f"题库请求失败({url}): {exc}")
-            return None
+            return None, "network"
+        status = getattr(response, "status_code", 200)
+        if isinstance(status, int) and status >= 400:
+            logger.debug(f"题库请求失败({url}): HTTP {status}")
+            return None, "http"
+        try:
+            return response.json(), None
+        except Exception as exc:
+            logger.debug(f"题库响应不是合法 JSON({url}): {exc}")
+            return None, "json"
+
+    def _get_json(self, url: str, params: dict):
+        payload, _ = self._request_json(url, params)
+        return payload
 
     # ------------------------------------------------------------ balance
     @property
@@ -189,9 +209,22 @@ class QuestionBankClient:
         """连通性自检: 只读 GET /info, 不查询题目、不消耗次数."""
         if not self.enabled():
             return {"ok": False, "message": "未配置第三方题库 Token"}
-        payload = self._get_json(self.info_url, {"token": self.token})
-        if not isinstance(payload, dict):
+        payload, error = self._request_json(self.info_url, {"token": self.token})
+        if error == "http":
+            return {"ok": False, "message": "题库请求失败, 请检查查询地址或 Token"}
+        if error == "network":
             return {"ok": False, "message": "题库请求失败, 请检查网络或查询地址"}
+        if not isinstance(payload, dict):
+            return {"ok": False, "message": "题库响应无效, 请检查查询地址"}
+        code = payload.get("code")
+        if code is not None:
+            try:
+                code_value = int(code)
+            except (TypeError, ValueError):
+                code_value = None
+            if code_value == 0:
+                message = payload.get("message") or payload.get("msg") or "Token 无效或已过期"
+                return {"ok": False, "message": str(message)}
         remaining = _extract_remaining(payload)
         if remaining is None:
             return {"ok": True, "remaining": None, "message": "题库连接正常"}

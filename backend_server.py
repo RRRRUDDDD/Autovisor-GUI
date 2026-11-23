@@ -746,19 +746,27 @@ class TaskManager:
         with self._lock:
             logger.emit_debug = self._debug_log_enabled
         Autovisor.logger = logger
-        log_file = logger.start_new_run()
-        logger.set_event_sink(self.on_logger_event)
-        progress.set_progress_sink(self.on_progress)
-
-        with self._lock:
-            self._active_task = asyncio.current_task()
-            self._active_logger = logger
-            self._state["logFilePath"] = log_file
-            self._broadcast_locked()
 
         exit_code = 0
         error_msg = ""
+        log_file = ""
         try:
+            config_path = os.path.join(self.data_dir, "config.ini")
+            mirrors_path = os.path.join(self.data_dir, "data", "mirrors.json")
+            created_files = ensure_config_files(config_path)
+            config = Config(config_path, mirrors_path)
+            # 先按用户配置维护旧日志, 再切换本轮日志, 避免用默认保留期误删
+            logger.configure_from_config(config)
+            log_file = logger.start_new_run()
+            logger.set_event_sink(self.on_logger_event)
+            progress.set_progress_sink(self.on_progress)
+
+            with self._lock:
+                self._active_task = asyncio.current_task()
+                self._active_logger = logger
+                self._state["logFilePath"] = log_file
+                self._broadcast_locked()
+
             logger.section("初始化")
             logger.event(
                 "运行环境",
@@ -773,13 +781,8 @@ class TaskManager:
                 日志文件=log_file,
             )
             installer.validate_python_version()
-            config_path = os.path.join(self.data_dir, "config.ini")
-            mirrors_path = os.path.join(self.data_dir, "data", "mirrors.json")
-            created_files = ensure_config_files(config_path)
             for path in created_files:
                 logger.info(f"已生成默认配置文件: {path}", shift=True)
-            config = Config(config_path, mirrors_path)
-            logger.configure_from_config(config)
             cfg_debug = bool(getattr(config, "enableDebugLog", False))
             with self._lock:
                 debug_enabled = cfg_debug or self._debug_log_enabled
@@ -1012,11 +1015,11 @@ class BackendRequestHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def _read_json_body(self) -> dict:
+    def _read_json_body(self, max_bytes: int = 2 * 1024 * 1024) -> dict:
         length = int(self.headers.get("Content-Length") or "0")
         if length <= 0:
             return {}
-        if length > 2 * 1024 * 1024:
+        if length > max_bytes:
             raise ValueError("请求体过大")
         raw = self.rfile.read(length)
         if not raw:
@@ -1074,7 +1077,9 @@ class BackendRequestHandler(BaseHTTPRequestHandler):
 
         path = urlparse(self.path).path
         try:
-            body = self._read_json_body()
+            # 题库缓存导入包含全部历史题目, 单独放宽上限; 其他接口保持 2MB 保护
+            body_limit = 20 * 1024 * 1024 if path == "/api/cache/import" else 2 * 1024 * 1024
+            body = self._read_json_body(max_bytes=body_limit)
         except Exception as exc:
             self._send_json(HTTPStatus.BAD_REQUEST, {"error": f"无效请求体: {exc}"})
             return

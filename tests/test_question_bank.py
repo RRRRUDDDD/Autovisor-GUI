@@ -30,8 +30,9 @@ HOMEWORK_QUESTION = {
 
 
 class _Response:
-    def __init__(self, payload):
+    def __init__(self, payload, status=200):
         self.payload = payload
+        self.status_code = status
 
     def json(self):
         if isinstance(self.payload, Exception):
@@ -111,6 +112,57 @@ class QuestionBankClientTests(unittest.TestCase):
         result = client.probe()
         self.assertFalse(result["ok"])
         self.assertIn("失败", result["message"])
+
+    def test_probe_rejects_http_error_statuses(self):
+        for status in (401, 403, 500):
+            with self.subTest(status=status):
+
+                def handler(url, kwargs, code=status):
+                    return _Response({"code": 1, "data": {"times": 5}}, status=code)
+
+                client, _ = self._client(handler)
+                result = client.probe()
+                self.assertFalse(result["ok"])
+                self.assertIn("失败", result["message"])
+
+    def test_probe_rejects_invalid_token_code_zero(self):
+        def handler(url, kwargs):
+            return _Response({"code": 0, "message": "token 无效"})
+
+        client, _ = self._client(handler)
+        result = client.probe()
+        self.assertFalse(result["ok"])
+        self.assertIn("token 无效", result["message"])
+
+    def test_info_url_ignores_trailing_slash(self):
+        client = qb.QuestionBankClient(
+            token=TOKEN, query_url="https://bank.example/query/"
+        )
+        self.assertEqual(client.info_url, "https://bank.example/info")
+
+    def test_proxy_is_shared_with_requests_helper(self):
+        def handler(url, kwargs):
+            return _Response({"code": 1, "data": {"times": 1}})
+
+        client, session = self._client(handler, proxy="http://127.0.0.1:7890")
+        client.probe()
+        self.assertEqual(
+            session.calls[0][1]["proxies"],
+            {"http": "http://127.0.0.1:7890", "https": "http://127.0.0.1:7890"},
+        )
+
+    def test_sanitize_session_clears_cookies(self):
+        class _Cookies:
+            def __init__(self):
+                self.cleared = False
+
+            def clear(self):
+                self.cleared = True
+
+        session = _Session(lambda url, kwargs: _Response({"code": 0}))
+        session.cookies = _Cookies()
+        qb.QuestionBankClient(token=TOKEN, session=session)
+        self.assertTrue(session.cookies.cleared)
 
     def test_info_is_lazy_loaded_once_before_first_query(self):
         def handler(url, kwargs):

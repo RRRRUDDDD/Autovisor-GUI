@@ -145,7 +145,7 @@ class ZhsApiClient:
     def __init__(self, cookies, proxy: str = "", user_agent: str = ""):
         self.proxy = proxy
         self.session = build_session(cookies, proxy, user_agent)
-        self.lock = threading.Lock()
+        self.lock = threading.RLock()
         self._exam_sso_ready = False
 
     def reset_exam_sso(self) -> None:
@@ -247,14 +247,15 @@ class ZhsApiClient:
     def _cas_login(self, service: str) -> tuple[str | None, int]:
         """请求 CAS 登录入口, 返回 (service 票据地址, HTTP 状态码)."""
         url = f"{CAS_LOGIN}?service={service}"
-        response = self.session.get(url, allow_redirects=False, timeout=REQUEST_TIMEOUT)
-        status = int(getattr(response, "status_code", 0) or 0)
-        headers = getattr(response, "headers", {}) or {}
-        location = headers.get("Location") or headers.get("location") or ""
-        if status == 302 and location and CAS_TICKET_PARAM in location:
-            target = urljoin(PASSPORT_ORIGIN, location)
-            self.session.get(target, allow_redirects=True, timeout=REQUEST_TIMEOUT)
-            return target, status
+        with self.lock:
+            response = self.session.get(url, allow_redirects=False, timeout=REQUEST_TIMEOUT)
+            status = int(getattr(response, "status_code", 0) or 0)
+            headers = getattr(response, "headers", {}) or {}
+            location = headers.get("Location") or headers.get("location") or ""
+            if status == 302 and location and CAS_TICKET_PARAM in location:
+                target = urljoin(PASSPORT_ORIGIN, location)
+                self.session.get(target, allow_redirects=True, timeout=REQUEST_TIMEOUT)
+                return target, status
         return None, status
 
     def ensure_exam_sso(self, force: bool = False) -> None:
@@ -262,13 +263,14 @@ class ZhsApiClient:
 
         已换票则直接返回; force=True 时会重置状态重新换票.
         """
-        if self._exam_sso_ready and not force:
-            return
-        ticket_url, _ = self._cas_login(EXAM_SSO_SERVICE)
-        if not ticket_url:
-            self._exam_sso_ready = False
-            raise SessionExpiredError("CAS 未签发考试会话票据, 请重新登录智慧树.")
-        self._exam_sso_ready = True
+        with self.lock:
+            if self._exam_sso_ready and not force:
+                return
+            ticket_url, _ = self._cas_login(EXAM_SSO_SERVICE)
+            if not ticket_url:
+                self._exam_sso_ready = False
+                raise SessionExpiredError("CAS 未签发考试会话票据, 请重新登录智慧树.")
+            self._exam_sso_ready = True
 
     def verify_session_status(self) -> SessionStatus:
         """用 CAS + getLoginUserInfo 判断登录态: OK / EXPIRED / UNAVAILABLE.

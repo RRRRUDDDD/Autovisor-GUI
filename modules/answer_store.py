@@ -608,6 +608,8 @@ class AiQuestionStore:
             ]
             if auto_clear_wrong:
                 assignments.append("wrong_options='[]'")
+                if ai_analysis is None:
+                    assignments.append("ai_analysis=''")
             if ai_analysis is not None:
                 assignments.append("ai_analysis=?")
                 args.append(_as_text(ai_analysis))
@@ -970,13 +972,29 @@ class AiQuestionStore:
         now = time.time()
 
         def action(conn):
-            row = self._find_zhidao(
-                conn,
-                course_id,
-                exam_id,
-                eid=None if eid is None else str(eid),
-                question_id=None if question_id is None else str(question_id),
-            )
+            eid_row = None
+            qid_row = None
+            if eid is not None:
+                eid_row = self._find_zhidao(
+                    conn, course_id, exam_id, eid=str(eid)
+                )
+            if question_id is not None:
+                qid_row = self._find_zhidao(
+                    conn, course_id, exam_id, question_id=str(question_id)
+                )
+            row = eid_row or qid_row
+            if (
+                eid_row is not None
+                and qid_row is not None
+                and eid_row["id"] != qid_row["id"]
+            ):
+                keep, drop = (
+                    (eid_row, qid_row) if eid_row["id"] < qid_row["id"] else (qid_row, eid_row)
+                )
+                conn.execute("DELETE FROM zhidao_questions WHERE id=?", (drop["id"],))
+                row = conn.execute(
+                    "SELECT * FROM zhidao_questions WHERE id=?", (keep["id"],)
+                ).fetchone()
             if row is None and hashed:
                 sql = (
                     "SELECT * FROM zhidao_questions WHERE course_id=? AND exam_id=? "

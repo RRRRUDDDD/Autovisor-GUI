@@ -255,6 +255,12 @@ export function normalizeConfig(raw) {
   const llmStreamIdleTimeout = Number(
     rawLlm.streamIdleTimeout ?? rawLlm.stream_idle_timeout
   );
+  const llmStreamTotal =
+    Number.isFinite(llmStreamTimeout) && llmStreamTimeout > 0 ? llmStreamTimeout : 120;
+  const llmStreamIdle =
+    Number.isFinite(llmStreamIdleTimeout) && llmStreamIdleTimeout > 0
+      ? llmStreamIdleTimeout
+      : 30;
   const llm = {
     provider: llmProvider,
     apiFormat: llmApiFormat,
@@ -264,12 +270,8 @@ export function normalizeConfig(raw) {
     visionModel: String(rawLlm.visionModel ?? rawLlm.vision_model ?? '').trim(),
     apiVersion: String(rawLlm.apiVersion ?? rawLlm.api_version ?? '').trim(),
     autoSubmit: Boolean(rawLlm.autoSubmit ?? rawLlm.auto_submit),
-    streamTimeout:
-      Number.isFinite(llmStreamTimeout) && llmStreamTimeout > 0 ? llmStreamTimeout : 120,
-    streamIdleTimeout:
-      Number.isFinite(llmStreamIdleTimeout) && llmStreamIdleTimeout > 0
-        ? llmStreamIdleTimeout
-        : 30,
+    streamTimeout: llmStreamTotal,
+    streamIdleTimeout: Math.min(llmStreamIdle, llmStreamTotal),
     questionBankToken: String(
       rawLlm.questionBankToken ?? rawLlm.question_bank_token ?? ''
     ).trim(),
@@ -333,13 +335,13 @@ export function normalizeConfig(raw) {
     logMaxSizeMb:
       Number.isFinite(logMaxSizeMb) && logMaxSizeMb > 0 ? Math.round(logMaxSizeMb) : 10,
     logRetentionDays:
-      Number.isFinite(logRetentionDays) && logRetentionDays > 0
+      Number.isFinite(logRetentionDays) && logRetentionDays >= 0
         ? Math.round(logRetentionDays)
         : 14,
     logMaxFiles:
       Number.isFinite(logMaxFiles) && logMaxFiles > 0 ? Math.round(logMaxFiles) : 200,
     logCompressAfterDays:
-      Number.isFinite(logCompressAfterDays) && logCompressAfterDays > 0
+      Number.isFinite(logCompressAfterDays) && logCompressAfterDays >= 0
         ? Math.round(logCompressAfterDays)
         : 3,
     llm,

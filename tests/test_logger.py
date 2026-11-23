@@ -5,6 +5,7 @@ import tempfile
 import threading
 import time
 import unittest
+from types import SimpleNamespace
 from unittest import mock
 
 from modules.logger import Logger, redact_sensitive
@@ -252,6 +253,33 @@ class LogRotationTests(unittest.TestCase):
             logger.filename = orig_filename
 
 
+class LoggerInitTests(unittest.TestCase):
+    ATTRS = (
+        "MAX_LOG_SIZE_MB",
+        "LOG_RETENTION_DAYS",
+        "LOG_COMPRESS_AFTER_DAYS",
+        "MAX_LOG_FILES",
+    )
+
+    def test_init_does_not_maintain_existing_logs(self):
+        logger = Logger()
+        saved = (logger.filename, logger.log_dir, logger.runtime_root)
+        saved_class = {name: getattr(Logger, name) for name in self.ATTRS}
+
+        def restore():
+            logger.filename, logger.log_dir, logger.runtime_root = saved
+            for name, value in saved_class.items():
+                setattr(Logger, name, value)
+
+        self.addCleanup(restore)
+        with mock.patch.object(Logger, "_maintain_logs") as maintain, mock.patch.object(
+            Logger, "_open_new_log_file", return_value="Log1.txt"
+        ) as opener:
+            logger._init()
+        maintain.assert_not_called()
+        opener.assert_called_once()
+
+
 class LogProductionTests(unittest.TestCase):
     """Phase 1.5: 体积轮转、保留期清理、gzip 归档与脱敏。"""
 
@@ -352,6 +380,56 @@ class LogProductionTests(unittest.TestCase):
         with gzip.open(os.path.join(self.tmp, "Log1.txt.gz"), "rt", encoding="utf-8") as file:
             self.assertEqual(file.read(), "需要归档的内容")
         self.assertIn("Log2.txt", files)
+
+    def test_maintain_purges_expired_logs_before_compressing(self):
+        self._set("LOG_RETENTION_DAYS", 2.0)
+        self._set("LOG_COMPRESS_AFTER_DAYS", 1.0)
+        expired = os.path.join(self.tmp, "Log2.txt")
+        with open(expired, "w", encoding="utf-8") as file:
+            file.write("超过保留期但同样超过压缩期")
+        now = time.time()
+        os.utime(expired, (now - 5 * 86400, now - 5 * 86400))
+
+        self.logger._maintain_logs()
+
+        files = self._files()
+        self.assertNotIn("Log2.txt", files)
+        # 先删后压: 不应留下刚刚生成的 .gz 归档
+        self.assertNotIn("Log2.txt.gz", files)
+
+    def test_configure_from_config_applies_user_retention_immediately(self):
+        within_user_window = os.path.join(self.tmp, "Log2.txt")
+        with open(within_user_window, "w", encoding="utf-8") as file:
+            file.write("20 天前")
+        beyond_user_window = os.path.join(self.tmp, "Log3.txt")
+        with open(beyond_user_window, "w", encoding="utf-8") as file:
+            file.write("40 天前")
+        now = time.time()
+        os.utime(within_user_window, (now - 20 * 86400, now - 20 * 86400))
+        os.utime(beyond_user_window, (now - 40 * 86400, now - 40 * 86400))
+
+        saved = {name: getattr(Logger, name) for name in self.ATTRS}
+
+        def restore():
+            for name, value in saved.items():
+                setattr(Logger, name, value)
+
+        self.addCleanup(restore)
+        config = SimpleNamespace(
+            log_max_size_mb=10,
+            log_retention_days=30,
+            log_max_files=200,
+            log_compress_after_days=3,
+        )
+
+        self.logger.configure_from_config(config)
+
+        files = self._files()
+        # 20 天超过默认 14 天但未超过用户配置的 30 天: 必须保留(压缩归档)
+        self.assertIn("Log2.txt.gz", files)
+        # 40 天超过用户配置的 30 天: 立即清理
+        self.assertNotIn("Log3.txt", files)
+        self.assertNotIn("Log3.txt.gz", files)
 
     def test_redaction_covers_keys_cookies_proxy_and_url_query(self):
         self.logger.write_log("Authorization: Bearer sk-abcdefgh12345678\n")

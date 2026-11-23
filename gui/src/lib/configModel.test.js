@@ -153,6 +153,8 @@ describe('configModel', () => {
     expect(normalizeConfig({}).logCompressAfterDays).toBe(3);
     expect(normalizeConfig({ logMaxSizeMb: 5, logRetentionDays: 7 }).logMaxSizeMb).toBe(5);
     expect(normalizeConfig({ logMaxFiles: 500 }).logMaxFiles).toBe(500);
+    expect(normalizeConfig({ logRetentionDays: 0 }).logRetentionDays).toBe(0);
+    expect(normalizeConfig({ logCompressAfterDays: 0 }).logCompressAfterDays).toBe(0);
     expect(normalizeConfig({}).llm.streamTimeout).toBe(120);
     expect(normalizeConfig({}).llm.streamIdleTimeout).toBe(30);
     expect(normalizeConfig({}).llm.questionBankToken).toBe('');
@@ -167,6 +169,10 @@ describe('configModel', () => {
     });
     expect(llmOverrides.llm.streamTimeout).toBe(60);
     expect(llmOverrides.llm.streamIdleTimeout).toBe(15);
+    expect(
+      normalizeConfig({ llm: { streamTimeout: 10, streamIdleTimeout: 30 } }).llm
+        .streamIdleTimeout
+    ).toBe(10);
     expect(llmOverrides.llm.questionBankToken).toBe('bank-token');
     expect(llmOverrides.llm.questionBankUrl).toBe('https://tk.example.com/query');
     expect(cfg.llm).toEqual({

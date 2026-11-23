@@ -333,6 +333,79 @@ class ExportImportTests(StoreTestCase):
         self.assertEqual(row["ai_analysis"], "解析一")
 
 
+    def test_import_with_both_keys_merges_conflicting_rows(self):
+        store, _ = self.make_store()
+        store.save_options_by_eid(
+            "course-1", "exam-1", "E-9", OPTIONS, content="按 eid 的题干"
+        )
+        store.save_options_by_id(
+            "course-1",
+            "exam-1",
+            "Q-9",
+            [{"id": 21, "content": "另一组选项"}],
+            content="按数字 id 的题干",
+        )
+        payload = {
+            "zhidao_questions": [
+                {
+                    "course_id": "course-1",
+                    "exam_id": "exam-1",
+                    "eid": "E-9",
+                    "question_id": "Q-9",
+                    "content": "合并后的题干",
+                    "options": OPTIONS,
+                    "correct_options": [11],
+                }
+            ]
+        }
+
+        counts = store.import_data(payload)
+
+        self.assertEqual(counts["zhidao_questions"], 1)
+        row = store.get_by_eid("course-1", "E-9", exam_id="exam-1")
+        self.assertEqual(row["question_id"], "Q-9")
+        self.assertEqual(row["content"], "合并后的题干")
+        self.assertEqual(row["correct_options"], [11])
+        self.assertEqual(store.stats("course-1")["zhidao_questions"], 1)
+
+
+class MarkCorrectTests(StoreTestCase):
+    def test_mark_correct_clears_stale_ai_analysis(self):
+        store, _ = self.make_store()
+        store.save_options_by_eid(
+            "course-1", "exam-1", "E-1", OPTIONS, content="题干一"
+        )
+        store.mark_correct(
+            "course-1",
+            "exam-1",
+            eid="E-1",
+            correct_options=[11],
+            ai_analysis="旧解析",
+        )
+        row = store.get_by_eid("course-1", "E-1", exam_id="exam-1")
+        self.assertEqual(row["ai_analysis"], "旧解析")
+
+        store.mark_correct("course-1", "exam-1", eid="E-1", correct_options=[12])
+
+        row = store.get_by_eid("course-1", "E-1", exam_id="exam-1")
+        self.assertEqual(row["ai_analysis"], "")
+
+    def test_mark_correct_keeps_explicit_analysis(self):
+        store, _ = self.make_store()
+        store.save_options_by_eid(
+            "course-1", "exam-1", "E-2", OPTIONS, content="题干二"
+        )
+        store.mark_correct(
+            "course-1",
+            "exam-1",
+            eid="E-2",
+            correct_options=[11],
+            ai_analysis="新解析",
+        )
+        row = store.get_by_eid("course-1", "E-2", exam_id="exam-1")
+        self.assertEqual(row["ai_analysis"], "新解析")
+
+
 class ConcurrencyTests(StoreTestCase):
     def test_threaded_writers_do_not_lose_rows(self):
         store, root = self.make_store()

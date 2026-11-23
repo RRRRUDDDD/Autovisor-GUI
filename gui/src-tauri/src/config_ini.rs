@@ -300,7 +300,8 @@ impl From<&LlmConfig> for LlmDiskConfig {
             stream_idle_timeout: normalize_positive(
                 v.stream_idle_timeout,
                 default_stream_idle_timeout(),
-            ),
+            )
+            .min(normalize_positive(v.stream_timeout, default_stream_timeout())),
             question_bank_token: v.question_bank_token.trim().to_string(),
             question_bank_url: normalize_question_bank_url(&v.question_bank_url),
         }
@@ -341,7 +342,8 @@ impl From<LlmDiskConfig> for LlmConfig {
             stream_idle_timeout: normalize_positive(
                 v.stream_idle_timeout,
                 default_stream_idle_timeout(),
-            ),
+            )
+            .min(normalize_positive(v.stream_timeout, default_stream_timeout())),
             question_bank_token: v.question_bank_token.trim().to_string(),
             question_bank_url: normalize_question_bank_url(&v.question_bank_url),
         }
@@ -613,7 +615,7 @@ pub fn parse_ini_str(content: &str) -> (AutovisorConfig, Vec<String>) {
                 }
                 "log_retention_days" => {
                     if let Ok(num) = val.parse::<i64>() {
-                        if num > 0 {
+                        if num >= 0 {
                             cfg.log_retention_days = num;
                         }
                     }
@@ -627,7 +629,7 @@ pub fn parse_ini_str(content: &str) -> (AutovisorConfig, Vec<String>) {
                 }
                 "log_compress_after_days" => {
                     if let Ok(num) = val.parse::<i64>() {
-                        if num > 0 {
+                        if num >= 0 {
                             cfg.log_compress_after_days = num;
                         }
                     }
@@ -765,13 +767,13 @@ pub fn render_ini_str(cfg: &AutovisorConfig) -> String {
         ";单个日志文件体积上限/MB, 超过后轮转 (默认:10)".to_string(),
         format!("log_max_size_mb = {}", cfg.log_max_size_mb.max(1)),
         ";日志保留天数, 过期归档清理 (默认:14)".to_string(),
-        format!("log_retention_days = {}", cfg.log_retention_days.max(1)),
+        format!("log_retention_days = {}", cfg.log_retention_days.max(0)),
         ";日志文件最大保留数量 (默认:200)".to_string(),
         format!("log_max_files = {}", cfg.log_max_files.max(1)),
         ";日志归档多少天后压缩 (默认:3)".to_string(),
         format!(
             "log_compress_after_days = {}",
-            cfg.log_compress_after_days.max(1)
+            cfg.log_compress_after_days.max(0)
         ),
         String::new(),
         "[notification]".to_string(),
@@ -1186,6 +1188,29 @@ mod tests {
         assert_eq!(parsed.log_max_files, 99);
         assert_eq!(parsed.log_compress_after_days, 2);
         assert_eq!(urls, vec!["https://studyvideoh5.zhihuishu.com/stuStudy?id=1"]);
+    }
+
+    #[test]
+    fn keeps_zero_log_limits_and_clamps_idle_timeout() {
+        let mut cfg = AutovisorConfig::default();
+        cfg.log_retention_days = 0;
+        cfg.log_compress_after_days = 0;
+
+        let rendered = render_ini_str(&cfg);
+        assert!(rendered.contains("log_retention_days = 0"));
+        assert!(rendered.contains("log_compress_after_days = 0"));
+
+        let (parsed, _) = parse_ini_str(&rendered);
+        assert_eq!(parsed.log_retention_days, 0);
+        assert_eq!(parsed.log_compress_after_days, 0);
+
+        let disk: LlmDiskConfig = serde_json::from_value(serde_json::json!({
+            "stream_timeout": 5.0,
+            "stream_idle_timeout": 60.0,
+        }))
+        .unwrap();
+        let llm = LlmConfig::from(disk);
+        assert!((llm.stream_idle_timeout - 5.0).abs() < 1e-6);
     }
 
     #[test]

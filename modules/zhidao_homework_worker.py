@@ -359,7 +359,9 @@ class ZhidaoHomeworkWorker:
             return self.question_bank
         self._question_bank_ready = True
         try:
-            self.question_bank = QuestionBankClient.from_config()
+            api_client = getattr(self.api, "client", None)
+            proxy = getattr(api_client, "proxy", "") if api_client is not None else ""
+            self.question_bank = QuestionBankClient.from_config(proxy=proxy)
         except Exception as exc:
             logger.debug(f"初始化外部题库失败: {exc}")
             self.question_bank = None

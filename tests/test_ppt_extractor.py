@@ -246,6 +246,14 @@ class DownloadTests(unittest.TestCase):
         self.assertEqual(len(session.calls), 1)
         self.assertEqual(os.listdir(self.temp_dir), [])
 
+    def test_extractor_negatively_caches_failed_url(self):
+        session = FakeDownloadSession(FakeDownloadResponse(b"PDF-1.7 data"))
+        extractor = PptExtractor(session=session, temp_dir=self.temp_dir)
+        url = "https://example.com/legacy.pptx"
+        self.assertEqual(extractor.extract_url(url), "")
+        self.assertEqual(extractor.extract_url(url), "")
+        self.assertEqual(len(session.calls), 1)
+
     def test_extractor_skips_legacy_and_splits_budget(self):
         session = FakeDownloadSession(FakeDownloadResponse(b"unused"))
         extractor = PptExtractor(

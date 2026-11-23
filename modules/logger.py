@@ -83,7 +83,6 @@ class Logger:
         self.console_debug = False
         self.emit_debug = False
         self.filename = ""
-        self._maintain_logs()
         self._open_new_log_file()
 
     def configure(
@@ -110,13 +109,15 @@ class Logger:
             cls.LOG_COMPRESS_AFTER_DAYS = max(0.0, float(compress_after_days))
 
     def configure_from_config(self, config) -> None:
-        """从 Config 实例读取日志配置 (缺失时沿用默认值)."""
+        """从 Config 实例读取日志配置后立即按用户策略维护一次旧日志."""
         self.configure(
             max_size_mb=getattr(config, "log_max_size_mb", None),
             retention_days=getattr(config, "log_retention_days", None),
             max_files=getattr(config, "log_max_files", None),
             compress_after_days=getattr(config, "log_compress_after_days", None),
         )
+        self._maintain_logs()
+        self._prune_by_count()
 
     def _log_entries(self) -> list[tuple[int, str]]:
         try:
@@ -162,10 +163,17 @@ class Logger:
             return False
 
     def _maintain_logs(self, now: float | None = None) -> None:
-        """启动时维护: 压缩旧日志、清理超期日志, 失败只告警不中断."""
+        """启动或加载配置时维护: 先清理超期日志, 再压缩旧日志."""
         now = time.time() if now is None else now
         compress_days = max(0.0, float(getattr(self, "LOG_COMPRESS_AFTER_DAYS", 0.0)))
         retention_days = max(0.0, float(getattr(self, "LOG_RETENTION_DAYS", 0.0)))
+
+        if retention_days > 0:
+            for _, path in self._log_entries():
+                if path == self.filename:
+                    continue
+                if (now - self._mtime(path)) / _DAY >= retention_days:
+                    self._remove_quietly(path)
 
         if compress_days > 0:
             for _, path in self._log_entries():
@@ -174,12 +182,16 @@ class Logger:
                 if (now - self._mtime(path)) / _DAY >= compress_days:
                     self._compress_log(path)
 
-        if retention_days > 0:
-            for _, path in self._log_entries():
-                if path == self.filename:
-                    continue
-                if (now - self._mtime(path)) / _DAY >= retention_days:
-                    self._remove_quietly(path)
+    def _prune_by_count(self) -> None:
+        """按 MAX_LOG_FILES 删除最旧日志, 不影响当前正在写入的文件."""
+        max_files = max(1, int(getattr(self, "MAX_LOG_FILES", 200)))
+        entries = sorted(
+            self._log_entries(), key=lambda item: (self._mtime(item[1]), item[0])
+        )
+        removable = [path for _, path in entries if path != self.filename]
+        excess = len(entries) - max_files
+        for path in removable[: max(0, excess)]:
+            self._remove_quietly(path)
 
     def _open_new_log_file(self):
         os.makedirs(self.log_dir, exist_ok=True)
@@ -287,16 +299,20 @@ class Logger:
         with self._write_lock:
             if not self.filename:
                 return
-            with open(self.filename, "a", encoding="utf-8") as f:
-                f.write(record)
-                f.flush()
             try:
+                with open(self.filename, "a", encoding="utf-8") as f:
+                    f.write(record)
+                    f.flush()
                 size = os.path.getsize(self.filename)
-            except OSError:
-                size = 0
+            except OSError as exc:
+                print(f"[WARN] 日志写入失败: {exc}", file=sys.stderr)
+                return
             max_bytes = float(getattr(self, "MAX_LOG_SIZE_MB", 0.0)) * _MB
             if max_bytes > 0 and size >= max_bytes:
-                self._open_new_log_file()
+                try:
+                    self._open_new_log_file()
+                except OSError as exc:
+                    print(f"[WARN] 日志轮转失败: {exc}", file=sys.stderr)
 
     def log_exception(self, msg, exc=None, shift=False):
         """记录异常: 异常类型、详情、当前运行状态和完整堆栈。"""

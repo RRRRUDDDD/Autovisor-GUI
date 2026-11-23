@@ -333,6 +333,9 @@ class PptExtractor:
         )
         if text:
             self._cache[url] = text
+        else:
+            # 负缓存: 非 .pptx 或 404 链接不必在后续轮次反复下载
+            self._cache[url] = ""
         return text
 
     def collect(
