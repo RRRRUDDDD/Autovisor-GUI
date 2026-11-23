@@ -1,0 +1,259 @@
+import json
+import time
+import unittest
+
+import requests
+
+from modules import zhidao_crypto, zhs_api
+from modules.exam_ctx import ExamApi, ExamApiError
+from modules.zhs_api import (
+    CaptchaRequiredError,
+    SessionExpiredError,
+    SessionStatus,
+    ZhsApiClient,
+    ZhsApiError,
+)
+
+SUCCESS_PAYLOADS = {
+    "home": {"code": 0},
+    "zhidao": {"code": 0},
+    "ai_exam": {"code": 0},
+    "ai_exam_submit": {},
+    "ai_task": {"code": 200},
+    "homework": {"status": "200"},
+    "zhidao_exam": {"status": "200"},
+}
+
+
+class FakeResponse:
+    def __init__(self, payload=None, status_code=200, headers=None, text="", raise_json=False):
+        self.payload = payload
+        self.status_code = status_code
+        self.headers = headers or {}
+        self.text = text or (json.dumps(payload) if payload is not None else "")
+        self._raise_json = raise_json
+
+    def json(self):
+        if self._raise_json:
+            raise ValueError("not json")
+        return self.payload
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            raise requests.HTTPError(f"HTTP {self.status_code}")
+
+    def close(self):
+        pass
+
+
+class FakeSession:
+    def __init__(self, responses=None):
+        self.responses = list(responses or [])
+        self.calls = []
+
+    def _next(self):
+        if not self.responses:
+            raise AssertionError("没有剩余的 mock 响应")
+        return self.responses.pop(0)
+
+    def get(self, url, params=None, timeout=None, allow_redirects=True):
+        self.calls.append(("GET", url, params, allow_redirects))
+        return self._next()
+
+    def post(self, url, data=None, json=None, headers=None, timeout=None, stream=False):
+        self.calls.append(("POST", url, data, json, headers))
+        return self._next()
+
+
+class StrategyQueryTests(unittest.TestCase):
+    def _client(self, response):
+        client = ZhsApiClient([])
+        client.session = FakeSession([response])
+        return client
+
+    def test_all_named_strategies_encrypt_with_their_key_and_validate(self):
+        self.assertEqual(len(zhs_api.STRATEGIES), 7)
+        for name, strategy in zhs_api.STRATEGIES.items():
+            with self.subTest(strategy=name):
+                client = self._client(FakeResponse(SUCCESS_PAYLOADS[name]))
+                ret = client.query(name, "https://example.com/api", {"courseId": 42})
+                self.assertEqual(ret, SUCCESS_PAYLOADS[name])
+                call = client.session.calls[0]
+                self.assertEqual(call[0], "POST")
+                if strategy.content_type == "json":
+                    form = json.loads(call[2])
+                else:
+                    form = call[2]
+                payload = json.loads(
+                    zhidao_crypto.decrypt(form["secretStr"], key=strategy.key)
+                )
+                self.assertEqual(payload["courseId"], 42)
+                if strategy.set_timestamp:
+                    self.assertIn("dateFormate", form)
+                    self.assertEqual(payload["dateFormate"], form["dateFormate"])
+                else:
+                    self.assertNotIn("dateFormate", form)
+                    self.assertNotIn("dateFormate", payload)
+
+    def test_legacy_exam_api_query_uses_dynamic_strategy(self):
+        api = ExamApi([])
+        api.session = FakeSession([FakeResponse({"code": 200, "data": {"ok": True}})])
+        ret = api.query(
+            "https://example.com/paper",
+            {"courseId": 1},
+            key=zhidao_crypto.AI_KEY,
+            ok_code=200,
+            content_type="json",
+        )
+        self.assertTrue(ret["data"]["ok"])
+        form = json.loads(api.session.calls[0][2])
+        payload = json.loads(
+            zhidao_crypto.decrypt(form["secretStr"], key=zhidao_crypto.AI_KEY)
+        )
+        self.assertEqual(payload["courseId"], 1)
+
+    def test_extra_fields_are_plaintext_and_not_encrypted(self):
+        client = self._client(FakeResponse({"status": "200"}))
+        client.query(
+            "homework",
+            "https://example.com/save",
+            {"questionId": 7},
+            extra_fields={"source": "1"},
+        )
+        form = client.session.calls[0][2]
+        self.assertEqual(form["source"], "1")
+        payload = json.loads(
+            zhidao_crypto.decrypt(form["secretStr"], key=zhidao_crypto.EXAM_KEY)
+        )
+        self.assertEqual(payload["questionId"], 7)
+        self.assertNotIn("source", payload)
+
+    def test_get_method_passes_form_as_params(self):
+        client = self._client(FakeResponse({"code": 0}))
+        client.query("home", "https://example.com/list", {"page": 1}, method="GET")
+        method, _url, params, _redirect = client.session.calls[0]
+        self.assertEqual(method, "GET")
+        payload = json.loads(
+            zhidao_crypto.decrypt(params["secretStr"], key=zhidao_crypto.HOME_KEY)
+        )
+        self.assertEqual(payload["page"], 1)
+
+    def test_minus_12_raises_captcha_error_only_on_zhidao_strategy(self):
+        client = self._client(FakeResponse({"code": -12, "message": "验证码"}))
+        with self.assertRaises(CaptchaRequiredError):
+            client.query("zhidao", "https://example.com", {})
+
+        client = self._client(FakeResponse({"code": -12, "message": "unknown"}))
+        with self.assertRaises(ZhsApiError) as ctx:
+            client.query("home", "https://example.com", {})
+        self.assertNotIsInstance(ctx.exception, CaptchaRequiredError)
+
+    def test_bad_status_and_unknown_strategy_fail_fast(self):
+        client = self._client(FakeResponse({"status": "500"}))
+        with self.assertRaises(ZhsApiError):
+            client.query("homework", "https://example.com", {})
+
+        client = self._client(FakeResponse({"code": 0}))
+        with self.assertRaises(ValueError):
+            client.query("not-a-strategy", "https://example.com", {})
+
+    def test_exam_api_error_alias_still_matches(self):
+        self.assertIs(ExamApiError, ZhsApiError)
+
+
+class CasSsoTests(unittest.TestCase):
+    def _client(self, responses):
+        client = ZhsApiClient([])
+        client.session = FakeSession(responses)
+        return client
+
+    def test_ensure_exam_sso_follows_ticket_and_caches(self):
+        client = self._client(
+            [
+                FakeResponse(
+                    status_code=302,
+                    headers={"Location": "/cas/login?ticket=ST-123"},
+                ),
+                FakeResponse(status_code=200),
+            ]
+        )
+        client.ensure_exam_sso()
+        self.assertTrue(client._exam_sso_ready)
+        self.assertEqual(len(client.session.calls), 2)
+        self.assertEqual(client.session.calls[1][0], "GET")
+        self.assertIn("ticket=ST-123", client.session.calls[1][1])
+
+        client.ensure_exam_sso()
+        self.assertEqual(len(client.session.calls), 2)
+
+    def test_ensure_exam_sso_raises_on_200_or_missing_ticket(self):
+        client = self._client([FakeResponse(status_code=200)])
+        with self.assertRaises(SessionExpiredError):
+            client.ensure_exam_sso()
+
+        client = self._client(
+            [FakeResponse(status_code=302, headers={"Location": "/cas/login"})]
+        )
+        with self.assertRaises(SessionExpiredError):
+            client.ensure_exam_sso()
+
+    def test_verify_session_ok(self):
+        client = self._client(
+            [
+                FakeResponse(
+                    status_code=302,
+                    headers={"Location": "https://passport.zhihuishu.com/cas/x?ticket=ST-1"},
+                ),
+                FakeResponse(status_code=200),
+                FakeResponse({"result": {"uuid": "u-1"}}),
+            ]
+        )
+        self.assertEqual(client.verify_session_status(), SessionStatus.OK)
+
+    def test_verify_session_expired(self):
+        client = self._client([FakeResponse(status_code=200)])
+        self.assertEqual(client.verify_session_status(), SessionStatus.EXPIRED)
+
+        client = self._client(
+            [
+                FakeResponse(
+                    status_code=302,
+                    headers={"Location": "/cas/x?ticket=ST-1"},
+                ),
+                FakeResponse(status_code=200),
+                FakeResponse({"result": {}}),
+            ]
+        )
+        self.assertEqual(client.verify_session_status(), SessionStatus.EXPIRED)
+
+        client = self._client(
+            [
+                FakeResponse(
+                    status_code=302,
+                    headers={"Location": "/cas/x?ticket=ST-1"},
+                ),
+                FakeResponse(status_code=200),
+                FakeResponse({}, status_code=401),
+            ]
+        )
+        self.assertEqual(client.verify_session_status(), SessionStatus.EXPIRED)
+
+    def test_verify_session_unavailable_keeps_cookie(self):
+        client = self._client(
+            [
+                FakeResponse(
+                    status_code=302,
+                    headers={"Location": "/cas/x?ticket=ST-1"},
+                ),
+                FakeResponse(status_code=200),
+                FakeResponse({}, status_code=503),
+            ]
+        )
+        self.assertEqual(client.verify_session_status(), SessionStatus.UNAVAILABLE)
+
+        client = self._client([FakeResponse({}, status_code=502)])
+        self.assertEqual(client.verify_session_status(), SessionStatus.UNAVAILABLE)
+
+
+if __name__ == "__main__":
+    unittest.main()

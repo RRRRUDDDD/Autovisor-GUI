@@ -16,6 +16,25 @@ VIDEO_KEY = b"azp53h0kft7qi78q"
 QA_KEY = b"kcGOlISPkYKRksSK"
 EXAM_KEY = b"onbfhdyvz8x7otrp"
 
+# 按密钥名索引, 供表驱动协议层与测试按策略查密钥.
+KEYS = {
+    "HOME": HOME_KEY,
+    "AI": AI_KEY,
+    "VIDEO": VIDEO_KEY,
+    "QA": QA_KEY,
+    "EXAM": EXAM_KEY,
+}
+
+
+def key_for(name: str, default: bytes | None = EXAM_KEY) -> bytes:
+    """按密钥名取密钥; 未知名返回 default 或抛 KeyError."""
+    try:
+        return KEYS[name.upper()]
+    except KeyError:
+        if default is not None:
+            return default
+        raise
+
 ZHIDAO_AI_SIGN_PREFIX = "8ZflKEagfL"
 
 

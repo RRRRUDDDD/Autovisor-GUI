@@ -20,10 +20,16 @@ from urllib.parse import unquote
 
 import requests
 
-from modules import llm, zhidao_crypto
-from modules.http_utils import build_requests_proxies, create_retry_session
+from modules import llm, zhidao_crypto, zhs_api
+from modules.http_utils import build_requests_proxies
 from modules.logger import Logger
 from modules.utils import get_runtime_path
+from modules.zhs_api import (  # noqa: F401  兼容旧的导入路径
+    CaptchaRequiredError,
+    SessionExpiredError,
+    SessionStatus,
+    build_session,
+)
 
 logger = Logger()
 
@@ -42,17 +48,6 @@ ZHIDAO_AI_HEADERS = {
     "service-code": "SI_POLYMAS",
     "Accept": "text/event-stream",
     "Content-Type": "application/json",
-}
-
-DEFAULT_HEADERS = {
-    "Accept": "*/*",
-    "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
-    "Origin": "https://ai-smart-course-student-pro.zhihuishu.com",
-    "Referer": "https://ai-smart-course-student-pro.zhihuishu.com/",
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-    ),
 }
 
 QUESTION_TYPE_NAMES = {1: "单选题", 2: "多选题", 14: "判断题"}
@@ -94,8 +89,8 @@ def _format_answer_choices(content: dict, answer_ids: list) -> str:
     return "; ".join(parts) or str(answer_ids)
 
 
-class ExamApiError(RuntimeError):
-    pass
+# 兼容旧名称: 智慧树接口异常统一由 modules.zhs_api.ZhsApiError 表示.
+ExamApiError = zhs_api.ZhsApiError
 
 
 def parse_answer_ids(text: str | None) -> list:
@@ -279,37 +274,11 @@ class AnswerBank:
             )
 
 
-def build_session(cookies, proxy: str = "", user_agent: str = "") -> requests.Session:
-    """用浏览器导出的 Cookie 构造带代理/重试的 requests 会话."""
-    session = create_retry_session(proxy, headers=dict(DEFAULT_HEADERS))
-    if user_agent:
-        session.headers["User-Agent"] = user_agent
-    if isinstance(cookies, dict):
-        cookies = [{"name": name, "value": value} for name, value in cookies.items()]
-    for cookie in cookies or []:
-        name = cookie.get("name")
-        value = cookie.get("value")
-        if not name or value is None:
-            continue
-        session.cookies.set(name, value)
-    try:
-        raw = session.cookies.get("CASLOGC")
-        if raw:
-            uuid = json.loads(unquote(raw)).get("uuid")
-            if uuid:
-                session.cookies.set(f"exitRecod_{uuid}", "2")
-    except (ValueError, TypeError):
-        pass
-    return session
-
-
-class ExamApi:
-    """带 Cookie/代理/重试的智慧树考试接口客户端."""
+class ExamApi(zhs_api.ZhsApiClient):
+    """带 Cookie/代理/重试的智慧树考试接口客户端 (复用 zhs_api 策略层)."""
 
     def __init__(self, cookies, proxy: str = "", user_agent: str = ""):
-        self.proxy = proxy
-        self.session = build_session(cookies, proxy, user_agent)
-        self.lock = threading.Lock()
+        super().__init__(cookies, proxy, user_agent)
 
     def query(
         self,
@@ -320,43 +289,23 @@ class ExamApi:
         method: str = "POST",
         content_type: str = "form",
         set_timestamp: bool = True,
+        extra_fields: dict | None = None,
     ) -> dict:
-        payload = dict(data)
-        timestamp = None
-        if set_timestamp:
-            timestamp = int(time.time()) * 1000
-            payload["dateFormate"] = timestamp
-        form = {
-            "secretStr": zhidao_crypto.encrypt(
-                json.dumps(payload, ensure_ascii=False), key=key
-            )
-        }
-        if timestamp is not None:
-            form["dateFormate"] = timestamp
-        if method == "GET":
-            with self.lock:
-                response = self.session.get(url, params=form, timeout=20)
-        elif content_type == "json":
-            with self.lock:
-                response = self.session.post(
-                    url,
-                    data=json.dumps(form),
-                    headers={"Content-Type": "application/json;charset=UTF-8"},
-                    timeout=20,
-                )
-        else:
-            with self.lock:
-                response = self.session.post(url, data=form, timeout=20)
-        response.raise_for_status()
-        try:
-            ret = response.json()
-        except ValueError as exc:
-            raise ExamApiError(f"接口返回非 JSON: {response.text[:120]}") from exc
-        if ret.get("code") != ok_code:
-            raise ExamApiError(
-                f"code={ret.get('code')} msg={ret.get('message') or ret}"
-            )
-        return ret
+        """兼容旧方法签名: 按调用参数临时构造策略后走统一 query 流程."""
+        strategy = zhs_api.QueryStrategy(
+            key=key,
+            set_timestamp=set_timestamp,
+            content_type=content_type,
+            ok_field="code",
+            ok_value=ok_code,
+        )
+        return self.execute(strategy, url, data, method=method, extra_fields=extra_fields)
+
+    def query_strategy(
+        self, strategy_name: str, url: str, data: dict, method: str = "POST", **kwargs
+    ) -> dict:
+        """按命名策略提交 (供知到作业/考试/题库等新接口使用)."""
+        return zhs_api.ZhsApiClient.query(self, strategy_name, url, data, method, **kwargs)
 
     def query_paper(self, course_id, class_id, knowledge_id) -> dict | None:
         data = {
