@@ -55,8 +55,14 @@ class VisionAnswerTests(unittest.TestCase):
             homework.parse_vision_answer("FILL: 光的折射"),
             ([], "光的折射"),
         )
+        think = "<thi" + "nk>"
+        end = "</thi" + "nk>"
         self.assertEqual(
-            homework.parse_vision_answer(" thinking推理过程\nA"),
+            homework.parse_vision_answer(f"{think}推理过程\nA{end}B"),
+            ([1], ""),
+        )
+        self.assertEqual(
+            homework.parse_vision_answer(f"{think}推理过程\nA"),
             ([0], ""),
         )
 
@@ -108,6 +114,27 @@ class HybridRoutingTests(unittest.IsolatedAsyncioTestCase):
                 stats = await homework.auto_answer_homework(_FakePage(), config=config)
         api_call.assert_not_awaited()
         self.assertEqual(stats, {"ok": 0, "fill": 0, "fail": 0})
+
+    async def test_captcha_settles_then_retries_api(self):
+        from modules.zhs_api import CaptchaRequiredError
+
+        expected = {"answered": 2, "submitted": False, "needs_vision": False}
+        attempts = {"count": 0}
+
+        async def fake_api(_page, _config, _params):
+            attempts["count"] += 1
+            if attempts["count"] == 1:
+                raise CaptchaRequiredError("需要滑块验证")
+            return expected
+
+        settle = AsyncMock(return_value=True)
+        with patch.object(homework, "_try_zhidao_api", new=fake_api):
+            with patch.object(homework, "_settle_captcha", new=settle):
+                stats = await homework.auto_answer_homework(_FakePage(), config=None)
+
+        self.assertEqual(stats, expected)
+        self.assertEqual(attempts["count"], 2)
+        settle.assert_awaited_once()
 
 
 if __name__ == "__main__":

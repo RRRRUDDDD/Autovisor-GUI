@@ -16,7 +16,11 @@ from modules.zhidao_homework_api import (
     extract_exam_questions,
     format_student_answer,
 )
-from modules.zhidao_homework_worker import ZhidaoHomeworkWorker, question_has_image
+from modules.zhidao_homework_worker import (
+    _CAPTCHA_HINTS,
+    ZhidaoHomeworkWorker,
+    question_has_image,
+)
 
 logger = Logger()
 
@@ -39,7 +43,7 @@ class ZhidaoExamWorker(ZhidaoHomeworkWorker):
         school_id="",
     ) -> None:
         answer = format_student_answer(question.get("type", 1), values)
-        self.api.save_student_answer(
+        response = self.api.save_student_answer(
             recruit_id=recruit_id,
             course_id=course_id,
             exam_id=exam_id,
@@ -49,6 +53,11 @@ class ZhidaoExamWorker(ZhidaoHomeworkWorker):
             question_type=question.get("type", 1),
             answer=answer,
         )
+        message = str((response or {}).get("message") or (response or {}).get("msg") or "")
+        if any(hint in message.lower() for hint in _CAPTCHA_HINTS):
+            from modules.zhs_api import CaptchaRequiredError
+
+            raise CaptchaRequiredError(f"考试保存答案触发人机验证: {message}")
 
     # ------------------------------------------------------------------ run
     def scan(self, flag: int = 1) -> list[dict]:
@@ -93,6 +102,28 @@ class ZhidaoExamWorker(ZhidaoHomeworkWorker):
         return results
 
     def run(
+        self,
+        *,
+        recruit_id,
+        course_id,
+        exam_id,
+        student_exam_id,
+        school_id="",
+        exam_name="",
+    ) -> dict:
+        try:
+            return self._run(
+                recruit_id=recruit_id,
+                course_id=course_id,
+                exam_id=exam_id,
+                student_exam_id=student_exam_id,
+                school_id=school_id,
+                exam_name=exam_name,
+            )
+        finally:
+            self._log_bank_stats()
+
+    def _run(
         self,
         *,
         recruit_id,
@@ -147,7 +178,7 @@ class ZhidaoExamWorker(ZhidaoHomeworkWorker):
 
         exam_key = str(exam_id)
         for question in questions:
-            row = self._remember_question(question, exam_key)
+            row = self._remember_question(question, exam_key, course_id=course_id)
             values, source = self._answer_question(question, row)
             if source in ("题库", "随机", "排除法"):
                 self.sleep(random.uniform(1.5, 3.0))

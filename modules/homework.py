@@ -32,7 +32,7 @@ VISION_PROMPT = """你是一名网课答题助手。图片是智慧树作业/考
 - 填空题: 输出「FILL: 答案原文」
 选项按图片中从上到下的顺序依次为 A、B、C、D、E、F...，不要输出解释或多余文字。"""
 
-_THINK_RE = re.compile(r"<think\b[^>]*>.*?", re.IGNORECASE | re.DOTALL)
+_THINK_RE = re.compile(r"<think\b[^>]*>.*?</thi" + "nk>", re.IGNORECASE | re.DOTALL)
 _THINK_TAG_RE = re.compile(r"</?think[^>]*>", re.IGNORECASE)
 _LETTER_TOKEN_RE = re.compile(r"^[A-H](?:[A-H])*$", re.IGNORECASE)
 _LETTER_ANSWER_RE = re.compile(
@@ -94,6 +94,20 @@ el => {
   const input = el.querySelector("input");
   if (input) return !!input.checked || active;
   return active;
+}
+"""
+
+JS_HAS_ANSWER = r"""
+el => {
+  const inputs = [...el.querySelectorAll("input")];
+  if (inputs.some(i => i.checked)) return true;
+  if (inputs.some(i => (i.value || "").trim() && i.type !== "radio" && i.type !== "checkbox")) return true;
+  const box = el.querySelector("textarea, [contenteditable=true]");
+  if (box && ((box.value || "").trim() || (box.innerText || "").trim())) return true;
+  return [...el.querySelectorAll(".nodeLab")].some(node => {
+    const cls = (node.className || "") + " " + ((node.parentElement && node.parentElement.className) || "");
+    return /(^|\s)(active|checked|selected|is-active|is-checked|is-selected)(\s|$)/.test(cls);
+  });
 }
 """
 
@@ -238,6 +252,13 @@ async def _question_type(handle) -> str:
         return str(await handle.evaluate(JS_QUESTION_TYPE) or "choice")
     except Exception:
         return "choice"
+
+
+async def _has_answer(handle) -> bool:
+    try:
+        return bool(await handle.evaluate(JS_HAS_ANSWER))
+    except Exception:
+        return False
 
 
 async def _visible_options(handle) -> list:
@@ -407,6 +428,72 @@ def _api_enabled(config, kind: str) -> bool:
     return bool(getattr(config, attr, True))
 
 
+def _captcha_modules():
+    try:
+        import numpy as np
+        import cv2
+    except Exception:
+        return None
+    return [np, cv2]
+
+
+async def _settle_captcha(page, config) -> bool:
+    """作业接口触发人机验证: 显示窗口, 自动/手动处理后再决定是否重试."""
+    from modules.slider import captcha_visible, slider_verify
+    from modules.window_control import display_window, hide_window, should_hide_window
+
+    hidden = should_hide_window(config)
+    if hidden:
+        await display_window(page)
+    logger.warn("接口作答触发人机验证, 请在浏览器中完成滑块/验证码 ...", shift=True)
+    logger.event("作业接口作答", 结果="需要人机验证")
+    logger.event("人工介入", 状态="需要", 原因="作业接口触发人机验证")
+    solved = False
+    modules = _captcha_modules() if getattr(config, "enableAutoCaptcha", True) else None
+    try:
+        if modules:
+            solved = bool(
+                await slider_verify(page, modules, appear_timeout_ms=6000, max_attempts=3)
+            )
+        if not solved:
+            deadline = time.monotonic() + 120
+            seen = False
+            while time.monotonic() < deadline:
+                visible = await captcha_visible(page)
+                seen = seen or visible
+                if seen and not visible:
+                    solved = True
+                    break
+                await page.wait_for_timeout(1000)
+    finally:
+        if hidden:
+            await hide_window(page)
+    logger.event("人工介入", 状态="已解除" if solved else "超时", 原因="作业接口人机验证")
+    return solved
+
+
+async def _try_api_with_captcha(page, config, params: dict) -> dict:
+    from modules.zhs_api import CaptchaRequiredError
+
+    last_error = None
+    for attempt in range(2):
+        try:
+            return await _try_zhidao_api(page, config, params)
+        except CaptchaRequiredError as exc:
+            last_error = exc
+            logger.warn(f"接口作答触发人机验证: {exc}")
+            logger.event(
+                "作业接口作答",
+                结果="人机验证",
+                错误=logger.summarize_exception(exc),
+            )
+            if attempt == 0 and await _settle_captcha(page, config):
+                logger.info("人机验证已处理, 重试接口作答 ...")
+                continue
+            break
+    raise last_error
+
+
 async def _try_zhidao_api(page, config, params: dict) -> dict:
     """用浏览器 Cookie 构造加密 API 客户端并同步作答, 不修改页面."""
     from modules.ai_analysis_api import AiAnalysisApi
@@ -438,7 +525,7 @@ async def _try_zhidao_api(page, config, params: dict) -> dict:
             analysis_api=AiAnalysisApi(session=client.session, proxy=proxy),
             auto_submit=auto_submit,
             target_score=float(threshold or 0),
-            max_rounds=int(max_redo or 0) or 3,
+            max_rounds=int(max_redo or 0),
         )
         return await asyncio.to_thread(
             worker.run,
@@ -480,7 +567,7 @@ async def auto_answer_homework(page, config=None) -> dict:
         logger.info("检测到知到作业/考试页, 优先使用加密 API 明文作答 ...")
         logger.event("作业接口作答", 地址=getattr(page, "url", ""), 类型=params["kind"])
         try:
-            api_stats = await _try_zhidao_api(page, config, params)
+            api_stats = await _try_api_with_captcha(page, config, params)
         except Exception as exc:
             logger.warn(f"接口作答不可用, 回退视觉模型: {exc}")
             logger.event(
@@ -500,6 +587,12 @@ async def auto_answer_homework(page, config=None) -> dict:
                 logger.event("作业接口作答汇总", **api_stats)
                 return api_stats
             logger.info("接口检测到图片题, 回退视觉模型逐题作答.")
+            answered = int(api_stats.get("answered", 0) or 0)
+            if answered:
+                try:
+                    await page.reload(wait_until="domcontentloaded", timeout=30000)
+                except Exception as exc:
+                    logger.debug(f"回退视觉前刷新页面失败: {exc}")
 
     if not llm.vision_enabled():
         logger.warn(
@@ -533,6 +626,16 @@ async def auto_answer_homework(page, config=None) -> dict:
         if question is None:
             break
         dom_sig = await _signature(question)
+        if await _has_answer(question):
+            logger.info(f"第{index}题 已有答案（接口已保存）, 跳过视觉识别.")
+            logger.event("作业答题", 题号=index, 结果="已作答跳过")
+            advanced, had_next = await _goto_next(page, dom_sig or None)
+            if advanced:
+                continue
+            if had_next and not (total and len(seen) >= total):
+                stuck = True
+                logger.warn("点击下一题后题目未切换, 停止作答.")
+            break
         qtype = await _question_type(question)
         options = await _visible_options(question)
         try:

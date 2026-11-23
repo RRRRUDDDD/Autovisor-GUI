@@ -46,6 +46,7 @@ class FakeFormalApi:
         self.query_calls = []
         self.strategy_calls = []
         self.batch_payloads = []
+        self.fail_batch = False
 
     def query(
         self,
@@ -74,6 +75,8 @@ class FakeFormalApi:
             return {"code": 0, "data": {"partSheetVos": self.parts}}
         if url == FORMAL_SAVE_BATCH:
             self.batch_payloads.append(data)
+            if self.fail_batch:
+                raise RuntimeError("batch save failed")
             return {"code": 0}
         if url == FORMAL_OPEN_DETAIL:
             return {"code": 200, "data": dict(self.detail)}
@@ -219,6 +222,47 @@ class FormalExamFlowTests(FormalExamTestCase):
             api.batch_payloads[0]["answerList"][0]["answer"], "2#@#3"
         )
         self.assertEqual(api.batch_payloads[0]["answerList"][0]["questionType"], 2)
+
+    def test_fill_question_uses_slash_separator(self):
+        parts = self.make_parts([[4001]])
+        contents = {
+            4001: {
+                "id": 4001,
+                "questionType": 3,
+                "content": "请填写两个空",
+                "optionVos": [],
+            }
+        }
+        ctx, api = self.make_ctx(parts, contents)
+        ctx.zhidao_answerer = StubAnswerer(result=["甲", "乙"])
+
+        with patch("modules.exam_ctx.time.sleep"):
+            success, answered, total = ctx.start(submit=False)
+
+        self.assertFalse(success)
+        self.assertEqual((answered, total), (1, 1))
+        item = api.batch_payloads[0]["answerList"][0]
+        self.assertEqual(item["answer"], "甲/乙")
+        self.assertEqual(item["questionType"], 3)
+
+    def test_batch_save_failure_keeps_answers_out_and_skips_submit(self):
+        parts = self.make_parts([[7001, 7002]])
+        contents = {
+            question_id: make_content(question_id) for question_id in (7001, 7002)
+        }
+        ctx, api = self.make_ctx(parts, contents, save_nums=2, auto_submit=True)
+        api.fail_batch = True
+
+        with patch("modules.exam_ctx.time.sleep"):
+            success, answered, total = ctx.start(submit=True)
+
+        self.assertFalse(success)
+        self.assertEqual(answered, 0)
+        self.assertEqual(total, 2)
+        self.assertEqual(len(api.batch_payloads), 1)
+        self.assertEqual(ctx._failed_saves, 2)
+        self.assertNotIn(EXAM_SUBMIT, api.urls())
+        self.assertEqual(ctx._answered, {})
 
     def test_submit_false_skips_submit_and_detail(self):
         parts = self.make_parts([[3001]])

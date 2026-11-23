@@ -114,6 +114,14 @@ def _format_answer_choices(content: dict, answer_ids: list) -> str:
 ExamApiError = zhs_api.ZhsApiError
 
 
+def answer_separator(question_type) -> str:
+    """填空题多空用 "/" 拼接, 其余题型沿用 "#@#"."""
+    try:
+        return "/" if int(question_type) == 3 else "#@#"
+    except (TypeError, ValueError):
+        return "#@#"
+
+
 def parse_answer_ids(text: str | None) -> list:
     """从 ```answer`` 代码块或裸 JSON/列表文本里解析出选项 id."""
     raw = (text or "").strip()
@@ -670,7 +678,7 @@ class AiExamBase(ABC):
             logger.error(f"读取题目失败: {question_id} {exc}")
             return None
 
-    def save_answer(self, question_id, answers: list) -> bool:
+    def save_answer(self, question_id, answers: list, question_type=None) -> bool:
         if not answers:
             return False
         data = {
@@ -679,7 +687,9 @@ class AiExamBase(ABC):
             "examPaperId": self.exam_paper_id,
             "questionId": question_id,
             "dataVos": None,
-            "answer": "#@#".join(str(answer) for answer in answers),
+            "answer": answer_separator(question_type).join(
+                str(answer) for answer in answers
+            ),
         }
         try:
             self.api.query(EXAM_SAVE_ANSWER, data)
@@ -776,6 +786,43 @@ class AiExamBase(ABC):
             logger.debug(f"{name} 返回的答案不在选项内, 继续兜底.")
         raise ValueError("AI 未给出可用的选项 id")
 
+    def _generate_fill_answer(self, question: dict) -> list:
+        prompt = (
+            "假设你是一名学生, 正在参加线上考试, 需要严格按要求完成一道填空题。\n"
+            f"题目：{extract_plain_text(question.get('content', ''))}\n"
+            "本题为填空题, 可能有多个空。只输出 markdown 代码块, 按空的顺序给出答案：\n"
+            '```answer\n["答案一", "答案二"]\n```\n'
+            "代码块外不要写任何解释。"
+        )
+        for name, answerer in (
+            ("智慧树AI", self.zhidao_answerer),
+            (llm.provider_label(), self.deepseek_answerer),
+        ):
+            if name != "智慧树AI" and self._llm_disabled:
+                continue
+            try:
+                values = answerer.answer(prompt)
+            except llm.NonRetryableLLMError as exc:
+                if name != "智慧树AI":
+                    self._llm_disabled = True
+                    if not self._llm_warned:
+                        self._llm_warned = True
+                        logger.warn(
+                            f"自定义大模型不可用({exc}), 本试卷后续题目将跳过 LLM 直接降级.",
+                            shift=True,
+                        )
+                logger.debug(f"{name} 填空作答快速失败: {exc}")
+                continue
+            except Exception as exc:
+                logger.debug(f"{name} 填空作答失败: {exc}")
+                continue
+            cleaned = [str(item).strip() for item in values if str(item).strip()]
+            if cleaned:
+                self._last_ai_provider = name
+                return cleaned
+            logger.debug(f"{name} 未给出有效填空答案, 继续兜底.")
+        raise ValueError("AI 未给出有效的填空答案")
+
     def _cached_answer(
         self, question: dict, question_id, version: int, valid_ids: set
     ) -> list | None:
@@ -841,6 +888,12 @@ class AiExamBase(ABC):
             time.sleep(random.uniform(1.5, 3.0))
             return cached_ids, "题库"
 
+        if question_type == 3 and not choices:
+            try:
+                return self._generate_fill_answer(question), "AI"
+            except Exception as exc:
+                logger.warn(f"题目 {question_id} 填空作答失败: {exc}")
+                return [], "填空"
         if not choices:
             raise ValueError(f"题目 {question_id} 没有可选项")
         if len(choices) < 2:
@@ -863,8 +916,9 @@ class AiExamBase(ABC):
     def _fetch_sheet_items(self) -> list:
         """读取答题卡并展开为题目列表 (questionId/version)."""
 
-    def _flush_pending(self) -> None:
+    def _flush_pending(self) -> bool:
         """把暂存答案写入服务端; 逐题保存的子类无需实现."""
+        return True
 
     @abstractmethod
     def _finish(self, submit: bool, sheets: list):
@@ -873,7 +927,11 @@ class AiExamBase(ABC):
     def _on_answered(
         self, item: dict, content: dict, answers: list, source: str, index: int, total: int
     ) -> bool:
-        saved = self.save_answer(item["questionId"], answers)
+        saved = self.save_answer(
+            item["questionId"],
+            answers,
+            question_type=content.get("questionType", item.get("questionType")),
+        )
         self._log_answer(item, content, answers, source, index, total, saved)
         return saved
 
@@ -927,7 +985,15 @@ class AiExamBase(ABC):
             logger.info(f"开始{self.exam_label}作答: 试卷 {self.exam_paper_id}, 共 {total} 题.")
             logger.event(f"{self.exam_label}开始", 试卷=self.exam_paper_id, 题目=total)
             self._answer_questions(sheets)
-            self._flush_pending()
+            flushed = self._flush_pending()
+            if submit and (not flushed or getattr(self, "_failed_saves", 0)):
+                logger.warn("存在未成功保存的答案, 为避免丢失作答放弃自动交卷.")
+                logger.event(
+                    "接口考试",
+                    结果="放弃自动交卷",
+                    失败题数=getattr(self, "_failed_saves", 0),
+                )
+                submit = False
             return self._finish(submit, sheets)
         finally:
             self._stopped.set()
@@ -1083,6 +1149,7 @@ class AiFormalExamCtx(AiExamBase):
         self.auto_submit = bool(auto_submit)
         self._pending: list[dict] = []
         self._answered: dict[str, dict] = {}
+        self._failed_saves = 0
 
     @classmethod
     def from_task(
@@ -1199,15 +1266,18 @@ class AiFormalExamCtx(AiExamBase):
     def _on_answered(
         self, item: dict, content: dict, answers: list, source: str, index: int, total: int
     ) -> bool:
+        question_type = content.get(
+            "questionType", item.get("questionType", 1)
+        )
         entry = {
             "recruitId": self.course_id,
             "examTestId": self.exam_test_id,
             "examPaperId": self.exam_paper_id,
             "questionId": item["questionId"],
-            "answer": "#@#".join(str(answer) for answer in answers),
-            "questionType": content.get(
-                "questionType", item.get("questionType", 1)
+            "answer": answer_separator(question_type).join(
+                str(answer) for answer in answers
             ),
+            "questionType": question_type,
             "dataVos": None,
         }
         self._pending.append(entry)
@@ -1217,11 +1287,28 @@ class AiFormalExamCtx(AiExamBase):
             self._flush_pending()
         return True
 
-    def _flush_pending(self) -> None:
+    def _flush_pending(self) -> bool:
+        failed: list[dict] = []
         while self._pending:
             batch = self._pending[: self.save_nums]
             del self._pending[: self.save_nums]
-            self.save_batch_answer(batch)
+            if self.save_batch_answer(batch):
+                continue
+            logger.warn(
+                f"批量保存 {len(batch)} 题答案失败, 已从待提交队列移除并保留告警."
+            )
+            failed.extend(batch)
+            self._failed_saves += len(batch)
+            for entry in batch:
+                self._answered.pop(str(entry.get("questionId")), None)
+        if failed:
+            logger.event(
+                "接口答题",
+                结果="批量保存失败",
+                失败题数=len(failed),
+            )
+            return False
+        return True
 
     def save_batch_answer(self, answer_list: list[dict]) -> bool:
         if not answer_list:

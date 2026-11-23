@@ -94,17 +94,37 @@ class FakeHomeworkApi:
                             "questionDtos": [
                                 {
                                     "eid": "q1",
+                                    "id": "q1",
+                                    "name": "1+1=?",
+                                    "questionType": {"id": 1},
+                                    "questionOptions": [
+                                        {"id": 11, "content": "1"},
+                                        {"id": 12, "content": "2"},
+                                        {"id": 13, "content": "3"},
+                                    ],
                                     "isCorrect": 0,
                                     "userAnswerVo": {"answer": "11"},
                                 },
                                 {
                                     "eid": "q2",
+                                    "id": "q2",
+                                    "name": "选出偶数",
+                                    "questionType": {"id": 2},
+                                    "questionOptions": [
+                                        {"id": 21, "content": "2"},
+                                        {"id": 22, "content": "4"},
+                                        {"id": 23, "content": "5"},
+                                    ],
                                     "isCorrect": 1,
                                     "correctOptions": [21, 22],
                                     "userAnswerVo": {"answer": [21, 22]},
                                 },
                                 {
                                     "eid": "q3",
+                                    "id": "q3",
+                                    "name": "写出答案",
+                                    "questionType": {"id": 3},
+                                    "questionOptions": [],
                                     "isCorrect": 0,
                                     "userAnswerVo": {"answer": "错答"},
                                 },
@@ -132,9 +152,57 @@ class FakeAnalysisApi:
         self.user_calls += 1
         return "777"
 
-    def analyze(self, question, *, user_id="", course_id="", recruit_id="", timeout=120):
-        self.analyze_calls.append((question["eid"], user_id, course_id, recruit_id))
-        return f"{question['eid']}解析"
+    def analyze(
+        self,
+        question=None,
+        *,
+        question_id="",
+        user_id="",
+        course_id="",
+        recruit_id="",
+        timeout=120,
+    ):
+        key = str(question_id or (question or {}).get("eid") or "")
+        self.analyze_calls.append((key, user_id, course_id, recruit_id))
+        return f"{key}解析"
+
+
+class BridgedHomeworkApi(FakeHomeworkApi):
+    """真实结构: doHomework 只有加密 eid, lookHomework 只返回数字 id."""
+
+    def __init__(self, payload, scores):
+        super().__init__(payload, scores)
+        self.info_question_ids = []
+
+    def look_homework(self, **kwargs):
+        self.look_calls += 1
+        return {
+            "rt": {
+                "examBase": {
+                    "workExamParts": [
+                        {
+                            "questionDtos": [
+                                {
+                                    "id": 90001,
+                                    "name": "<p>双键题</p>",
+                                    "questionType": {"id": 2},
+                                    "questionOptions": [
+                                        {"id": 11, "content": "甲"},
+                                        {"id": 12, "content": "乙"},
+                                        {"id": 13, "content": "丙"},
+                                    ],
+                                }
+                            ]
+                        }
+                    ]
+                }
+            }
+        }
+
+    def get_stu_answer_info(self, **kwargs):
+        self.info_calls += 1
+        self.info_question_ids.append(kwargs.get("question_ids"))
+        return {"rt": [{"questionId": 90001, "isRight": 0, "userAnswer": ["11"]}]}
 
 
 class ScriptedAnswerer:
@@ -321,6 +389,82 @@ class HomeworkWorkerLifecycleTests(unittest.TestCase):
         self.assertEqual(api.submit_calls, 0)
         self.assertEqual(api.look_calls, 0)
 
+    def test_bridges_encrypted_eid_to_numeric_question_id(self):
+        payload = _payload(
+            _dto("enc_1", 2, "双键题", [(11, "甲"), (12, "乙"), (13, "丙")])
+        )
+        api = BridgedHomeworkApi(payload, [40, 100])
+        analysis = FakeAnalysisApi()
+        answerer = ScriptedAnswerer([_ids(11), _ids(12)])
+        worker = self._worker(api, answerer, analysis, target_score=100)
+        stats = worker.run(
+            recruit_id="R1",
+            course_id="C1",
+            homework_id="H1",
+            stu_exam_id="S1",
+            exam_id="E1",
+        )
+
+        self.assertTrue(stats["target_reached"])
+        self.assertEqual(stats["rounds"], 2)
+        self.assertEqual(api.info_question_ids, [["90001"]])
+        self.assertEqual(analysis.analyze_calls, [("90001", "777", "C1", "R1")])
+        # 次轮使用桥接后的数字 question_id 带来的解析与错误组合
+        self.assertIn("【错误选择方式】", answerer.prompts[1])
+        self.assertIn("甲", answerer.prompts[1])
+        self.assertIn("【历史AI解析】90001解析", answerer.prompts[1])
+        self.assertEqual([call["answer"] for call in api.saved], ["11", "12"])
+        row = self.store.get_by_eid("C1", "enc_1", "E1")
+        self.assertEqual(row["question_id"], "90001")
+        self.assertEqual(row["ai_analysis"], "90001解析")
+        self.assertEqual(row["wrong_options"], [["11"]])
+
+    def test_percent_score_uses_total_score(self):
+        payload = _payload(
+            _dto("q5", 1, "五十分制", [(51, "甲"), (52, "乙")])
+        )
+        payload["rt"]["examBase"]["totalScore"] = 50
+        api = FakeHomeworkApi(payload, [35])
+        answerer = ScriptedAnswerer([_ids(51)])
+        worker = self._worker(api, answerer, None, target_score=60)
+        stats = worker.run(
+            recruit_id="R1",
+            course_id="C1",
+            homework_id="H1",
+            stu_exam_id="S1",
+            exam_id="E1",
+        )
+
+        self.assertEqual(stats["score"], 35.0)
+        self.assertEqual(stats["score_percent"], 70.0)
+        self.assertTrue(stats["target_reached"])
+        self.assertEqual(stats["rounds"], 1)
+        self.assertEqual(api.submit_calls, 1)
+        self.assertEqual(api.look_calls, 0)
+
+    def test_fill_cache_hits_without_llm(self):
+        api = FakeHomeworkApi(_payload(_dto("f1", 3, "默写填空")), [])
+        self.store.save_options_by_eid(
+            "C1", "E1", "f1", [], question_type="3", content="默写填空"
+        )
+        self.store.mark_correct(
+            "C1", "E1", eid="f1", correct_options=["甲", "乙"]
+        )
+
+        def boom(_prompt):
+            raise AssertionError("填空命中缓存不应调用大模型")
+
+        worker = self._worker(api, boom, None, auto_submit=False)
+        stats = worker.run(
+            recruit_id="R1",
+            course_id="C1",
+            homework_id="H1",
+            stu_exam_id="S1",
+            exam_id="E1",
+        )
+        self.assertEqual(stats["answered"], 1)
+        self.assertEqual(api.saved[0]["answer"], "甲/乙")
+
 
 class PromptAndParseTests(unittest.TestCase):
     def test_parse_homework_answer_supports_ids_letters_and_text(self):
@@ -335,6 +479,20 @@ class PromptAndParseTests(unittest.TestCase):
     def test_parse_fill_answer(self):
         question = _normalized("q", 3, "填空")
         self.assertEqual(parse_homework_answer(_fills("甲", "乙"), question), ([], ["甲", "乙"]))
+
+    def test_think_block_content_is_ignored(self):
+        think = "<thi" + "nk>"
+        end = "</thi" + "nk>"
+        question = _normalized("q", 2, "题", [(101, "甲"), (102, "乙")])
+        reply = (
+            f"{think}分析中选 [101] 或 [A]{end}\n"
+            '```answer\n[{"id": 102}]\n```'
+        )
+        self.assertEqual(parse_homework_answer(reply, question), (["102"], []))
+        self.assertEqual(
+            parse_homework_answer(f'{think}内部 101{end}\n["102"]', question),
+            (["102"], []),
+        )
 
     def test_prompt_injects_exclusions_combos_and_analysis(self):
         question = _normalized("q", 2, "题", [(11, "甲"), (12, "乙"), (13, "丙")])

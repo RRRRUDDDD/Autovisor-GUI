@@ -219,6 +219,68 @@ class ExamWorkerTests(unittest.TestCase):
         self.assertEqual(api.saved, [])
         self.assertEqual(api.submit_calls, [])
 
+    def test_captcha_message_raises_captcha_required(self):
+        from modules.zhs_api import CaptchaRequiredError
+
+        class CaptchaApi(FakeExamApi):
+            def save_student_answer(self, **kwargs):
+                self.saved.append(kwargs)
+                return {"message": "请完成滑块验证"}
+
+        api = CaptchaApi([])
+        worker = self._worker(api)
+        with self.assertRaises(CaptchaRequiredError):
+            worker.run(
+                recruit_id="R1",
+                course_id="C1",
+                exam_id="E1",
+                student_exam_id="S1",
+                school_id="9",
+            )
+        self.assertEqual(api.submit_calls, [])
+
+    def test_run_pending_stores_answers_under_exam_course(self):
+        exams = [
+            {
+                "examId": "E9",
+                "studentExamId": "S9",
+                "recruitId": "R9",
+                "courseId": "C9",
+                "examName": "其他课程考试",
+                "studentStartTime": "2026-11-23 10:00:00",
+            }
+        ]
+        api = FakeExamApi(exams)
+        worker = self._worker(api)
+        worker.run_pending()
+
+        self.assertIsNotNone(self.store.get_by_eid("C9", "q1", "E9"))
+        self.assertIsNone(self.store.get_by_eid("C1", "q1", "E9"))
+
+    def test_bank_stats_logged_even_when_run_fails(self):
+        class BoomApi(FakeExamApi):
+            def get_save_answer_lock_result(self, **kwargs):
+                raise RuntimeError("lock query failed")
+
+        class Bank:
+            def __init__(self):
+                self.calls = 0
+
+            def log_stats(self):
+                self.calls += 1
+
+        bank = Bank()
+        worker = self._worker(BoomApi([]), question_bank=bank)
+        with self.assertRaises(RuntimeError):
+            worker.run(
+                recruit_id="R1",
+                course_id="C1",
+                exam_id="E1",
+                student_exam_id="S1",
+                school_id="9",
+            )
+        self.assertEqual(bank.calls, 1)
+
 
 class FakeClient:
     def __init__(self):

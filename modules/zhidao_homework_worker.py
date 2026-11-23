@@ -8,28 +8,33 @@ import re
 import time
 
 from modules import llm
-from modules.answer_store import AiQuestionStore
+from modules.answer_store import AiQuestionStore, option_hash
 from modules.html_utils import extract_plain_text, has_meaningful_image
 from modules.logger import Logger
 from modules.question_bank import QuestionBankClient
 from modules.zhidao_homework_api import (
     QUESTION_TYPE_NAMES,
+    correct_option_ids,
     extract_exam_questions,
     extract_score,
     format_student_answer,
-    parse_review,
 )
 
 logger = Logger()
 
 _ANSWER_BLOCK_RE = re.compile(r"```answer\s*(.*?)```", re.DOTALL | re.IGNORECASE)
-_THINK_RE = re.compile(r"<think\b[^>]*>.*?", re.DOTALL | re.IGNORECASE)
+_THINK_RE = re.compile(
+    r"<think\b[^>]*>.*?</thi" + "nk>",
+    re.DOTALL | re.IGNORECASE,
+)
 _THINK_TAG_RE = re.compile(r"</?think[^>]*>", re.IGNORECASE)
 _LIST_RE = re.compile(r"\[.*\]", re.DOTALL)
 _LETTERS = "ABCDEFGH"
 
 ROLLBACK_RETRIES = 3
+AUTO_MAX_ROUNDS = 10
 _CAPTCHA_HINTS = ("滑块", "验证码", "captcha", "slider")
+_RESET_HINTS = ("已提交", "不能继续答题", "已交卷", "试卷已提交")
 
 
 def _plain(html_text) -> str:
@@ -131,6 +136,133 @@ def _wrong_combos(row: dict | None) -> list[list[str]]:
     return combos
 
 
+def _split_user_answer(text, question_type: int) -> list[str]:
+    raw = str(text or "")
+    separator = "/" if question_type == 3 else ","
+    parts = [item.strip() for item in raw.split(separator)]
+    if question_type == 3 and len(parts) <= 1 and "," in raw:
+        parts = [item.strip() for item in raw.split(",")]
+    return [item for item in parts if item]
+
+
+def _source_dict(payload) -> list[dict]:
+    if not isinstance(payload, dict):
+        return []
+    rt = payload.get("rt")
+    sources = []
+    if isinstance(rt, dict):
+        if isinstance(rt.get("examBase"), dict):
+            sources.append(rt["examBase"])
+        sources.append(rt)
+    sources.append(payload)
+    return sources
+
+
+def payload_needs_reset(payload) -> bool:
+    """doHomework 返回已提交/不可继续作答时, 需要先 saveCourseTran 重置."""
+    message = " ".join(
+        str(source.get(key) or "")
+        for source in _source_dict(payload)
+        for key in ("message", "msg")
+    )
+    if any(hint in message for hint in _RESET_HINTS):
+        return True
+    for source in _source_dict(payload):
+        try:
+            if int(source.get("state")) == 4:
+                return True
+        except (TypeError, ValueError):
+            continue
+    return False
+
+
+def payload_total_score(payload, default: float = 100.0) -> float:
+    for source in _source_dict(payload):
+        raw = source.get("totalScore")
+        if raw is None:
+            continue
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            continue
+        if value > 0:
+            return value
+    return default
+
+
+def payload_is_marking(payload) -> int | None:
+    for source in _source_dict(payload):
+        for key in ("isMarking", "maxRedo", "markingCount"):
+            raw = source.get(key)
+            if raw is None:
+                continue
+            try:
+                return int(raw)
+            except (TypeError, ValueError):
+                continue
+    return None
+
+
+def payload_max_redo(payload) -> int | None:
+    for source in _source_dict(payload):
+        for key in ("maxRedo", "maxRedoNum", "redoLimit"):
+            raw = source.get(key)
+            if raw is None:
+                continue
+            try:
+                value = int(raw)
+            except (TypeError, ValueError):
+                continue
+            if value > 0:
+                return value
+    return None
+
+
+def answer_info_by_question_id(payload) -> dict[str, dict]:
+    """把 getStuAnswerInfo 的条目按数字 questionId 建索引."""
+    if not isinstance(payload, dict):
+        return {}
+    entries = payload.get("rt")
+    if isinstance(entries, dict):
+        entries = (
+            entries.get("questionDtos")
+            or entries.get("stuAnswerInfos")
+            or entries.get("questions")
+            or entries.get("answerInfos")
+        )
+    result: dict[str, dict] = {}
+    for entry in entries or []:
+        if not isinstance(entry, dict):
+            continue
+        key = str(entry.get("questionId") or entry.get("id") or entry.get("eid") or "")
+        if key:
+            result[key] = entry
+    return result
+
+
+def _entry_flag(entry: dict | None, *keys) -> bool:
+    if not isinstance(entry, dict):
+        return False
+    for key in keys:
+        value = entry.get(key)
+        if value is not None:
+            return str(value).strip().lower() in {"1", "true", "yes", "y"}
+    return False
+
+
+def _entry_answer(entry: dict | None) -> str:
+    if not isinstance(entry, dict):
+        return ""
+    user = entry.get("userAnswerVo")
+    if isinstance(user, dict):
+        value = user.get("answer")
+    else:
+        value = entry.get("userAnswer") or entry.get("stuAnswer") or entry.get("answer")
+    if isinstance(value, list):
+        return ",".join(str(item) for item in value)
+    return str(value or "")
+
+
 def build_homework_prompt(
     question: dict,
     *,
@@ -162,9 +294,7 @@ def build_homework_prompt(
             lines.append("【排除选项】以下选项已被判定错误，不要选择：" + "；".join(texts))
     if wrong_combos:
         rendered = [
-            "、".join(
-                option_map.get(item, {}).get("content") or item for item in combo
-            )
+            "、".join(_plain(option_map.get(item, {}).get("content")) or item for item in combo)
             for combo in wrong_combos
         ]
         lines.append("【错误选择方式】历史提交中这些组合已被判错：" + " | ".join(rendered))
@@ -212,12 +342,15 @@ class ZhidaoHomeworkWorker:
         self.analysis_api = analysis_api
         self.auto_submit = bool(auto_submit)
         self.target_score = float(target_score or 0)
-        self.max_rounds = max(1, int(max_rounds or 1))
+        # 0 表示按服务端 maxRedo / 保底 AUTO_MAX_ROUNDS 轮
+        self.max_rounds = int(max_rounds or 0)
         self.sleep = sleep
         self.question_bank = question_bank
         self._question_bank_ready = question_bank is not None
         self._ai_user_id = None
         self._recruit_id = ""
+        self._llm_disabled = False
+        self._llm_warned = False
 
     # ------------------------------------------------------------- answering
     def _get_question_bank(self):
@@ -251,13 +384,32 @@ class ZhidaoHomeworkWorker:
         except Exception as exc:
             logger.debug(f"外部题库统计输出失败: {exc}")
 
-    # ------------------------------------------------------------- answering
     def _ask(self, prompt: str) -> str:
         if self.answerer is not None:
             return self.answerer(prompt)
         if not llm.enabled():
             raise ValueError("未配置可用的大模型接口")
         return llm.chat_sync(prompt, json_mode=False, stream=True)
+
+    def _disable_llm(self, exc) -> None:
+        self._llm_disabled = True
+        if not self._llm_warned:
+            self._llm_warned = True
+            logger.warn(
+                f"大模型不可用({exc}), 本卷后续题目将跳过 LLM 并降级处理.",
+                shift=True,
+            )
+            logger.event("作业作答", 结果="LLM 已禁用", 错误=logger.summarize_exception(exc))
+
+    def _fallback_values(self, question: dict, options: list | None = None) -> list[str]:
+        qtype = question.get("type", 1)
+        pool = options if options is not None else question.get("options") or []
+        if qtype == 3:
+            raise ValueError(f"题目 {question.get('eid')} 未获得有效填空答案")
+        if not pool:
+            raise ValueError(f"题目 {question.get('eid')} 没有可选项")
+        count = min(2, len(pool)) if qtype == 2 else 1
+        return [str(item["id"]) for item in random.sample(pool, count)]
 
     def _answer_question(self, question: dict, row: dict | None) -> tuple[list, str]:
         qtype = question.get("type", 1)
@@ -267,11 +419,18 @@ class ZhidaoHomeworkWorker:
         valid_ids = {str(option["id"]) for option in options}
 
         cached = [str(item) for item in (row or {}).get("correct_options") or []]
-        if cached and all(item in valid_ids for item in cached):
-            return cached, "题库"
+        if cached:
+            if qtype == 3:
+                fills = [item for item in cached if item.strip()]
+                if fills:
+                    return fills, "题库"
+            elif all(item in valid_ids for item in cached):
+                return cached, "题库"
 
         if not options and qtype != 3:
             raise ValueError(f"题目 {question.get('eid')} 没有可选项")
+        if self._llm_disabled:
+            return self._fallback_values(question), "随机"
         bank_reference = self._bank_reference(question)
 
         if qtype in (1, 14):
@@ -291,13 +450,17 @@ class ZhidaoHomeworkWorker:
                 bank_reference=bank_reference,
             )
             excluded_set = set(excluded)
-            for attempt in range(ROLLBACK_RETRIES):
-                ids, _ = parse_homework_answer(self._ask(prompt), question)
+            for _attempt in range(ROLLBACK_RETRIES):
+                try:
+                    reply = self._ask(prompt)
+                except llm.NonRetryableLLMError as exc:
+                    self._disable_llm(exc)
+                    return self._fallback_values(question, candidates), "随机"
+                ids, _ = parse_homework_answer(reply, question)
                 ids = [item for item in ids if item in valid_ids]
                 if ids and not any(item in excluded_set for item in ids):
                     return ids[:1], "AI"
                 prompt += "\n【重要】你上次给出的答案已被判定错误，请重新选择。"
-            # 全被排除或多次无效: 从剩余候选中兜底
             pool = candidates or options
             return [str(random.choice(pool)["id"])], "随机"
 
@@ -309,15 +472,20 @@ class ZhidaoHomeworkWorker:
         )
         wrong_signatures = {tuple(sorted(combo)) for combo in combos}
         last: tuple[list, str] = ([], "")
-        for attempt in range(ROLLBACK_RETRIES):
-            ids, fills = parse_homework_answer(self._ask(prompt), question)
+        for _attempt in range(ROLLBACK_RETRIES):
+            try:
+                reply = self._ask(prompt)
+            except llm.NonRetryableLLMError as exc:
+                self._disable_llm(exc)
+                return self._fallback_values(question), "随机"
+            ids, fills = parse_homework_answer(reply, question)
             if qtype == 3:
                 fills = [item for item in fills if item.strip()]
                 if not fills:
                     prompt += "\n【重要】答案不能为空，请重新作答。"
                     continue
                 last = (fills, "AI")
-                if tuple(fills) not in wrong_signatures:
+                if tuple(sorted(fills)) not in wrong_signatures:
                     return last
             else:
                 ids = [item for item in ids if item in valid_ids]
@@ -330,27 +498,66 @@ class ZhidaoHomeworkWorker:
             prompt += "\n【重要】该答案组合已被判定错误，请换一个答案。"
         if last[0]:
             return last
-        if qtype == 3:
-            raise ValueError(f"题目 {question.get('eid')} 未获得有效填空答案")
-        pool = options
-        count = min(2, len(pool)) if qtype == 2 else 1
-        return [str(item["id"]) for item in random.sample(pool, count)], "随机"
+        return self._fallback_values(question), "随机"
 
     # ---------------------------------------------------------------- storage
     def _exam_key(self, exam_id, homework_id) -> str:
         return str(exam_id or homework_id or "")
 
-    def _remember_question(self, question: dict, exam_key: str) -> dict | None:
-        self.store.save_options_by_eid(
-            self.course_id,
-            exam_key,
-            question["eid"],
-            question.get("options") or [],
-            question_type=str(question.get("type", 1)),
-            content=question.get("content", ""),
-            course_name=self.course_name,
-        )
-        return self.store.get_by_eid(self.course_id, question["eid"], exam_key)
+    def _storage_course(self, course_id=None) -> str:
+        return str(course_id or self.course_id)
+
+    def _remember_question(
+        self, question: dict, exam_key: str, course_id=None
+    ) -> dict | None:
+        course = self._storage_course(course_id)
+        eid = question.get("eid")
+        if eid:
+            self.store.save_options_by_eid(
+                course,
+                exam_key,
+                eid,
+                question.get("options") or [],
+                question_type=str(question.get("type", 1)),
+                content=_plain(question.get("content")),
+                course_name=self.course_name,
+            )
+            row = self.store.get_by_eid(course, eid, exam_key)
+            if row:
+                return row
+        question_id = question.get("question_id")
+        if question_id:
+            self.store.save_options_by_id(
+                course,
+                exam_key,
+                question_id,
+                question.get("options") or [],
+                question_type=str(question.get("type", 1)),
+                content=_plain(question.get("content")),
+                course_name=self.course_name,
+            )
+            return self.store.get_by_id(course, question_id, exam_key)
+        return None
+
+    def _find_row(self, question: dict, exam_key: str, course_id=None) -> dict | None:
+        """eid -> 选项哈希 -> 题干, 三级兜底查找已有缓存."""
+        course = self._storage_course(course_id)
+        eid = question.get("eid")
+        if eid:
+            row = self.store.get_by_eid(course, eid, exam_key)
+            if row:
+                return row
+        hashed = option_hash(question.get("options") or [])
+        if hashed:
+            row = self.store.find_by_hash(course, hashed, exam_key)
+            if row:
+                return row
+        content = _plain(question.get("content"))
+        if content:
+            row = self.store.find_by_content(course, content, exam_key)
+            if row:
+                return row
+        return None
 
     def _save_answer(
         self,
@@ -382,19 +589,9 @@ class ZhidaoHomeworkWorker:
             raise CaptchaRequiredError(f"保存答案触发人机验证: {message}")
 
     # ---------------------------------------------------------------- review
-    def _review(
-        self,
-        *,
-        recruit_id,
-        course_id,
-        homework_id,
-        stu_exam_id,
-        exam_id="",
-        school_id="",
-        question_ids=(),
-    ) -> dict:
+    def _look_homework(self, *, recruit_id, course_id, stu_exam_id, exam_id, school_id):
         try:
-            looked = self.api.look_homework(
+            return self.api.look_homework(
                 recruit_id=recruit_id,
                 student_exam_id=stu_exam_id,
                 exam_id=exam_id,
@@ -403,68 +600,167 @@ class ZhidaoHomeworkWorker:
             )
         except Exception as exc:
             logger.debug(f"lookHomework 失败: {exc}")
-            looked = {}
-        try:
-            info = self.api.get_stu_answer_info(
-                recruit_id=recruit_id,
-                stu_exam_id=stu_exam_id,
-                exam_id=exam_id,
-                school_id=school_id,
-                course_id=course_id,
-                question_ids=question_ids,
-            )
-        except Exception as exc:
-            logger.debug(f"getStuAnswerInfo 失败: {exc}")
-            info = {}
-        return parse_review(looked, info)
+            return {}
 
-    def _analysis_text(self, question: dict) -> str:
-        if self.analysis_api is None:
+    def _review(
+        self,
+        *,
+        recruit_id,
+        course_id,
+        homework_id,
+        stu_exam_id,
+        exam_key,
+        school_id,
+        questions,
+    ) -> dict:
+        """回读已提交作业: 用数字 question_id 桥接 eid, 再查对错."""
+        course = self._storage_course(course_id)
+        looked = extract_exam_questions(
+            self._look_homework(
+                recruit_id=recruit_id,
+                course_id=course,
+                stu_exam_id=stu_exam_id,
+                exam_id=exam_key,
+                school_id=school_id,
+            )
+        )
+        qid_by_eid: dict[str, str] = {}
+        question_ids: list[str] = []
+        for item in looked:
+            question_id = item.get("question_id")
+            if not question_id:
+                continue
+            self.store.save_options_by_id(
+                course,
+                exam_key,
+                question_id,
+                item.get("options") or [],
+                question_type=str(item.get("type", 1)),
+                content=_plain(item.get("content")),
+                course_name=self.course_name,
+            )
+            row = self.store.get_by_id(course, question_id, exam_key)
+            if row and row.get("eid"):
+                qid_by_eid[str(row["eid"])] = question_id
+            if question_id not in question_ids:
+                question_ids.append(question_id)
+        if not question_ids:
+            for item in questions:
+                question_id = item.get("question_id")
+                if question_id and question_id not in question_ids:
+                    question_ids.append(question_id)
+
+        info_payload = {}
+        if question_ids:
+            try:
+                info_payload = self.api.get_stu_answer_info(
+                    recruit_id=recruit_id,
+                    stu_exam_id=stu_exam_id,
+                    exam_id=exam_key,
+                    school_id=school_id,
+                    course_id=course,
+                    question_ids=question_ids,
+                )
+            except Exception as exc:
+                logger.debug(f"getStuAnswerInfo 失败: {exc}")
+        return {
+            "looked": looked,
+            "info": answer_info_by_question_id(info_payload),
+            "qid_by_eid": qid_by_eid,
+        }
+
+    def _analysis_text(self, question_id) -> str:
+        if self.analysis_api is None or not str(question_id or "").strip():
             return ""
         if self._ai_user_id is None:
             self._ai_user_id = self.analysis_api.get_user_id(
                 self.course_id, self._recruit_id
             )
         return self.analysis_api.analyze(
-            question,
+            question_id=question_id,
             user_id=self._ai_user_id,
             course_id=self.course_id,
             recruit_id=self._recruit_id,
         )
 
-    def _apply_review(self, questions: list[dict], review: dict, exam_key: str) -> None:
+    def _apply_review(
+        self,
+        questions: list[dict],
+        review: dict,
+        exam_key: str,
+        *,
+        course_id=None,
+    ) -> None:
+        course = self._storage_course(course_id)
+        looked = {item.get("question_id"): item for item in review.get("looked") or []}
+        info = review.get("info") or {}
+        qid_by_eid = review.get("qid_by_eid") or {}
         for question in questions:
-            eid = question["eid"]
-            info = review.get(eid)
-            if not info:
+            eid = question.get("eid")
+            question_id = (
+                qid_by_eid.get(str(eid))
+                or question.get("question_id")
+                or ""
+            )
+            row = None
+            if eid:
+                row = self.store.get_by_eid(course, eid, exam_key)
+            if not question_id and row:
+                question_id = str(row.get("question_id") or "")
+            if not question_id:
+                bridged = self._find_row(question, exam_key, course)
+                if bridged:
+                    question_id = str(bridged.get("question_id") or "")
+                    row = bridged
+            if not question_id:
                 continue
-            row = self.store.get_by_eid(self.course_id, eid, exam_key) or {}
-            if info.get("correct"):
-                correct = info.get("correct_options") or row.get("correct_options") or []
+            looked_item = looked.get(question_id)
+            entry = info.get(question_id) or (info.get(eid) if eid else None)
+            correct = _entry_flag(entry, "isRight", "isCorrect", "correct")
+            if not correct and looked_item is not None:
+                correct = _entry_flag(looked_item.get("raw"), "isRight", "isCorrect")
+            answer_text = _entry_answer(entry) or (
+                _entry_answer(looked_item.get("raw")) if looked_item else ""
+            )
+            correct_options = []
+            if looked_item is not None:
+                correct_options = correct_option_ids(looked_item.get("raw") or {})
+            if not correct_options and row:
+                correct_options = row.get("correct_options") or []
+
+            if correct:
                 self.store.mark_correct(
-                    self.course_id, exam_key, eid=eid, correct_options=correct
+                    course,
+                    exam_key,
+                    question_id=question_id,
+                    correct_options=correct_options,
+                    auto_clear_wrong=True,
                 )
                 continue
-            wrong = [
-                item
-                for item in str(info.get("user_answer") or "").split(",")
-                if item.strip()
-            ]
+
+            wrong = _split_user_answer(answer_text, question.get("type", 1))
             if wrong:
                 self.store.record_wrong(
-                    self.course_id, exam_key, eid=eid, wrong_options=wrong
+                    course,
+                    exam_key,
+                    question_id=question_id,
+                    wrong_options=wrong,
                 )
-            if self.analysis_api is not None and not row.get("ai_analysis"):
-                text = self._analysis_text(question)
-                if text:
-                    self.store.mark_correct(
-                        self.course_id,
-                        exam_key,
-                        eid=eid,
-                        correct_options=row.get("correct_options") or [],
-                        ai_analysis=text,
-                        auto_clear_wrong=False,
-                    )
+            if self.analysis_api is None:
+                continue
+            row = row or self.store.get_by_id(course, question_id, exam_key) or {}
+            if row.get("ai_analysis"):
+                continue
+            text = self._analysis_text(question_id)
+            if text:
+                self.store.mark_correct(
+                    course,
+                    exam_key,
+                    question_id=question_id,
+                    correct_options=row.get("correct_options") or [],
+                    ai_analysis=text,
+                    auto_clear_wrong=False,
+                )
 
     # ------------------------------------------------------------------- run
     def run(
@@ -489,6 +785,44 @@ class ZhidaoHomeworkWorker:
         finally:
             self._log_bank_stats()
 
+    def _open_homework(
+        self,
+        *,
+        recruit_id,
+        course_id,
+        exam_key,
+        stu_exam_id,
+        school_id,
+        allow_reset=True,
+    ):
+        payload = self.api.do_homework(
+            recruit_id=recruit_id,
+            exam_id=exam_key,
+            student_exam_id=stu_exam_id,
+            school_id=school_id,
+            course_id=course_id,
+        )
+        if allow_reset and payload_needs_reset(payload):
+            logger.warn("作业已提交或不可继续作答, 先重置状态再重试...")
+            self.api.save_course_tran(
+                recruit_id=recruit_id,
+                exam_id=exam_key,
+                course_id=course_id,
+            )
+            payload = self.api.do_homework(
+                recruit_id=recruit_id,
+                exam_id=exam_key,
+                student_exam_id=stu_exam_id,
+                school_id=school_id,
+                course_id=course_id,
+            )
+        return payload
+
+    def _round_limit(self, payload) -> int:
+        if self.max_rounds > 0:
+            return self.max_rounds
+        return payload_max_redo(payload) or AUTO_MAX_ROUNDS
+
     def _run(
         self,
         *,
@@ -505,32 +839,43 @@ class ZhidaoHomeworkWorker:
             "answered": 0,
             "submitted": False,
             "score": None,
+            "score_percent": None,
             "rounds": 0,
             "needs_vision": False,
             "target_reached": False,
             "is_marking": 0,
         }
-        payload = self.api.do_homework(
+        payload = self._open_homework(
             recruit_id=recruit_id,
-            exam_id=exam_key,
-            student_exam_id=stu_exam_id,
-            school_id=school_id,
             course_id=course_id,
+            exam_key=exam_key,
+            stu_exam_id=stu_exam_id,
+            school_id=school_id,
         )
         questions = extract_exam_questions(payload)
         if not questions:
             return stats
 
-        if any(question_has_image(question) for question in questions):
-            logger.warn("作业含图片题, 回退视觉模型逐题作答.")
+        text_questions = [q for q in questions if not question_has_image(q)]
+        if len(text_questions) < len(questions):
             stats["needs_vision"] = True
+            stats["image_questions"] = len(questions) - len(text_questions)
+            logger.warn(
+                f"作业含 {stats['image_questions']} 道图片题, 先接口保存其余 "
+                f"{len(text_questions)} 道纯文本题, 图片题回退视觉模型."
+            )
+            questions = text_questions
+        if not questions:
             return stats
 
-        for round_index in range(self.max_rounds):
-            stats["rounds"] = round_index + 1
+        limit = self._round_limit(payload)
+        while True:
+            stats["rounds"] += 1
             answered = 0
             for question in questions:
-                row = self._remember_question(question, exam_key)
+                row = self._remember_question(
+                    question, exam_key, course_id
+                ) or self._find_row(question, exam_key, course_id)
                 values, source = self._answer_question(question, row)
                 if source in ("题库", "随机", "排除法"):
                     self.sleep(random.uniform(1.5, 3.0))
@@ -553,6 +898,9 @@ class ZhidaoHomeworkWorker:
             if not self.auto_submit:
                 logger.info("作业答案已保存, 等待用户手动提交.")
                 return stats
+            if stats["needs_vision"]:
+                logger.info("存在图片题, 本次不自动提交; 等待视觉流程补答后再处理.")
+                return stats
 
             submitted = self.api.submit(
                 recruit_id=recruit_id,
@@ -562,9 +910,17 @@ class ZhidaoHomeworkWorker:
             )
             stats["submitted"] = True
             stats["score"] = extract_score(submitted)
-            if stats["score"] is not None and stats["score"] >= self.target_score:
+            total_score = payload_total_score(payload)
+            if stats["score"] is not None and total_score > 0:
+                stats["score_percent"] = stats["score"] / total_score * 100
+            if (
+                stats["score_percent"] is not None
+                and stats["score_percent"] >= self.target_score
+            ) or (stats["score"] is not None and stats["score"] >= self.target_score):
                 stats["target_reached"] = True
-                logger.info(f"作业得分 {stats['score']} 已达标, 停止重做.")
+                logger.info(
+                    f"作业得分 {stats['score']}/{total_score:g} 已达标, 停止重做."
+                )
                 return stats
 
             review = self._review(
@@ -572,32 +928,41 @@ class ZhidaoHomeworkWorker:
                 course_id=course_id,
                 homework_id=homework_id,
                 stu_exam_id=stu_exam_id,
-                exam_id=exam_key,
+                exam_key=exam_key,
                 school_id=school_id,
-                question_ids=[q["question_id"] for q in questions if q["question_id"]],
+                questions=questions,
             )
-            self._apply_review(questions, review, exam_key)
+            self._apply_review(questions, review, exam_key, course_id=course_id)
 
-            if round_index + 1 >= self.max_rounds:
+            if stats["rounds"] >= limit:
                 break
-            # 同步递增内存快照, 避免服务端重做计数未刷新导致死循环
-            stats["is_marking"] += 1
+            marking = payload_is_marking(payload)
+            if marking is None:
+                stats["is_marking"] += 1
+            else:
+                stats["is_marking"] = marking
+                if self.max_rounds == 0 and marking >= limit:
+                    logger.warn("作业重做次数已达上限, 停止重做.")
+                    break
             self.api.save_course_tran(
                 recruit_id=recruit_id,
                 exam_id=exam_key,
                 course_id=course_id,
             )
-            payload = self.api.do_homework(
+            payload = self._open_homework(
                 recruit_id=recruit_id,
-                exam_id=exam_key,
-                student_exam_id=stu_exam_id,
-                school_id=school_id,
                 course_id=course_id,
+                exam_key=exam_key,
+                stu_exam_id=stu_exam_id,
+                school_id=school_id,
+                allow_reset=False,
             )
             refreshed = extract_exam_questions(payload)
             if not refreshed:
                 break
-            questions = refreshed
-            logger.info(f"作业未达标({stats['score']}), 开始第 {round_index + 2} 轮重做.")
+            questions = [q for q in refreshed if not question_has_image(q)]
+            if not questions:
+                break
+            logger.info(f"作业未达标({stats['score']}), 开始第 {stats['rounds'] + 1} 轮重做.")
 
         return stats
