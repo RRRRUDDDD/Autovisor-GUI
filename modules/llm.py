@@ -937,6 +937,11 @@ def _consume_openai_stream(
             except queue.Empty:
                 stop_event.set()
                 _close_response(resp)
+                # 剩余总时长小于 idle 时, 等待期间可能刚好越过总超时线.
+                if time.monotonic() >= deadline:
+                    raise RuntimeError(
+                        f"流式响应超时: 总时长超过 {float(total_timeout):g} 秒"
+                    )
                 raise RuntimeError(
                     f"流式响应超时: {float(idle_timeout):g} 秒内未收到新数据"
                 )

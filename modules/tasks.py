@@ -289,11 +289,62 @@ async def play_video(
             continue
 
 
+async def click_intercepted_answers(page, interceptor, choices) -> bool:
+    """按接口拦截到的标准答案点选 DOM 选项; 未命中返回 False 静默回退."""
+    if interceptor is None or not choices:
+        return False
+    clicked = 0
+    try:
+        for choice in choices:
+            try:
+                text = await choice.inner_text()
+            except TargetClosedError:
+                raise
+            except Exception:
+                continue
+            if not text or not interceptor.is_correct(text):
+                continue
+            await choice.click(timeout=500)
+            clicked += 1
+    except TargetClosedError:
+        raise
+    except Exception as exc:
+        logger.debug(f"接口拦截答案点选失败: {logger.summarize_exception(exc)}")
+    return clicked > 0
+
+
 async def skip_questions(
     page: Page,
     event_loop,
     playback_enabled: asyncio.Event | None = None,
     config=None,
+) -> None:
+    """挂载弹题接口只读监听, 运行答题轮询, 结束后必定移除监听."""
+    interceptor = None
+    if config is None or getattr(config, "enablePopupIntercept", True):
+        from modules.popup_interceptor import PopupAnswerInterceptor
+
+        try:
+            interceptor = PopupAnswerInterceptor(page)
+            interceptor.attach()
+        except Exception as exc:
+            logger.debug(f"课中弹题接口拦截挂载失败: {logger.summarize_exception(exc)}")
+            interceptor = None
+    try:
+        await _skip_questions_loop(
+            page, event_loop, playback_enabled, config, interceptor
+        )
+    finally:
+        if interceptor is not None:
+            interceptor.detach()
+
+
+async def _skip_questions_loop(
+    page: Page,
+    event_loop,
+    playback_enabled: asyncio.Event | None = None,
+    config=None,
+    interceptor=None,
 ) -> None:
     await page.wait_for_load_state("domcontentloaded")
     while True:
@@ -305,28 +356,43 @@ async def skip_questions(
                 await asyncio.sleep(2)
                 if not await has_visible_element(page, (".topic-title",)):
                     continue
-                # 优先智慧树 AI, 失败回退自定义大模型, 仍失败则回退手动
+                # 优先接口拦截答案, 未命中再走智慧树 AI / 自定义大模型, 仍失败回退手动
                 llm_answered = False
+                intercepted = False
                 try:
                     choices = await page.query_selector_all(".topic-item")
                     if len(choices) < 2:
                         choices = await page.query_selector_all(
                             "[class*=option], [class*=answer], .el-radio, .el-checkbox"
                         )
-                    answerer = None
-                    if config is not None and getattr(config, "enableZhidaoQuiz", True):
-                        from modules.quiz_page import make_zhidao_answerer
+                    intercepted = await click_intercepted_answers(
+                        page, interceptor, choices
+                    )
+                    if not intercepted:
+                        answerer = None
+                        if config is not None and getattr(config, "enableZhidaoQuiz", True):
+                            from modules.quiz_page import make_zhidao_answerer
 
-                        answerer = await make_zhidao_answerer(page, config)
-                    if answerer is not None:
-                        llm_answered = bool(
-                            await answer_with_llm(page, None, choices, answerer=answerer)
-                        )
-                    else:
-                        llm_answered = bool(await answer_with_llm(page, None, choices))
+                            answerer = await make_zhidao_answerer(page, config)
+                        if answerer is not None:
+                            llm_answered = bool(
+                                await answer_with_llm(
+                                    page, None, choices, answerer=answerer
+                                )
+                            )
+                        else:
+                            llm_answered = bool(
+                                await answer_with_llm(page, None, choices)
+                            )
                 except Exception as exc:
                     logger.debug(f"新版弹题大模型作答未命中: {logger.summarize_exception(exc)}")
-                if llm_answered:
+                if intercepted:
+                    logger.info(
+                        "检测到新版课中弹题, 已按接口返回答案选择选项, 等待弹题弹窗关闭...",
+                        shift=True,
+                    )
+                    logger.event("新版课中弹题", 处理方式="接口答案拦截", 地址=page.url)
+                elif llm_answered:
                     logger.info("检测到新版课中弹题, 已由 AI 选择选项, 等待弹题弹窗关闭...", shift=True)
                     logger.event("新版课中弹题", 处理方式="AI作答", 地址=page.url)
                 else:
@@ -361,19 +427,37 @@ async def skip_questions(
                     answerer = await make_zhidao_answerer(page, config)
                 answered = 0
                 llm_count = 0
+                intercept_count = 0
                 fallback_count = 0
                 skipped_count = 0
                 for idx, ques in enumerate(total_ques, 1):
                     await ques.click(timeout=500)
                     if not await page.query_selector(".answer"):
                         choices = await page.query_selector_all(".topic-item")
-                        # 优先智慧树 AI, 失败回退自定义大模型, 再失败回退默认行为(点前两个选项)
-                        ai_ok = (
-                            await answer_with_llm(page, ques, choices, answerer=answerer)
-                            if answerer is not None
-                            else await answer_with_llm(page, ques, choices)
+                        # 优先接口拦截答案, 再走 AI, 最后回退默认行为(点前两个选项)
+                        intercepted = await click_intercepted_answers(
+                            page, interceptor, choices
                         )
-                        if ai_ok:
+                        if intercepted:
+                            intercept_count += 1
+                            logger.info(
+                                f"课中弹题第 {idx}/{len(total_ques)} 题(接口答案拦截): 已按服务端答案点选"
+                            )
+                            logger.event(
+                                "课中答题",
+                                序号=f"{idx}/{len(total_ques)}",
+                                方式="接口答案拦截",
+                            )
+                        ai_ok = False
+                        if not intercepted:
+                            ai_ok = (
+                                await answer_with_llm(page, ques, choices, answerer=answerer)
+                                if answerer is not None
+                                else await answer_with_llm(page, ques, choices)
+                            )
+                        if intercepted:
+                            pass
+                        elif ai_ok:
                             llm_count += 1
                         else:
                             q_title = ""
@@ -418,12 +502,14 @@ async def skip_questions(
                         logger.debug(f"课中弹题第 {idx}/{len(total_ques)} 题已作答, 跳过.")
                 logger.info(
                     f"课中弹题处理完成: 共 {len(total_ques)} 题, "
-                    f"大模型作答 {llm_count} 题, 默认选择 {fallback_count} 题, 已作答跳过 {skipped_count} 题."
+                    f"接口拦截 {intercept_count} 题, 大模型作答 {llm_count} 题, "
+                    f"默认选择 {fallback_count} 题, 已作答跳过 {skipped_count} 题."
                 )
                 logger.event(
                     "课中答题",
                     题目数=len(total_ques),
                     已作答=answered,
+                    接口拦截=intercept_count,
                     大模型作答=llm_count,
                     默认选择=fallback_count,
                     跳过=skipped_count,
