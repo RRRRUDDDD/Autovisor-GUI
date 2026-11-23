@@ -1,0 +1,139 @@
+# encoding=utf-8
+"""智慧树官方免费 AI 解析接口 (明文 JSON + SSE).
+
+流程: GET user/info 取 data.userId -> POST question/analysis/thread/run
+逐行读取 SSE 中 choices[0].message.content, 直到 stop == true.
+"""
+from __future__ import annotations
+
+import json
+
+import requests
+
+from modules.http_utils import build_requests_proxies
+
+AI_BASE = "https://ai-course-assistant-api.zhihuishu.com"
+USER_INFO_URL = f"{AI_BASE}/api/v1/user/info"
+ANALYSIS_RUN_URL = f"{AI_BASE}/api/v1/question/analysis/thread/run"
+
+REQUEST_TIMEOUT = 20
+ANALYSIS_TIMEOUT = 120
+
+
+def _text(value) -> str:
+    return "" if value is None else str(value).strip()
+
+
+def _flag(value) -> bool:
+    return str(value).strip().lower() in {"1", "true"}
+
+
+class AiAnalysisApi:
+    """封装官方 AI 解析, 失败时返回空串由调用方静默跳过."""
+
+    def __init__(self, session=None, proxy: str = ""):
+        self.session = session or requests.Session()
+        self.proxy = proxy
+
+    def _proxies(self):
+        if not self.proxy:
+            return None
+        try:
+            return build_requests_proxies(self.proxy) or None
+        except ValueError:
+            return None
+
+    def get_user_id(self, course_id="", recruit_id="") -> str:
+        params = {"userId": 0, "courseId": str(course_id), "recruitId": str(recruit_id)}
+        try:
+            response = self.session.get(
+                USER_INFO_URL, params=params, timeout=REQUEST_TIMEOUT,
+                proxies=self._proxies(),
+            )
+            response.raise_for_status()
+            payload = response.json()
+        except Exception:
+            return ""
+        data = payload.get("data") if isinstance(payload, dict) else None
+        if not isinstance(data, dict):
+            return ""
+        return _text(data.get("userId"))
+
+    def analyze(
+        self,
+        question: dict,
+        *,
+        user_id="",
+        course_id="",
+        recruit_id="",
+        timeout: float = ANALYSIS_TIMEOUT,
+    ) -> str:
+        body = {
+            "userId": int(user_id) if str(user_id).isdigit() else 0,
+            "courseId": str(course_id),
+            "recruitId": str(recruit_id),
+            "question": _text(question.get("content")),
+            "questionType": question.get("type", 1),
+            "options": question.get("options") or [],
+            "answer": [],
+        }
+        try:
+            response = self.session.post(
+                ANALYSIS_RUN_URL,
+                json=body,
+                timeout=timeout,
+                stream=True,
+                headers={"Accept": "text/event-stream"},
+                proxies=self._proxies(),
+            )
+            response.raise_for_status()
+        except Exception:
+            return ""
+        try:
+            return self._read_sse(response)
+        finally:
+            close = getattr(response, "close", None)
+            if callable(close):
+                try:
+                    close()
+                except Exception:
+                    pass
+
+    @staticmethod
+    def _read_sse(response) -> str:
+        parts: list[str] = []
+        try:
+            iterator = iter(response.iter_lines(decode_unicode=True))
+        except Exception:
+            return ""
+        for raw_line in iterator:
+            if isinstance(raw_line, bytes):
+                try:
+                    raw_line = raw_line.decode("utf-8", "replace")
+                except Exception:
+                    continue
+            line = _text(raw_line)
+            if not line.startswith("data:"):
+                continue
+            payload = line[len("data:"):].strip()
+            if not payload or payload == "[DONE]":
+                if payload == "[DONE]":
+                    break
+                continue
+            try:
+                data = json.loads(payload)
+            except (ValueError, TypeError):
+                continue
+            if not isinstance(data, dict):
+                continue
+            choices = data.get("choices") or []
+            choice = choices[0] if choices and isinstance(choices[0], dict) else {}
+            message = choice.get("message") or {}
+            content = message.get("content")
+            if content is None:
+                content = (choice.get("delta") or {}).get("content")
+            if content:
+                parts.append(str(content))
+            if _flag(data.get("stop")) or _flag(choice.get("stop")):
+                break
+        return "".join(parts).strip()

@@ -91,6 +91,10 @@ class Config:
             self.enableReviewExamApi = self.get_bool_field('course-option', 'enableReviewExamApi', fallback=False)
             # 课中弹题: 是否优先用智慧树 AI 作答, 失败再回退自定义大模型
             self.enableZhidaoQuiz = self.get_bool_field('course-option', 'enableZhidaoQuiz', fallback=True)
+            # 知到作业: 命中作业页时优先走加密 API 明文作答, 失败回退视觉模型
+            self.enableHomeworkApi = self.get_bool_field('course-option', 'enableHomeworkApi', fallback=True)
+            # 知到正式考试: 命中考试页时由加密 API 接管 (默认开启)
+            self.enableFormalExamApi = self.get_bool_field('course-option', 'enableFormalExamApi', fallback=True)
             self.course_match_rule = re.compile("https://[-A-Za-z0-9+&@#/%?=~_|!:,.;]+[-A-Za-z0-9+&@#/%=~_|]")
             self.course_urls = self.get_course_urls()
         # 登录
@@ -343,6 +347,10 @@ enableExamApi = True
 enableReviewExamApi = False
 ;课中弹题: 是否优先用智慧树 AI 作答, 失败回退自定义大模型 (默认:True)
 enableZhidaoQuiz = True
+;知到作业: 命中作业页时优先走加密 API 明文作答, 失败回退视觉模型 (默认:True)
+enableHomeworkApi = True
+;知到正式考试: 命中考试页时由加密 API 接管, 含自动交卷 (默认:True)
+enableFormalExamApi = True
 ;掌握度目标百分比 (1-100, 默认:100)
 masteryTarget = 100
 

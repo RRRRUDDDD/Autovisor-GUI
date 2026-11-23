@@ -1,4 +1,6 @@
+import types
 import unittest
+from unittest.mock import AsyncMock, patch
 
 from modules import homework
 
@@ -57,6 +59,55 @@ class VisionAnswerTests(unittest.TestCase):
             homework.parse_vision_answer(" thinking推理过程\nA"),
             ([0], ""),
         )
+
+
+class _FakePage:
+    url = (
+        "https://onlineexamh5new.zhihuishu.com/stuExamWeb.html"
+        "#/webExamList/dohomework/458533/tok1/tok2/1000013343/1847/0"
+    )
+
+
+class _QuietLogger:
+    def __getattr__(self, _name):
+        return lambda *args, **kwargs: None
+
+
+class HybridRoutingTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        patcher = patch.object(homework, "logger", _QuietLogger())
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    async def test_api_result_is_returned_without_visual_flow(self):
+        expected = {"answered": 3, "submitted": True, "needs_vision": False}
+        with patch.object(
+            homework, "_try_zhidao_api", new=AsyncMock(return_value=expected)
+        ) as api_call:
+            stats = await homework.auto_answer_homework(_FakePage(), config=None)
+        self.assertEqual(stats, expected)
+        api_call.assert_awaited_once()
+
+    async def test_image_questions_fall_back_to_visual_flow(self):
+        api_stats = {"answered": 0, "needs_vision": True}
+        with patch.object(
+            homework, "_try_zhidao_api", new=AsyncMock(return_value=api_stats)
+        ):
+            with patch.object(homework.llm, "vision_enabled", return_value=False):
+                stats = await homework.auto_answer_homework(_FakePage(), config=None)
+        self.assertEqual(stats, {"ok": 0, "fill": 0, "fail": 0})
+
+    async def test_disabled_api_flag_skips_encrypted_route(self):
+        config = types.SimpleNamespace(
+            enableHomeworkApi=False, enableFormalExamApi=True, proxy=""
+        )
+        with patch.object(
+            homework, "_try_zhidao_api", new=AsyncMock()
+        ) as api_call:
+            with patch.object(homework.llm, "vision_enabled", return_value=False):
+                stats = await homework.auto_answer_homework(_FakePage(), config=config)
+        api_call.assert_not_awaited()
+        self.assertEqual(stats, {"ok": 0, "fill": 0, "fail": 0})
 
 
 if __name__ == "__main__":

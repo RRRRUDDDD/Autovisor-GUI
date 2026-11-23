@@ -665,7 +665,7 @@ async def auto_answer_new_page(page, config=None):
         if homework.is_homework_url(url):
             ANSWERED[url] = now
             entered = True
-            logger.info("捕获到作业/考试答题页, 进入视觉模型逐题作答模式...")
+            logger.info("捕获到作业/考试答题页, 优先走加密 API 明文作答(图片题回退视觉模型)...")
             logger.event("作业页面捕获", 地址=url)
             await homework.auto_answer_homework(page, config)
             return

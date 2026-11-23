@@ -390,9 +390,111 @@ async def _save_or_submit(page, auto_submit: bool) -> None:
         logger.event("作业提交", 结果="未提交")
 
 
+_API_KIND_FLAGS = {
+    "dohomework": "enableHomeworkApi",
+    "doexam": "enableFormalExamApi",
+}
+
+
+def _api_enabled(config, kind: str) -> bool:
+    attr = _API_KIND_FLAGS.get(kind)
+    if not attr:
+        return False
+    if config is None:
+        return True
+    return bool(getattr(config, attr, True))
+
+
+async def _try_zhidao_api(page, config, params: dict) -> dict:
+    """用浏览器 Cookie 构造加密 API 客户端并同步作答, 不修改页面."""
+    from modules.ai_analysis_api import AiAnalysisApi
+    from modules.answer_store import AiQuestionStore
+    from modules.zhidao_exam_api import ZhidaoExamApi
+    from modules.zhidao_exam_worker import ZhidaoExamWorker
+    from modules.zhidao_homework_api import ZhidaoHomeworkApi
+    from modules.zhidao_homework_worker import ZhidaoHomeworkWorker
+    from modules.zhs_api import ZhsApiClient
+
+    cookies = await page.context.cookies()
+    try:
+        user_agent = await page.evaluate("navigator.userAgent")
+    except Exception:
+        user_agent = ""
+    proxy = str(getattr(config, "proxy", "") or "").strip()
+    client = ZhsApiClient(cookies, proxy=proxy, user_agent=user_agent)
+    auto_submit = bool(llm.conf().get("auto_submit", False))
+    store = AiQuestionStore()
+    course_id = params.get("courseId", "")
+
+    if params["kind"] == "dohomework":
+        worker = ZhidaoHomeworkWorker(
+            ZhidaoHomeworkApi(client),
+            course_id=course_id,
+            store=store,
+            analysis_api=AiAnalysisApi(proxy=proxy),
+            auto_submit=auto_submit,
+        )
+        return await asyncio.to_thread(
+            worker.run,
+            recruit_id=params.get("recruitId", ""),
+            course_id=course_id,
+            homework_id=params.get("examId", ""),
+            stu_exam_id=params.get("stuExamId", ""),
+            exam_id=params.get("examId", ""),
+            school_id=params.get("schoolId", ""),
+        )
+
+    worker = ZhidaoExamWorker(
+        ZhidaoExamApi(client),
+        course_id=course_id,
+        store=store,
+        auto_submit=auto_submit,
+    )
+    return await asyncio.to_thread(
+        worker.run,
+        recruit_id=params.get("recruitId", ""),
+        course_id=course_id,
+        exam_id=params.get("examId", ""),
+        student_exam_id=params.get("stuExamId", ""),
+        school_id=params.get("schoolId", ""),
+    )
+
+
 async def auto_answer_homework(page, config=None) -> dict:
-    """对当前智慧树作业/考试页逐题截图作答; 返回统计。"""
+    """对当前智慧树作业/考试页作答; 接口明文优先, 视觉模型兜底。"""
     stats = {"ok": 0, "fill": 0, "fail": 0}
+
+    try:
+        from modules.zhidao_homework_api import parse_exam_page_url
+
+        params = parse_exam_page_url(getattr(page, "url", ""))
+    except Exception:
+        params = {}
+    if params and _api_enabled(config, params["kind"]):
+        logger.info("检测到知到作业/考试页, 优先使用加密 API 明文作答 ...")
+        logger.event("作业接口作答", 地址=getattr(page, "url", ""), 类型=params["kind"])
+        try:
+            api_stats = await _try_zhidao_api(page, config, params)
+        except Exception as exc:
+            logger.warn(f"接口作答不可用, 回退视觉模型: {exc}")
+            logger.event(
+                "作业接口作答",
+                结果="回退视觉",
+                错误=logger.summarize_exception(exc),
+            )
+        else:
+            if not api_stats.get("needs_vision"):
+                logger.info(
+                    "接口作答完成: 作答 {answered} 题, 已交卷={submitted}, 得分={score}".format(
+                        answered=api_stats.get("answered", 0),
+                        submitted=api_stats.get("submitted", False),
+                        score=api_stats.get("score"),
+                    )
+                )
+                logger.event("作业接口作答汇总", **api_stats)
+                return api_stats
+            logger.info("接口检测到图片题, 回退视觉模型逐题作答.")
+
     if not llm.vision_enabled():
         logger.warn(
             "检测到作业/考试页, 但未配置视觉模型, 无法识别图片题干. "
