@@ -7,7 +7,7 @@ PACKAGES = ROOT / "packages"
 if PACKAGES.exists():
     sys.path.insert(0, str(PACKAGES))
 
-from modules.click_captcha import find_click_point, parse_click_instruction
+from modules.click_captcha import _load_font, find_click_point, parse_click_instruction
 from modules.tasks import VERIFICATION_SELECTORS
 
 try:
@@ -69,14 +69,11 @@ class ClickInstructionTests(unittest.TestCase):
 @unittest.skipIf(cv2 is None or np is None, "opencv/numpy 未安装")
 class ClickPointTests(unittest.TestCase):
     def _draw_puzzle(self):
-        from PIL import Image, ImageDraw, ImageFont
+        from PIL import Image, ImageDraw
 
         image = Image.new("RGB", (320, 160), (220, 220, 220))
         draw = ImageDraw.Draw(image)
-        try:
-            font = ImageFont.truetype(r"C:\Windows\Fonts\arialbd.ttf", 48)
-        except OSError:
-            font = ImageFont.load_default()
+        font = _load_font(48)
         draw.text((28, 28), "4", fill=(255, 210, 40), font=font)
         draw.text((118, 32), "W", fill=(255, 205, 35), font=font)
         draw.text((40, 92), "7", fill=(220, 50, 45), font=font)

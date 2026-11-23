@@ -129,17 +129,12 @@ def char_variants(token: str) -> tuple[str, ...]:
 def _font_candidates() -> tuple[str, ...]:
     return (
         r"C:\Windows\Fonts\arialbd.ttf",
-        r"C:\Windows\Fonts\arial.ttf",
         "/System/Library/Fonts/Supplemental/Arial Bold.ttf",
-        "/System/Library/Fonts/Supplemental/Arial.ttf",
         "/Library/Fonts/Arial Bold.ttf",
-        "/Library/Fonts/Arial.ttf",
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
-        "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
     )
 
 
-@lru_cache(maxsize=1)
+@lru_cache(maxsize=8)
 def _load_font(size: int):
     from PIL import ImageFont
 
@@ -148,7 +143,10 @@ def _load_font(size: int):
             return ImageFont.truetype(path, size)
         except OSError:
             continue
-    return ImageFont.load_default()
+    try:
+        return ImageFont.load_default(size)
+    except TypeError:
+        return ImageFont.load_default()
 
 
 @lru_cache(maxsize=256)
