@@ -519,8 +519,14 @@ async def main(config) -> bool:
             quiz_capture_status = "已启用 (智慧树AI)"
         elif quiz_page.llm.enabled():
             quiz_capture_status = f"已启用 ({quiz_page.llm.provider_label()})"
+        elif quiz_page.llm.vision_enabled():
+            quiz_capture_status = "已启用 (仅作业/考试图片题视觉模型)"
         else:
             quiz_capture_status = "未配置答题源, 仅监听不答题"
+        if quiz_page.llm.vision_enabled():
+            quiz_capture_status += f" ; 图片题={quiz_page.llm.vision_label()}"
+        else:
+            quiz_capture_status += " ; 图片题=未配置视觉模型"
         logger.event("测验页面捕获", 状态=quiz_capture_status)
         monitor_task = None
         try:
@@ -886,6 +892,7 @@ def cli() -> int:
             隐藏窗口=config.enableHideWindow,
             完成后关机=config.shutdownOnComplete,
             大模型=quiz_page.llm.provider_label() if quiz_page.llm.enabled() else "未配置",
+            视觉模型=quiz_page.llm.vision_label() if quiz_page.llm.vision_enabled() else "未配置",
             智慧树AI答题=config.enableZhidaoQuiz,
             接口考试=config.enableExamApi,
             掌握度刷题=config.enableMastery,

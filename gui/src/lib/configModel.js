@@ -53,6 +53,7 @@ export function defaultLlmConfig() {
     apiKey: '',
     apiBase: 'https://api.deepseek.com',
     model: 'deepseek-chat',
+    visionModel: '',
     apiVersion: '',
     autoSubmit: false,
   };
@@ -223,6 +224,7 @@ export function normalizeConfig(raw) {
     apiKey: String(rawLlm.apiKey ?? rawLlm.api_key ?? '').trim(),
     apiBase: llmApiBase,
     model: llmModel,
+    visionModel: String(rawLlm.visionModel ?? rawLlm.vision_model ?? '').trim(),
     apiVersion: String(rawLlm.apiVersion ?? rawLlm.api_version ?? '').trim(),
     autoSubmit: Boolean(rawLlm.autoSubmit ?? rawLlm.auto_submit),
   };

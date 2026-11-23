@@ -349,6 +349,7 @@ LLM_TEMPLATE = {
     "api_key": "",
     "api_base": "https://api.deepseek.com",
     "model": "deepseek-chat",
+    "vision_model": "",
     "api_version": "",
     "auto_submit": False,
 }

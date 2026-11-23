@@ -13,7 +13,7 @@ import time
 
 from playwright._impl._errors import TargetClosedError
 
-from modules import llm
+from modules import homework, llm
 from modules.logger import Logger
 
 logger = Logger()
@@ -658,6 +658,16 @@ async def auto_answer_new_page(page, config=None):
             return
         now = time.time()
         if url in ANSWERED and now - ANSWERED[url] < _ANSWER_COOLDOWN:
+            return
+        if homework.is_non_quiz_exam_page(url):
+            logger.debug(f"检测到考试列表/学习报告页, 跳过自动答题: {url}")
+            return
+        if homework.is_homework_url(url):
+            ANSWERED[url] = now
+            entered = True
+            logger.info("捕获到作业/考试答题页, 进入视觉模型逐题作答模式...")
+            logger.event("作业页面捕获", 地址=url)
+            await homework.auto_answer_homework(page, config)
             return
         if (
             config is not None

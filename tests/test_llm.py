@@ -490,6 +490,64 @@ class LlmAnsweringLogTests(unittest.TestCase):
             models = llm.fetch_models(cfg)
             self.assertEqual(models, ["deepseek-chat", "deepseek-reasoner"])
 
+    def test_vision_config_and_openai_image_payload(self):
+        self.assertEqual(llm.normalize_conf({"vision_model": " gpt-4o "})["vision_model"], "gpt-4o")
+        self.assertEqual(llm.normalize_conf({"visionModel": "qwen-vl"})["vision_model"], "qwen-vl")
+        self.assertEqual(llm.normalize_conf({})["vision_model"], "")
+
+        vision_conf = llm.normalize_conf(
+            {
+                "provider": "openai",
+                "api_format": "openai",
+                "api_key": "sk",
+                "api_base": "https://api.openai.com/v1",
+                "model": "gpt-4o-mini",
+                "vision_model": "gpt-4o",
+            }
+        )
+        with patch("modules.llm._conf", return_value=vision_conf):
+            self.assertTrue(llm.vision_enabled())
+            self.assertIn("gpt-4o", llm.vision_label())
+
+        mock_resp = _mock_response({"choices": [{"message": {"content": "B"}}]})
+        with patch("modules.llm.requests.post", return_value=mock_resp) as post:
+            reply = llm.chat_vision_sync(b"fake-png", "请作答", conf_override=vision_conf)
+        self.assertEqual(reply, "B")
+        self.assertEqual(post.call_args[0][0], "https://api.openai.com/v1/chat/completions")
+        body = post.call_args[1]["json"]
+        self.assertEqual(body["model"], "gpt-4o")
+        content = body["messages"][0]["content"]
+        self.assertEqual(content[0]["type"], "text")
+        self.assertTrue(content[1]["image_url"]["url"].startswith("data:image/png;base64,"))
+
+    def test_vision_requires_model_and_supports_anthropic_image(self):
+        with self.assertRaises(ValueError):
+            llm.chat_vision_sync(
+                b"x",
+                "p",
+                conf_override={"api_key": "sk", "api_base": "https://api.anthropic.com"},
+            )
+        mock_resp = _mock_response({"content": [{"type": "text", "text": "A"}]})
+        with patch("modules.llm.requests.post", return_value=mock_resp) as post:
+            reply = llm.chat_vision_sync(
+                b"img",
+                "p",
+                "image/jpeg",
+                conf_override={
+                    "provider": "anthropic",
+                    "api_format": "anthropic",
+                    "api_key": "sk-ant",
+                    "api_base": "https://api.anthropic.com",
+                    "model": "claude-sonnet-4-20250514",
+                    "vision_model": "claude-sonnet-4-20250514",
+                },
+            )
+        self.assertEqual(reply, "A")
+        content = post.call_args[1]["json"]["messages"][0]["content"]
+        self.assertEqual(content[0]["type"], "image")
+        self.assertEqual(content[0]["source"]["media_type"], "image/jpeg")
+        self.assertEqual(content[1]["type"], "text")
+
 
 if __name__ == "__main__":
     unittest.main()

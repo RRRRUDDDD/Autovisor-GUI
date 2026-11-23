@@ -146,6 +146,7 @@ const SettingsView = ({
   );
   const llmIsLocal = isLocalLlmEndpoint(llm);
   const llmConfigured = isLlmConfigured(llm);
+  const visionReady = Boolean(String(llm.visionModel || '').trim());
   const llmModelChoices = useMemo(() => {
     const seen = new Set();
     const list = [];
@@ -342,7 +343,7 @@ const SettingsView = ({
               }`}
             >
               {llmConfigured
-                ? `${getLlmDisplayName(llm)} · ${llm.autoSubmit ? '自动提交' : '仅填答'}`
+                ? `${getLlmDisplayName(llm)} · ${llm.autoSubmit ? '自动提交' : '仅填答'}${visionReady ? ' · 图片题' : ''}`
                 : '未配置'}
             </span>
           </div>
@@ -453,12 +454,26 @@ const SettingsView = ({
               )}
             </div>
 
+            <div className="space-y-1.5">
+              <Label htmlFor="llmVisionModel">视觉模型（图片题，可选）</Label>
+              <Input
+                id="llmVisionModel"
+                value={llm.visionModel || ''}
+                onChange={(e) => updateLlmField({ visionModel: e.target.value })}
+                placeholder="如 gpt-4o、Qwen/Qwen2.5-VL-72B-Instruct、glm-4v-plus"
+                className="font-mono text-xs"
+              />
+              <p className="text-[11px] text-on-surface-variant">
+                作业/考试的题干与选项常为图片；填写支持读图的模型 ID 后会逐题截图作答，留空则跳过图片题
+              </p>
+            </div>
+
             <div className="border-t border-outline-variant/60 pt-2">
               <Switch
                 id="llmAutoSubmit"
                 checked={Boolean(llm.autoSubmit)}
                 onChange={(autoSubmit) => updateLlmField({ autoSubmit })}
-                label="测验页自动复核并提交"
+                label="测验 / 作业自动提交"
                 description="关闭时仅自动填写答案，方便你核对后手动提交"
               />
             </div>

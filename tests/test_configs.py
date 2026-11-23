@@ -320,7 +320,16 @@ class EnsureConfigFilesTests(unittest.TestCase):
             data = json.load(file)
         self.assertEqual(
             sorted(data),
-            ["api_base", "api_format", "api_key", "api_version", "auto_submit", "model", "provider"],
+            [
+                "api_base",
+                "api_format",
+                "api_key",
+                "api_version",
+                "auto_submit",
+                "model",
+                "provider",
+                "vision_model",
+            ],
         )
         self.assertEqual(data["api_key"], "")
         self.assertEqual(data["api_format"], "openai")

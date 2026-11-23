@@ -811,6 +811,7 @@ class TaskManager:
                 隐藏窗口=config.enableHideWindow,
                 完成后关机=config.shutdownOnComplete,
                 大模型=llm.provider_label() if llm.enabled() else "未配置",
+                视觉模型=llm.vision_label() if llm.vision_enabled() else "未配置",
                 智慧树AI答题=config.enableZhidaoQuiz,
                 接口考试=config.enableExamApi,
                 掌握度刷题=config.enableMastery,

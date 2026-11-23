@@ -101,6 +101,7 @@ describe('configModel', () => {
         api_key: ' sk-llm-demo ',
         api_base: ' https://api.example.com/v1 ',
         model: ' deepseek-reasoner ',
+        vision_model: ' Qwen/Qwen2.5-VL-72B-Instruct ',
         auto_submit: true,
       },
     });
@@ -130,6 +131,7 @@ describe('configModel', () => {
       apiKey: 'sk-llm-demo',
       apiBase: 'https://api.example.com/v1',
       model: 'deepseek-reasoner',
+      visionModel: 'Qwen/Qwen2.5-VL-72B-Instruct',
       apiVersion: '',
       autoSubmit: true,
     });

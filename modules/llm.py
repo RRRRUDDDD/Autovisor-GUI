@@ -10,8 +10,12 @@
 - ollama: Ollama 本地原生接口 (/api/chat，无需 API Key)
 
 配置文件: data/llm.json
+
+图片题: 另填 vision_model (视觉模型 ID), 复用同一套 Key / Base / 协议,
+通过 chat_vision_sync() 把截图交给支持读图的模型作答.
 """
 import asyncio
+import base64
 import difflib
 import json
 import os
@@ -51,6 +55,7 @@ DEFAULT_CONF = {
     "api_key": "",
     "api_base": "https://api.deepseek.com",
     "model": "deepseek-chat",
+    "vision_model": "",
     "api_version": "",
     "auto_submit": False,
 }
@@ -197,6 +202,7 @@ def normalize_conf(raw: dict | None) -> dict:
     if not api_base:
         api_base = DEFAULT_CONF["api_base"]
     model = str(src.get("model") or "").strip() or DEFAULT_CONF["model"]
+    vision_model = str(src.get("vision_model") or src.get("visionModel") or "").strip()
     raw_provider = str(src.get("provider") or "").strip().lower()
     raw_format = str(src.get("api_format") or src.get("apiFormat") or "").strip().lower()
     if raw_format in SUPPORTED_API_FORMATS:
@@ -212,6 +218,7 @@ def normalize_conf(raw: dict | None) -> dict:
         "api_key": api_key,
         "api_base": api_base,
         "model": model,
+        "vision_model": vision_model,
         "api_version": api_version,
         "auto_submit": auto_submit,
     }
@@ -253,6 +260,26 @@ def provider_label(c: dict | None = None) -> str:
     name = _PROVIDER_LABELS.get(cfg.get("provider", ""), "大模型")
     model = cfg.get("model", "")
     return f"{name}({model})" if model else name
+
+
+def vision_enabled() -> bool:
+    """是否配置了可用于图片题的视觉模型（复用主模型的接口与鉴权）。"""
+    if requests is None:
+        return False
+    c = _conf()
+    if not c.get("vision_model") or not c.get("api_base"):
+        return False
+    if c.get("api_key"):
+        return True
+    return is_local_endpoint(c.get("api_base", ""), c.get("provider", ""), c.get("api_format", ""))
+
+
+def vision_label() -> str:
+    """返回视觉模型的可读名称，用于日志展示。"""
+    c = _conf()
+    name = _PROVIDER_LABELS.get(c.get("provider", ""), "大模型")
+    model = c.get("vision_model", "")
+    return f"{name}({model})" if model else f"{name}(未配置视觉模型)"
 
 
 def _norm(s: str) -> str:
@@ -706,19 +733,38 @@ def _chat_sync(
     api_format: str = "openai",
     api_version: str = "",
     proxy: str | None = None,
+    image: tuple[bytes, str] | None = None,
 ) -> str:
     fmt = (api_format or "openai").strip().lower()
     proxies = _resolve_proxies(api, proxy)
     headers = {"Content-Type": "application/json"}
 
+    image_b64 = ""
+    image_mime = "image/png"
+    if image:
+        raw_bytes, raw_mime = image
+        if raw_bytes:
+            image_b64 = base64.b64encode(raw_bytes).decode("ascii")
+            image_mime = (raw_mime or "image/png").strip() or "image/png"
+    data_url = f"data:{image_mime};base64,{image_b64}" if image_b64 else ""
+
     if fmt == "anthropic":
         if api_key:
             headers["x-api-key"] = api_key
         headers["anthropic-version"] = (api_version or "").strip() or DEFAULT_ANTHROPIC_VERSION
+        content = prompt
+        if image_b64:
+            content = [
+                {
+                    "type": "image",
+                    "source": {"type": "base64", "media_type": image_mime, "data": image_b64},
+                },
+                {"type": "text", "text": prompt},
+            ]
         base_body = {
             "model": model,
             "max_tokens": 4096,
-            "messages": [{"role": "user", "content": prompt}],
+            "messages": [{"role": "user", "content": content}],
         }
         body = {**base_body, "temperature": 0}
         data = _post_with_fallback(api, headers, body, base_body, proxies)
@@ -727,7 +773,10 @@ def _chat_sync(
     if fmt == "gemini":
         if api_key:
             headers["x-goog-api-key"] = api_key
-        base_body = {"contents": [{"role": "user", "parts": [{"text": prompt}]}]}
+        parts = [{"text": prompt}]
+        if image_b64:
+            parts.append({"inline_data": {"mime_type": image_mime, "data": image_b64}})
+        base_body = {"contents": [{"role": "user", "parts": parts}]}
         gen_cfg = {"temperature": 0}
         if json_mode:
             gen_cfg["responseMimeType"] = "application/json"
@@ -738,9 +787,12 @@ def _chat_sync(
     if fmt == "ollama":
         if api_key:
             headers["Authorization"] = f"Bearer {api_key}"
+        message = {"role": "user", "content": prompt}
+        if image_b64:
+            message["images"] = [image_b64]
         base_body = {
             "model": model,
-            "messages": [{"role": "user", "content": prompt}],
+            "messages": [message],
             "stream": False,
         }
         body = {**base_body, "options": {"temperature": 0}}
@@ -752,7 +804,21 @@ def _chat_sync(
     if fmt == "openai-responses":
         if api_key:
             headers["Authorization"] = f"Bearer {api_key}"
-        base_body = {"model": model, "input": prompt}
+        if image_b64:
+            base_body = {
+                "model": model,
+                "input": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "input_text", "text": prompt},
+                            {"type": "input_image", "image_url": data_url},
+                        ],
+                    }
+                ],
+            }
+        else:
+            base_body = {"model": model, "input": prompt}
         body = dict(base_body)
         if json_mode:
             body["text"] = {"format": {"type": "json_object"}}
@@ -766,12 +832,49 @@ def _chat_sync(
     elif api_key:
         headers["Authorization"] = f"Bearer {api_key}"
 
-    base_body = {"model": model, "messages": [{"role": "user", "content": prompt}]}
+    content = prompt
+    if image_b64:
+        content = [
+            {"type": "text", "text": prompt},
+            {"type": "image_url", "image_url": {"url": data_url}},
+        ]
+    base_body = {"model": model, "messages": [{"role": "user", "content": content}]}
     body = {**base_body, "temperature": 0}
     if json_mode:
         body["response_format"] = {"type": "json_object"}
     data = _post_with_fallback(api, headers, body, base_body, proxies)
     return _extract_openai_content(data)
+
+
+def chat_vision_sync(
+    image_bytes: bytes,
+    prompt: str,
+    mime: str = "image/png",
+    conf_override: dict | None = None,
+    proxy: str | None = None,
+) -> str:
+    """用配置的视觉模型识别图片并回答 prompt（复用主模型的接口与鉴权）。"""
+    if requests is None:
+        raise RuntimeError("当前运行环境缺少 requests 依赖")
+    if not image_bytes:
+        raise ValueError("图片内容为空")
+    c = normalize_conf(conf_override) if conf_override is not None else _conf()
+    model = c.get("vision_model") or ""
+    if not model:
+        raise ValueError("未配置视觉模型（data/llm.json 的 vision_model）")
+    fmt = c.get("api_format") or infer_api_format(c.get("api_base", ""), c.get("provider", ""))
+    api = build_endpoint(c["api_base"], model, fmt, c.get("api_version", ""))
+    return _chat_sync(
+        api,
+        c["api_key"],
+        model,
+        prompt,
+        False,
+        api_format=fmt,
+        api_version=c.get("api_version", ""),
+        proxy=proxy,
+        image=(image_bytes, mime),
+    )
 
 
 def chat_sync(

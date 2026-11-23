@@ -151,6 +151,8 @@ pub struct LlmConfig {
     #[serde(default = "default_llm_model")]
     pub model: String,
     #[serde(default)]
+    pub vision_model: String,
+    #[serde(default)]
     pub api_version: String,
     #[serde(default)]
     pub auto_submit: bool,
@@ -164,6 +166,7 @@ impl Default for LlmConfig {
             api_key: String::new(),
             api_base: default_llm_api_base(),
             model: default_llm_model(),
+            vision_model: String::new(),
             api_version: String::new(),
             auto_submit: false,
         }
@@ -182,6 +185,8 @@ struct LlmDiskConfig {
     api_base: String,
     #[serde(default = "default_llm_model")]
     model: String,
+    #[serde(default)]
+    vision_model: String,
     #[serde(default)]
     api_version: String,
     #[serde(default)]
@@ -215,6 +220,7 @@ impl From<&LlmConfig> for LlmDiskConfig {
             api_key: v.api_key.trim().to_string(),
             api_base,
             model,
+            vision_model: v.vision_model.trim().to_string(),
             api_version: v.api_version.trim().to_string(),
             auto_submit: v.auto_submit,
         }
@@ -248,6 +254,7 @@ impl From<LlmDiskConfig> for LlmConfig {
             api_key: v.api_key.trim().to_string(),
             api_base,
             model,
+            vision_model: v.vision_model.trim().to_string(),
             api_version: v.api_version.trim().to_string(),
             auto_submit: v.auto_submit,
         }
@@ -974,6 +981,7 @@ mod tests {
             api_key: "sk-ant-test-123".to_string(),
             api_base: "https://api.anthropic.com".to_string(),
             model: "claude-sonnet-4-20250514".to_string(),
+            vision_model: "claude-sonnet-4-20250514".to_string(),
             api_version: "2023-06-01".to_string(),
             auto_submit: true,
         };
@@ -987,6 +995,7 @@ mod tests {
         assert_eq!(disk["api_key"], "sk-ant-test-123");
         assert_eq!(disk["api_base"], "https://api.anthropic.com");
         assert_eq!(disk["model"], "claude-sonnet-4-20250514");
+        assert_eq!(disk["vision_model"], "claude-sonnet-4-20250514");
         assert_eq!(disk["api_version"], "2023-06-01");
         assert_eq!(disk["auto_submit"], true);
 
