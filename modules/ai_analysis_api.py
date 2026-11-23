@@ -28,6 +28,11 @@ def _flag(value) -> bool:
     return str(value).strip().lower() in {"1", "true"}
 
 
+def _as_int(value):
+    text = str(value or "").strip()
+    return int(text) if text.isdigit() else value
+
+
 class AiAnalysisApi:
     """封装官方 AI 解析, 失败时返回空串由调用方静默跳过."""
 
@@ -61,22 +66,27 @@ class AiAnalysisApi:
 
     def analyze(
         self,
-        question: dict,
+        question: dict | None = None,
         *,
+        question_id="",
         user_id="",
         course_id="",
         recruit_id="",
         timeout: float = ANALYSIS_TIMEOUT,
     ) -> str:
+        if not question_id and isinstance(question, dict):
+            question_id = question.get("question_id") or question.get("id") or ""
         body = {
-            "userId": int(user_id) if str(user_id).isdigit() else 0,
             "courseId": str(course_id),
             "recruitId": str(recruit_id),
-            "question": _text(question.get("content")),
-            "questionType": question.get("type", 1),
-            "options": question.get("options") or [],
-            "answer": [],
+            "userRole": "STUDENT",
+            "userId": int(user_id) if str(user_id).isdigit() else 0,
+            "threadId": "",
+            "questionId": _as_int(question_id),
+            "regenerate": False,
+            "runId": None,
         }
+        response = None
         try:
             response = self.session.post(
                 ANALYSIS_RUN_URL,
@@ -87,10 +97,9 @@ class AiAnalysisApi:
                 proxies=self._proxies(),
             )
             response.raise_for_status()
+            return self._read_sse(response)
         except Exception:
             return ""
-        try:
-            return self._read_sse(response)
         finally:
             close = getattr(response, "close", None)
             if callable(close):
@@ -103,23 +112,21 @@ class AiAnalysisApi:
     def _read_sse(response) -> str:
         parts: list[str] = []
         try:
-            iterator = iter(response.iter_lines(decode_unicode=True))
+            # 不使用 requests 的自动解码: 缺省 ISO-8859-1 会让中文乱码.
+            iterator = iter(response.iter_lines(decode_unicode=False))
         except Exception:
             return ""
         for raw_line in iterator:
             if isinstance(raw_line, bytes):
-                try:
-                    raw_line = raw_line.decode("utf-8", "replace")
-                except Exception:
-                    continue
+                raw_line = raw_line.decode("utf-8", "replace")
             line = _text(raw_line)
-            if not line.startswith("data:"):
+            if not line or not line.startswith("data:"):
                 continue
             payload = line[len("data:"):].strip()
-            if not payload or payload == "[DONE]":
-                if payload == "[DONE]":
-                    break
+            if not payload:
                 continue
+            if payload == "[DONE]":
+                break
             try:
                 data = json.loads(payload)
             except (ValueError, TypeError):

@@ -46,10 +46,36 @@
 
 ## 4. 关键请求/响应字段（摘要）
 
-- 知到作业：`getStudentHomework(flag=1/2)`、`saveCourseTran`、`doHomework`、`saveStudentAnswer`、`submit`、`lookHomework`、`getStuAnswerInfo`；题目位于 `rt.examBase.workExamParts[].questionDtos[]`（`eid`、`name`、`questionOptions[{id, content}]`、`questionType.id`）。
-- 知到考试：`getStudentFinalExam(flag=1/0)`、`getSaveAnswerLockResult`、`getLoginSchoolInfo`、`doExam`、`saveStudentAnswer(source=1, examType=1)`、`submit`；`submit` 以 `rt.statu == "1"` 判成功。
-- AI 综合考试：`taskList`、`start-pull-paper`、`openExam`、`getAnswerSheetInformation`（遍历 `partSheetVos`）、`saveBatchAnswer`、`submit`、`openExamDetail`（`isLookAnswer` / `isAllowShowDetail`）。
-- 官方 AI 解析：`GET /api/v1/user/info` 取 `data.userId`；`POST /api/v1/question/analysis/thread/run` 解析 SSE `choices[0].message.content` 至 `stop == true`。
+### 4.1 知到作业（`studentexam-api`，`homework` 策略，`status == "200"`）
+
+| 路径 | 请求体（明文 JSON） |
+| --- | --- |
+| `/student/getStudentHomework` | `{recruitId: str, courseId: int, flag: 1|2, pageSize: 100, pageNum: 0}`；响应 `rt.studentHomeworkList[]`（`id` = studentExamId、`examId`）与 `rt.next`（`-1` 结束） |
+| `/student/saveCourseTran` | `{recruitId: str, examId: str, description: "", courseId: int}` |
+| `/student/doHomework` | `{recruitId: str, examId: str, studentExamId: str, schoolId: str, courseId: str}` |
+| `/answer/saveStudentAnswer` | `{stuExamAnswer: "<JSON 字符串>", recruitId: str}`；元素字段见下 |
+| `/answer/submit` | `{recruitId: str, examId: str, stuExamId: str, achieveCount: "5"}`（字符串） |
+| `/student/lookHomework` | `{recruitId: str, studentExamId: str, examId: str, schoolId: str, courseId: str}` |
+| `/answer/getStuAnswerInfo` | `{recruitId: str, stuExamId: str, examId: str, schoolId: str, courseId: str, questionIds: "101,102"}`（逗号字符串） |
+
+`stuExamAnswer` 元素：`{examId, recruitId, stuExamId, eid, schoolId, deviceId: "", examType, fromType: 3, answer, dataIds: "", questionType}`。
+题目位于 `rt.examBase.workExamParts[].questionDtos[]`；`eid` 用于保存，`id`（lookHomework）用于查错与 AI 解析，两者不可混用。
+
+### 4.2 知到正式考试（`taurusexam-api` + 复用 `homework` 保存）
+
+| 路径 | 请求体 |
+| --- | --- |
+| `taurusExam/gateway/t/v1/student/getStudentFinalExam` | `{courseId: int, recruitId: str, flag: 1|0}` |
+| `taurusExam/gateway/t/v1/student/doExam` | `{recruitId, examId, studentExamId, schoolId, courseId, deviceId: ""}` |
+| `taurusExam/gateway/t/v1/answer/submit` | `{recruitId, examId, stuExamId, achieveCount: "5"}`；`rt.statu == "1"` 判成功 |
+| `studentExam/gateway/t/v1/answer/getSaveAnswerLockResult` | `{examId: str, recruitId: str}`；`rt.state == 1` 表示锁定 |
+| `studentExam/gateway/t/v1/exam/getLoginSchoolInfo` | `{}`；`rt.schoolId`，null 时按空串处理 |
+| `studentExam/gateway/t/v1/answer/saveStudentAnswer` | 与作业相同，元素 `examType = 1`，表单额外明文 `source=1` |
+
+### 4.3 AI 综合考试与官方解析
+
+- AI 综合考试：`taskList`、`start-pull-paper`、`openExam`、`getAnswerSheetInformation`（遍历 `partSheetVos`）、`saveBatchAnswer`、`submit`（考试体 `{examTestId, recruitId, examPaperId}`）、`openExamDetail`（`isLookAnswer` / `isAllowShowDetail`）。
+- 官方 AI 解析：`GET /api/v1/user/info` 取 `data.userId`；`POST /api/v1/question/analysis/thread/run` 请求体 `{courseId, recruitId, userRole: "STUDENT", userId: int, threadId: "", questionId: int, regenerate: false, runId: null}`，按 UTF-8 解析 SSE `choices[0].message.content` 至 `stop == true`。
 
 ## 5. 变更维护约定
 

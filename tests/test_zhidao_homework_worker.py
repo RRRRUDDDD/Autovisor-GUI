@@ -231,10 +231,11 @@ class HomeworkWorkerLifecycleTests(unittest.TestCase):
         )
 
         self.assertEqual(len(api.saved), 6)
-        second_round = [call["answer_item"] for call in api.saved[3:]]
-        self.assertEqual([item["answer"] for item in second_round], ["12", "21,22", "正确答案"])
-        self.assertTrue(all(item["examType"] == "" for item in second_round))
-        self.assertTrue(all(item["fromType"] == 3 for item in second_round))
+        second_round = api.saved[3:]
+        self.assertEqual([call["answer"] for call in second_round], ["12", "21,22", "正确答案"])
+        self.assertTrue(all(call["exam_type"] == "" for call in second_round))
+        self.assertTrue(all(call["stu_exam_id"] == "S1" for call in second_round))
+        self.assertTrue(all(call["eid"] for call in second_round))
 
         row1 = self.store.get_by_eid("C1", "q1", "E1")
         row2 = self.store.get_by_eid("C1", "q2", "E1")
@@ -289,7 +290,7 @@ class HomeworkWorkerLifecycleTests(unittest.TestCase):
             exam_id="E1",
         )
         self.assertEqual(stats["answered"], 1)
-        self.assertEqual(api.saved[0]["answer_item"]["answer"], "2")
+        self.assertEqual(api.saved[0]["answer"], "2")
 
     def test_image_question_requests_vision_fallback_without_saving(self):
         api = FakeHomeworkApi(

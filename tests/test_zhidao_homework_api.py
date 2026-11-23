@@ -2,13 +2,16 @@ import json
 import unittest
 
 from modules.zhidao_homework_api import (
+    GET_STU_ANSWER_INFO,
     LOOK_HOMEWORK,
     SAVE_COURSE_TRAN,
     SAVE_STUDENT_ANSWER,
+    SUBMIT_HOMEWORK,
     ZhidaoHomeworkApi,
     build_student_answer_item,
     correct_option_ids,
     extract_exam_questions,
+    extract_homework_list,
     extract_score,
     format_student_answer,
     normalize_question,
@@ -35,6 +38,16 @@ class FakeClient:
 
 def _payload(*dtos):
     return {"rt": {"examBase": {"workExamParts": [{"questionDtos": list(dtos)}]}}}
+
+
+class UrlConstantsTests(unittest.TestCase):
+    def test_contract_paths(self):
+        base = "https://studentexam-api.zhihuishu.com/studentExam/gateway/t/v1"
+        self.assertEqual(SAVE_STUDENT_ANSWER, f"{base}/answer/saveStudentAnswer")
+        self.assertEqual(SUBMIT_HOMEWORK, f"{base}/answer/submit")
+        self.assertEqual(GET_STU_ANSWER_INFO, f"{base}/answer/getStuAnswerInfo")
+        self.assertEqual(SAVE_COURSE_TRAN, f"{base}/student/saveCourseTran")
+        self.assertEqual(LOOK_HOMEWORK, f"{base}/student/lookHomework")
 
 
 class UrlParsingTests(unittest.TestCase):
@@ -81,7 +94,7 @@ class NormalizeTests(unittest.TestCase):
         self.assertEqual(question_type_id(99), 1)
         self.assertEqual(question_type_id(None), 1)
 
-    def test_normalize_question_extracts_fields(self):
+    def test_normalize_question_keeps_eid_and_question_id_separate(self):
         dto = {
             "eid": "e-1",
             "id": 101,
@@ -95,6 +108,10 @@ class NormalizeTests(unittest.TestCase):
         self.assertEqual(question["type"], 2)
         self.assertEqual(question["type_name"], "multiple")
         self.assertEqual(question["options"][1], {"id": "12", "content": "乙"})
+
+        looked = normalize_question({"id": 90001, "name": "回读题"})
+        self.assertEqual(looked["eid"], "")
+        self.assertEqual(looked["question_id"], "90001")
 
     def test_extract_exam_questions_supports_part_and_flat_lists(self):
         questions = extract_exam_questions(
@@ -110,8 +127,42 @@ class NormalizeTests(unittest.TestCase):
         )
         self.assertEqual(flat[0]["type"], 14)
 
+        looked = extract_exam_questions({"rt": [{"id": 90001, "name": "回读"}]})
+        self.assertEqual(looked[0]["eid"], "")
+        self.assertEqual(looked[0]["question_id"], "90001")
+
         self.assertEqual(extract_exam_questions(None), [])
         self.assertEqual(extract_exam_questions({"rt": {"examBase": {}}}), [])
+
+    def test_extract_homework_list_maps_ids_and_next(self):
+        parsed = extract_homework_list(
+            {
+                "rt": {
+                    "next": -1,
+                    "studentHomeworkList": [
+                        {
+                            "id": "S1",
+                            "examId": "E1",
+                            "recruitId": "R1",
+                            "courseId": "C1",
+                            "examName": "作业一",
+                            "state": 1,
+                            "isMarking": 2,
+                        }
+                    ],
+                }
+            }
+        )
+        self.assertIsNone(parsed["next"])
+        item = parsed["items"][0]
+        self.assertEqual(item["studentExamId"], "S1")
+        self.assertEqual(item["examId"], "E1")
+        self.assertEqual(item["examName"], "作业一")
+        self.assertEqual(item["isMarking"], 2)
+
+        paged = extract_homework_list({"rt": {"next": "1", "studentHomeworkList": []}})
+        self.assertEqual(paged["next"], 1)
+        self.assertEqual(paged["items"], [])
 
 
 class ReviewTests(unittest.TestCase):
@@ -148,6 +199,14 @@ class ReviewTests(unittest.TestCase):
         self.assertEqual(review["q2"]["user_answer"], "21,22")
         self.assertFalse(review["q3"]["correct"])
 
+    def test_parse_review_keys_look_homework_by_numeric_id(self):
+        looked = {"rt": [{"id": 90001, "isCorrect": 0, "userAnswerVo": {"answer": "11"}}]}
+        info = {"rt": [{"questionId": 90001, "isRight": 0, "userAnswer": "12"}]}
+        review = parse_review(looked, info)
+        self.assertIn("90001", review)
+        self.assertFalse(review["90001"]["correct"])
+        self.assertEqual(review["90001"]["user_answer"], "11")
+
 
 class AnswerFormatTests(unittest.TestCase):
     def test_format_student_answer(self):
@@ -155,19 +214,31 @@ class AnswerFormatTests(unittest.TestCase):
         self.assertEqual(format_student_answer(3, ["甲", "乙"]), "甲/乙")
         self.assertEqual(format_student_answer(1, [7]), "7")
 
-    def test_build_student_answer_item(self):
+    def test_build_student_answer_item_matches_contract(self):
         item = build_student_answer_item(
-            eid="e1", question_type=2, answer="1,2", exam_id="EX", exam_type=""
+            eid="e1",
+            question_type=2,
+            answer="1,2",
+            recruit_id="R1",
+            exam_id="EX",
+            stu_exam_id="S1",
+            school_id="9",
+            exam_type="",
         )
         self.assertEqual(
             item,
             {
-                "questionId": "e1",
                 "examId": "EX",
-                "questionType": 2,
-                "answer": "1,2",
+                "recruitId": "R1",
+                "stuExamId": "S1",
+                "eid": "e1",
+                "schoolId": "9",
+                "deviceId": "",
                 "examType": "",
                 "fromType": 3,
+                "answer": "1,2",
+                "dataIds": "",
+                "questionType": 2,
             },
         )
 
@@ -186,50 +257,128 @@ class HomeworkApiTests(unittest.TestCase):
     def _last(self):
         return self.client.calls[-1]
 
-    def test_all_calls_ensure_sso_and_use_homework_strategy(self):
-        self.api.get_student_homework(2)
-        self.assertEqual(self._last()["strategy"], "homework")
-        self.assertEqual(self._last()["data"], {"flag": 2})
+    def test_get_student_homework_body(self):
+        self.api.get_student_homework(recruit_id="R1", course_id="100", flag=2)
+        call = self._last()
+        self.assertEqual(call["strategy"], "homework")
+        self.assertEqual(
+            call["data"],
+            {
+                "recruitId": "R1",
+                "courseId": 100,
+                "flag": 2,
+                "pageSize": 100,
+                "pageNum": 0,
+            },
+        )
         self.assertEqual(self.client.sso_calls, 1)
 
+    def test_all_calls_ensure_sso_and_use_homework_strategy(self):
         self.api.do_homework(
-            recruit_id=1, course_id=2, homework_id=3, stu_exam_id=4, school_id=5
+            recruit_id="R1",
+            exam_id="E1",
+            student_exam_id="S1",
+            school_id="9",
+            course_id="C1",
         )
-        self.assertEqual(self._last()["data"]["schoolId"], "5")
-        self.assertEqual(self._last()["data"]["deviceId"], "")
+        self.assertEqual(self._last()["strategy"], "homework")
+        self.assertEqual(
+            self._last()["data"],
+            {
+                "recruitId": "R1",
+                "examId": "E1",
+                "studentExamId": "S1",
+                "schoolId": "9",
+                "courseId": "C1",
+            },
+        )
 
-        self.api.save_course_tran(
-            recruit_id=1, course_id=2, homework_id=3, stu_exam_id=4
-        )
+        self.api.save_course_tran(recruit_id="R1", exam_id="E1", course_id="100")
         self.assertEqual(self._last()["url"], SAVE_COURSE_TRAN)
-        self.assertEqual(self._last()["data"]["state"], 0)
+        self.assertEqual(
+            self._last()["data"],
+            {"recruitId": "R1", "examId": "E1", "description": "", "courseId": 100},
+        )
 
-        self.api.look_homework(recruit_id=1, course_id=2, homework_id=3, stu_exam_id=4)
+        self.api.look_homework(
+            recruit_id="R1",
+            student_exam_id="S1",
+            exam_id="E1",
+            school_id="9",
+            course_id="C1",
+        )
         self.assertEqual(self._last()["url"], LOOK_HOMEWORK)
+        self.assertEqual(
+            self._last()["data"],
+            {
+                "recruitId": "R1",
+                "studentExamId": "S1",
+                "examId": "E1",
+                "schoolId": "9",
+                "courseId": "C1",
+            },
+        )
 
         self.api.get_stu_answer_info(
-            recruit_id=1, course_id=2, homework_id=3, stu_exam_id=4
+            recruit_id="R1",
+            stu_exam_id="S1",
+            exam_id="E1",
+            school_id="9",
+            course_id="C1",
+            question_ids=[90001, 90002],
         )
-        self.assertEqual(self.client.sso_calls, 5)
+        self.assertEqual(self._last()["url"], GET_STU_ANSWER_INFO)
+        self.assertEqual(self._last()["data"]["questionIds"], "90001,90002")
 
-    def test_save_student_answer_serializes_item(self):
-        item = build_student_answer_item(
-            eid="e1", question_type=1, answer="11", exam_id="EX", exam_type=""
+        self.assertEqual(self.client.sso_calls, 4)
+
+    def test_get_stu_answer_info_accepts_comma_string(self):
+        self.api.get_stu_answer_info(
+            recruit_id="R1",
+            stu_exam_id="S1",
+            exam_id="E1",
+            question_ids="90001,90002",
         )
+        self.assertEqual(self._last()["data"]["questionIds"], "90001,90002")
+
+    def test_save_student_answer_serializes_contract_item(self):
         self.api.save_student_answer(
-            recruit_id=1, course_id=2, homework_id=3, stu_exam_id=4, answer_item=item
+            recruit_id="R1",
+            exam_id="E1",
+            stu_exam_id="S1",
+            school_id="9",
+            eid="enc_1",
+            question_type=1,
+            answer="11",
+            exam_type="",
         )
         call = self._last()
         self.assertEqual(call["url"], SAVE_STUDENT_ANSWER)
+        self.assertEqual(set(call["data"]), {"stuExamAnswer", "recruitId"})
+        self.assertEqual(call["data"]["recruitId"], "R1")
         decoded = json.loads(call["data"]["stuExamAnswer"])
-        self.assertEqual(decoded, [item])
+        self.assertEqual(decoded[0]["eid"], "enc_1")
+        self.assertEqual(decoded[0]["examId"], "E1")
+        self.assertEqual(decoded[0]["stuExamId"], "S1")
         self.assertEqual(decoded[0]["fromType"], 3)
+        self.assertEqual(decoded[0]["dataIds"], "")
+        self.assertEqual(decoded[0]["deviceId"], "")
 
-    def test_submit_achieve_count(self):
+    def test_submit_uses_exam_id_and_string_achieve_count(self):
         self.api.submit(
-            recruit_id=1, course_id=2, homework_id=3, stu_exam_id=4, achieve_count=9
+            recruit_id="R1", exam_id="E1", stu_exam_id="S1", achieve_count=9
         )
-        self.assertEqual(self._last()["data"]["achieveCount"], 9)
+        call = self._last()
+        self.assertEqual(call["url"], SUBMIT_HOMEWORK)
+        self.assertEqual(
+            call["data"],
+            {
+                "recruitId": "R1",
+                "examId": "E1",
+                "stuExamId": "S1",
+                "achieveCount": "9",
+            },
+        )
 
 
 if __name__ == "__main__":

@@ -12,18 +12,19 @@ import json
 from modules.zhidao_homework_api import (
     HOMEWORK_BASE,
     SAVE_STUDENT_ANSWER,
+    _maybe_int,
     build_student_answer_item,
     extract_exam_questions,
 )
 
-EXAM_BASE = "https://taurusexam-api.zhihuishu.com/taurus/gateway/t/v1"
+EXAM_BASE = "https://taurusexam-api.zhihuishu.com/taurusExam/gateway/t/v1"
 
-GET_STUDENT_FINAL_EXAM = f"{EXAM_BASE}/exam/getStudentFinalExam"
-DO_EXAM = f"{EXAM_BASE}/exam/doExam"
-SUBMIT_EXAM = f"{EXAM_BASE}/exam/submit"
+GET_STUDENT_FINAL_EXAM = f"{EXAM_BASE}/student/getStudentFinalExam"
+DO_EXAM = f"{EXAM_BASE}/student/doExam"
+SUBMIT_EXAM = f"{EXAM_BASE}/answer/submit"
 
-GET_SAVE_ANSWER_LOCK_RESULT = f"{HOMEWORK_BASE}/exam/getSaveAnswerLockResult"
-GET_LOGIN_SCHOOL_INFO = f"{HOMEWORK_BASE}/student/getLoginSchoolInfo"
+GET_SAVE_ANSWER_LOCK_RESULT = f"{HOMEWORK_BASE}/answer/getSaveAnswerLockResult"
+GET_LOGIN_SCHOOL_INFO = f"{HOMEWORK_BASE}/exam/getLoginSchoolInfo"
 
 
 def _text(value) -> str:
@@ -33,9 +34,9 @@ def _text(value) -> str:
 def normalize_final_exam(item: dict) -> dict:
     item = item or {}
     return {
-        "examId": _text(item.get("examId") or item.get("id")),
+        "examId": _text(item.get("examId")),
         "studentExamId": _text(
-            item.get("studentExamId") or item.get("stuExamId") or item.get("studentExamid")
+            item.get("studentExamId") or item.get("stuExamId") or item.get("id")
         ),
         "recruitId": _text(item.get("recruitId") or item.get("recruitID")),
         "courseId": _text(item.get("courseId")),
@@ -88,7 +89,9 @@ def lock_state(payload) -> int | None:
 def extract_school_id(payload) -> str:
     if not isinstance(payload, dict):
         return ""
-    rt = payload.get("rt") if isinstance(payload.get("rt"), dict) else payload
+    rt = payload.get("rt")
+    if not isinstance(rt, dict):
+        return ""
     return _text(rt.get("schoolId") or rt.get("schoolID"))
 
 
@@ -114,19 +117,24 @@ class ZhidaoExamApi:
             "homework", url, data, extra_fields=extra_fields
         )
 
-    def get_student_final_exam(self, flag: int = 1) -> dict:
-        return self._exam_call(GET_STUDENT_FINAL_EXAM, {"flag": int(flag)})
-
-    def get_save_answer_lock_result(
-        self, *, recruit_id, course_id, exam_id, student_exam_id
+    def get_student_final_exam(
+        self, course_id="", recruit_id="", flag: int = 1
     ) -> dict:
+        return self._exam_call(
+            GET_STUDENT_FINAL_EXAM,
+            {
+                "courseId": _maybe_int(course_id),
+                "recruitId": str(recruit_id),
+                "flag": int(flag),
+            },
+        )
+
+    def get_save_answer_lock_result(self, *, exam_id, recruit_id) -> dict:
         return self._homework_call(
             GET_SAVE_ANSWER_LOCK_RESULT,
             {
-                "recruitId": str(recruit_id),
-                "courseId": str(course_id),
                 "examId": str(exam_id),
-                "studentExamId": str(student_exam_id),
+                "recruitId": str(recruit_id),
             },
         )
 
@@ -156,28 +164,29 @@ class ZhidaoExamApi:
         self,
         *,
         recruit_id,
-        course_id,
-        exam_id,
-        student_exam_id,
-        eid,
-        question_type,
-        answer,
+        course_id="",
+        exam_id="",
+        student_exam_id="",
+        school_id="",
+        eid="",
+        question_type=1,
+        answer="",
     ) -> dict:
         item = build_student_answer_item(
             eid=eid,
             question_type=question_type,
             answer=answer,
+            recruit_id=recruit_id,
             exam_id=exam_id,
+            stu_exam_id=student_exam_id,
+            school_id=school_id,
             exam_type=1,
         )
         return self._homework_call(
             SAVE_STUDENT_ANSWER,
             {
-                "recruitId": str(recruit_id),
-                "courseId": str(course_id),
-                "examId": str(exam_id),
-                "studentExamId": str(student_exam_id),
                 "stuExamAnswer": json.dumps([item], ensure_ascii=False),
+                "recruitId": str(recruit_id),
             },
             extra_fields={"source": "1"},
         )
@@ -186,10 +195,10 @@ class ZhidaoExamApi:
         self,
         *,
         recruit_id,
-        course_id,
-        exam_id,
-        student_exam_id,
-        achieve_count: int = 0,
+        course_id="",
+        exam_id="",
+        student_exam_id="",
+        achieve_count=0,
     ) -> dict:
         return self._exam_call(
             SUBMIT_EXAM,
@@ -197,8 +206,8 @@ class ZhidaoExamApi:
                 "recruitId": str(recruit_id),
                 "courseId": str(course_id),
                 "examId": str(exam_id),
-                "studentExamId": str(student_exam_id),
-                "achieveCount": int(achieve_count),
+                "stuExamId": str(student_exam_id),
+                "achieveCount": str(achieve_count),
             },
         )
 

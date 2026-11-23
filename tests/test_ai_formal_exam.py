@@ -183,6 +183,14 @@ class FormalExamFlowTests(FormalExamTestCase):
             call for call in api.strategy_calls if call["url"] == EXAM_SUBMIT
         )
         self.assertEqual(submit_call["strategy"], "ai_exam_submit")
+        self.assertEqual(
+            submit_call["data"],
+            {
+                "examTestId": "exam-1",
+                "recruitId": "course-1",
+                "examPaperId": "paper-1",
+            },
+        )
         pull_call = next(
             call for call in api.strategy_calls if call["url"] == FORMAL_START_PULL
         )

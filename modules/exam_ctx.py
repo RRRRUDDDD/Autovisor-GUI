@@ -1244,7 +1244,7 @@ class AiFormalExamCtx(AiExamBase):
     def submit_exam(self, tried: int = 0) -> bool:
         data = {
             "examTestId": self.exam_test_id,
-            "courseId": self.course_id,
+            "recruitId": str(self.course_id),
             "examPaperId": self.exam_paper_id,
         }
         try:

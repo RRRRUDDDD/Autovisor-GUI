@@ -435,7 +435,7 @@ async def _try_zhidao_api(page, config, params: dict) -> dict:
             ZhidaoHomeworkApi(client),
             course_id=course_id,
             store=store,
-            analysis_api=AiAnalysisApi(proxy=proxy),
+            analysis_api=AiAnalysisApi(session=client.session, proxy=proxy),
             auto_submit=auto_submit,
             target_score=float(threshold or 0),
             max_rounds=int(max_redo or 0) or 3,

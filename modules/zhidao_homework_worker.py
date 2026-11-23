@@ -14,7 +14,6 @@ from modules.logger import Logger
 from modules.question_bank import QuestionBankClient
 from modules.zhidao_homework_api import (
     QUESTION_TYPE_NAMES,
-    build_student_answer_item,
     extract_exam_questions,
     extract_score,
     format_student_answer,
@@ -363,21 +362,18 @@ class ZhidaoHomeworkWorker:
         homework_id,
         stu_exam_id,
         exam_id,
+        school_id="",
     ) -> None:
         answer = format_student_answer(question.get("type", 1), values)
-        item = build_student_answer_item(
+        response = self.api.save_student_answer(
+            recruit_id=recruit_id,
+            exam_id=exam_id,
+            stu_exam_id=stu_exam_id,
+            school_id=school_id,
             eid=question["eid"],
             question_type=question.get("type", 1),
             answer=answer,
-            exam_id=exam_id,
             exam_type="",
-        )
-        response = self.api.save_student_answer(
-            recruit_id=recruit_id,
-            course_id=course_id,
-            homework_id=homework_id,
-            stu_exam_id=stu_exam_id,
-            answer_item=item,
         )
         message = str((response or {}).get("message") or (response or {}).get("msg") or "")
         if any(hint in message.lower() for hint in _CAPTCHA_HINTS):
@@ -386,13 +382,24 @@ class ZhidaoHomeworkWorker:
             raise CaptchaRequiredError(f"保存答案触发人机验证: {message}")
 
     # ---------------------------------------------------------------- review
-    def _review(self, *, recruit_id, course_id, homework_id, stu_exam_id) -> dict:
+    def _review(
+        self,
+        *,
+        recruit_id,
+        course_id,
+        homework_id,
+        stu_exam_id,
+        exam_id="",
+        school_id="",
+        question_ids=(),
+    ) -> dict:
         try:
             looked = self.api.look_homework(
                 recruit_id=recruit_id,
+                student_exam_id=stu_exam_id,
+                exam_id=exam_id,
+                school_id=school_id,
                 course_id=course_id,
-                homework_id=homework_id,
-                stu_exam_id=stu_exam_id,
             )
         except Exception as exc:
             logger.debug(f"lookHomework 失败: {exc}")
@@ -400,9 +407,11 @@ class ZhidaoHomeworkWorker:
         try:
             info = self.api.get_stu_answer_info(
                 recruit_id=recruit_id,
-                course_id=course_id,
-                homework_id=homework_id,
                 stu_exam_id=stu_exam_id,
+                exam_id=exam_id,
+                school_id=school_id,
+                course_id=course_id,
+                question_ids=question_ids,
             )
         except Exception as exc:
             logger.debug(f"getStuAnswerInfo 失败: {exc}")
@@ -503,10 +512,10 @@ class ZhidaoHomeworkWorker:
         }
         payload = self.api.do_homework(
             recruit_id=recruit_id,
-            course_id=course_id,
-            homework_id=homework_id,
-            stu_exam_id=stu_exam_id,
+            exam_id=exam_key,
+            student_exam_id=stu_exam_id,
             school_id=school_id,
+            course_id=course_id,
         )
         questions = extract_exam_questions(payload)
         if not questions:
@@ -533,6 +542,7 @@ class ZhidaoHomeworkWorker:
                     homework_id=homework_id,
                     stu_exam_id=stu_exam_id,
                     exam_id=exam_id,
+                    school_id=school_id,
                 )
                 answered += 1
                 logger.info(
@@ -546,8 +556,7 @@ class ZhidaoHomeworkWorker:
 
             submitted = self.api.submit(
                 recruit_id=recruit_id,
-                course_id=course_id,
-                homework_id=homework_id,
+                exam_id=exam_key,
                 stu_exam_id=stu_exam_id,
                 achieve_count=answered,
             )
@@ -563,6 +572,9 @@ class ZhidaoHomeworkWorker:
                 course_id=course_id,
                 homework_id=homework_id,
                 stu_exam_id=stu_exam_id,
+                exam_id=exam_key,
+                school_id=school_id,
+                question_ids=[q["question_id"] for q in questions if q["question_id"]],
             )
             self._apply_review(questions, review, exam_key)
 
@@ -572,16 +584,15 @@ class ZhidaoHomeworkWorker:
             stats["is_marking"] += 1
             self.api.save_course_tran(
                 recruit_id=recruit_id,
+                exam_id=exam_key,
                 course_id=course_id,
-                homework_id=homework_id,
-                stu_exam_id=stu_exam_id,
             )
             payload = self.api.do_homework(
                 recruit_id=recruit_id,
-                course_id=course_id,
-                homework_id=homework_id,
-                stu_exam_id=stu_exam_id,
+                exam_id=exam_key,
+                student_exam_id=stu_exam_id,
                 school_id=school_id,
+                course_id=course_id,
             )
             refreshed = extract_exam_questions(payload)
             if not refreshed:

@@ -86,7 +86,9 @@ class AnalyzeStreamTests(unittest.TestCase):
         )
         session = FakeSession(post_response=response)
         api = AiAnalysisApi(session=session)
-        text = api.analyze(QUESTION, user_id="42", course_id="C1", recruit_id="R1")
+        text = api.analyze(
+            question_id=90001, user_id="42", course_id="C1", recruit_id="R1"
+        )
         self.assertEqual(text, "第一段第二段")
         self.assertTrue(response.closed)
 
@@ -94,11 +96,29 @@ class AnalyzeStreamTests(unittest.TestCase):
         self.assertEqual(call["url"], ANALYSIS_RUN_URL)
         self.assertTrue(call["stream"])
         self.assertEqual(call["headers"]["Accept"], "text/event-stream")
-        self.assertEqual(call["json"]["userId"], 42)
-        self.assertEqual(call["json"]["question"], "1+1=?")
-        self.assertEqual(call["json"]["questionType"], 1)
-        self.assertEqual(call["json"]["options"], QUESTION["options"])
-        self.assertEqual(call["json"]["answer"], [])
+        self.assertEqual(
+            call["json"],
+            {
+                "courseId": "C1",
+                "recruitId": "R1",
+                "userRole": "STUDENT",
+                "userId": 42,
+                "threadId": "",
+                "questionId": 90001,
+                "regenerate": False,
+                "runId": None,
+            },
+        )
+
+    def test_analyze_decodes_utf8_bytes(self):
+        response = FakeResponse(
+            lines=[
+                b'data: {"choices":[{"message":{"content":"\xe4\xb8\xad\xe6\x96\x87"}}]}',
+                b'data: {"stop":true}',
+            ]
+        )
+        api = AiAnalysisApi(session=FakeSession(post_response=response))
+        self.assertEqual(api.analyze(question_id="90001"), "中文")
 
     def test_analyze_stops_on_done_token(self):
         response = FakeResponse(
@@ -109,7 +129,7 @@ class AnalyzeStreamTests(unittest.TestCase):
             ]
         )
         api = AiAnalysisApi(session=FakeSession(post_response=response))
-        self.assertEqual(api.analyze(QUESTION), "答案")
+        self.assertEqual(api.analyze(question_id=1), "答案")
         self.assertTrue(response.closed)
 
     def test_analyze_handles_bad_json_and_request_error(self):
@@ -121,20 +141,30 @@ class AnalyzeStreamTests(unittest.TestCase):
             ]
         )
         api = AiAnalysisApi(session=FakeSession(post_response=response))
-        self.assertEqual(api.analyze(QUESTION), "ok")
+        self.assertEqual(api.analyze(question_id=1), "ok")
 
         failed = FakeResponse(error=RuntimeError("timeout"))
         api = AiAnalysisApi(session=FakeSession(post_response=failed))
-        self.assertEqual(api.analyze(QUESTION), "")
-        self.assertFalse(failed.closed)
+        self.assertEqual(api.analyze(question_id=1), "")
+        self.assertTrue(failed.closed)
 
     def test_non_numeric_user_id_falls_back_to_zero(self):
         response = FakeResponse(
             lines=['data: {"choices":[{"message":{"content":"x"}}]}']
         )
         session = FakeSession(post_response=response)
-        AiAnalysisApi(session=session).analyze(QUESTION, user_id="abc")
+        AiAnalysisApi(session=session).analyze(question_id=1, user_id="abc")
         self.assertEqual(session.post_calls[0]["json"]["userId"], 0)
+
+    def test_question_id_prefers_explicit_argument(self):
+        response = FakeResponse(
+            lines=['data: {"choices":[{"message":{"content":"x"}}]}']
+        )
+        session = FakeSession(post_response=response)
+        AiAnalysisApi(session=session).analyze(
+            {"id": "q1", "question_id": "111"}, question_id="222"
+        )
+        self.assertEqual(session.post_calls[0]["json"]["questionId"], 222)
 
 
 if __name__ == "__main__":

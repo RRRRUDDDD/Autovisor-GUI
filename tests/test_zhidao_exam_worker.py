@@ -53,7 +53,7 @@ class FakeExamApi:
         self.saved = []
         self.submit_calls = []
 
-    def get_student_final_exam(self, flag=1):
+    def get_student_final_exam(self, **kwargs):
         self.scan_calls += 1
         return {"rt": self.exams}
 
@@ -243,9 +243,12 @@ class ExamApiContractTests(unittest.TestCase):
         self.api = ZhidaoExamApi(self.client)
 
     def test_exam_endpoints_use_zhidao_exam_without_sso(self):
-        self.api.get_student_final_exam(1)
+        self.api.get_student_final_exam(course_id="100", recruit_id="R1", flag=1)
         self.assertEqual(self.client.calls[-1]["strategy"], "zhidao_exam")
-        self.assertEqual(self.client.calls[-1]["data"], {"flag": 1})
+        self.assertEqual(
+            self.client.calls[-1]["data"],
+            {"courseId": 100, "recruitId": "R1", "flag": 1},
+        )
         self.api.do_exam(
             recruit_id="R1",
             exam_id="E1",
@@ -258,12 +261,14 @@ class ExamApiContractTests(unittest.TestCase):
         self.assertEqual(self.client.sso_calls, 0)
 
     def test_lock_and_school_use_homework_strategy(self):
-        self.api.get_save_answer_lock_result(
-            recruit_id="R1", course_id="C1", exam_id="E1", student_exam_id="S1"
-        )
+        self.api.get_save_answer_lock_result(exam_id="E1", recruit_id="R1")
         self.assertEqual(self.client.calls[-1]["strategy"], "homework")
+        self.assertEqual(
+            self.client.calls[-1]["data"], {"examId": "E1", "recruitId": "R1"}
+        )
         self.api.get_login_school_info()
         self.assertEqual(self.client.calls[-1]["strategy"], "homework")
+        self.assertEqual(self.client.calls[-1]["data"], {})
         self.assertEqual(self.client.sso_calls, 2)
 
     def test_save_student_answer_sets_source_and_exam_type(self):
@@ -272,7 +277,8 @@ class ExamApiContractTests(unittest.TestCase):
             course_id="C1",
             exam_id="E1",
             student_exam_id="S1",
-            eid="q1",
+            school_id="9",
+            eid="enc_1",
             question_type=2,
             answer="1,2",
         )
@@ -280,14 +286,35 @@ class ExamApiContractTests(unittest.TestCase):
         self.assertEqual(call["strategy"], "homework")
         self.assertEqual(call["extra"], {"source": "1"})
         self.assertEqual(self.client.sso_calls, 1)
+        self.assertEqual(set(call["data"]), {"stuExamAnswer", "recruitId"})
         item = json.loads(call["data"]["stuExamAnswer"])[0]
         self.assertEqual(item["examType"], 1)
         self.assertEqual(item["fromType"], 3)
-        self.assertEqual(item["questionId"], "q1")
+        self.assertEqual(item["eid"], "enc_1")
+        self.assertEqual(item["stuExamId"], "S1")
+        self.assertEqual(item["schoolId"], "9")
         self.assertEqual(item["examId"], "E1")
         self.assertEqual(item["questionType"], 2)
         self.assertEqual(item["answer"], "1,2")
-        self.assertEqual(call["data"]["studentExamId"], "S1")
+
+    def test_submit_uses_stu_exam_id_and_string_achieve_count(self):
+        self.api.submit(
+            recruit_id="R1",
+            course_id="C1",
+            exam_id="E1",
+            student_exam_id="S1",
+            achieve_count=5,
+        )
+        self.assertEqual(
+            self.client.calls[-1]["data"],
+            {
+                "recruitId": "R1",
+                "courseId": "C1",
+                "examId": "E1",
+                "stuExamId": "S1",
+                "achieveCount": "5",
+            },
+        )
 
     def test_helper_parsers(self):
         from modules.zhidao_exam_api import (
@@ -306,7 +333,8 @@ class ExamApiContractTests(unittest.TestCase):
                 ]
             }
         )
-        self.assertEqual([exam["examId"] for exam in exams], ["E1", "E2"])
+        self.assertEqual([exam["examId"] for exam in exams], ["E1", ""])
+        self.assertEqual(exams[1]["studentExamId"], "E2")
         self.assertTrue(is_exam_started(exams[0]))
         self.assertFalse(is_exam_started(exams[1]))
         self.assertTrue(is_exam_started({"progressType": 2}))

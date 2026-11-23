@@ -36,6 +36,7 @@ class ZhidaoExamWorker(ZhidaoHomeworkWorker):
         homework_id,
         stu_exam_id,
         exam_id,
+        school_id="",
     ) -> None:
         answer = format_student_answer(question.get("type", 1), values)
         self.api.save_student_answer(
@@ -43,6 +44,7 @@ class ZhidaoExamWorker(ZhidaoHomeworkWorker):
             course_id=course_id,
             exam_id=exam_id,
             student_exam_id=stu_exam_id,
+            school_id=school_id,
             eid=question["eid"],
             question_type=question.get("type", 1),
             answer=answer,
@@ -50,7 +52,13 @@ class ZhidaoExamWorker(ZhidaoHomeworkWorker):
 
     # ------------------------------------------------------------------ run
     def scan(self, flag: int = 1) -> list[dict]:
-        return extract_final_exams(self.api.get_student_final_exam(flag))
+        return extract_final_exams(
+            self.api.get_student_final_exam(
+                course_id=self.course_id,
+                recruit_id=self._recruit_id,
+                flag=flag,
+            )
+        )
 
     def run_pending(self, *, course_id="", school_id="") -> list[dict]:
         """扫描未完成考试并逐场接管, 返回每场统计."""
@@ -102,10 +110,8 @@ class ZhidaoExamWorker(ZhidaoHomeworkWorker):
             "lock_state": None,
         }
         lock_payload = self.api.get_save_answer_lock_result(
-            recruit_id=recruit_id,
-            course_id=course_id,
             exam_id=exam_id,
-            student_exam_id=student_exam_id,
+            recruit_id=recruit_id,
         )
         state = lock_state(lock_payload)
         stats["lock_state"] = state
@@ -153,6 +159,7 @@ class ZhidaoExamWorker(ZhidaoHomeworkWorker):
                 homework_id=exam_id,
                 stu_exam_id=student_exam_id,
                 exam_id=exam_id,
+                school_id=school_id,
             )
             stats["answered"] += 1
             logger.info(
