@@ -24,6 +24,7 @@ from modules import llm, zhidao_crypto, zhs_api
 from modules.answer_store import AiQuestionStore
 from modules.http_utils import build_requests_proxies
 from modules.logger import Logger
+from modules.ppt_extractor import PptExtractor
 from modules.utils import get_runtime_path
 from modules.zhs_api import (  # noqa: F401  兼容旧的导入路径
     CaptchaRequiredError,
@@ -35,6 +36,9 @@ from modules.zhs_api import (  # noqa: F401  兼容旧的导入路径
 logger = Logger()
 
 EXAM_BASE = "https://studentexamtest.zhihuishu.com/gateway/t/v1"
+KNOWLEDGE_RESOURCE_LIST = (
+    "https://kg-ai-run.zhihuishu.com/run/gateway/t/stu/resources/list-knowledge-resource"
+)
 EXAM_OPEN = f"{EXAM_BASE}/exam/user/openExam"
 EXAM_USED_TIME = f"{EXAM_BASE}/exam/user/updateUserUsedTime"
 EXAM_SHEET = f"{EXAM_BASE}/exam/user/getExamSheetInfo"
@@ -359,6 +363,26 @@ class ExamApi(zhs_api.ZhsApiClient):
             logger.log_exception("查询考试试卷失败.", exc)
             return None
         return ret.get("data") or None
+
+    def list_knowledge_resources(
+        self, course_id, class_id, knowledge_id
+    ) -> list[dict]:
+        """读取知识点关联资源 (PPT 课件等); 失败时返回空列表."""
+        data = {
+            "courseId": course_id,
+            "classId": class_id,
+            "knowledgeId": knowledge_id,
+        }
+        try:
+            ret = self.query_strategy("ai_task", KNOWLEDGE_RESOURCE_LIST, data)
+        except Exception as exc:
+            logger.log_exception("查询知识点课件资源失败.", exc)
+            return []
+        payload = ret.get("data") if isinstance(ret, dict) else None
+        resources = (
+            payload.get("resourceList") if isinstance(payload, dict) else None
+        )
+        return resources if isinstance(resources, list) else []
 
 
 class ZhidaoAnswerer:
@@ -806,6 +830,7 @@ class ExamRunner:
         target: int = 100,
         max_attempts: int = MAX_EXAM_ATTEMPTS,
         op_extra: dict | None = None,
+        bank: AnswerBank | None = None,
     ):
         self.course_id = course_id
         self.class_id = class_id
@@ -813,7 +838,12 @@ class ExamRunner:
         self.target = target
         self.max_attempts = max_attempts
         self.op_extra = op_extra or {}
-        self.bank = AnswerBank(course_id)
+        self.bank = bank or AnswerBank(course_id)
+        self.extractor = PptExtractor(
+            proxy=getattr(api, "proxy", ""),
+            session=getattr(api, "session", None),
+        )
+        self._materials: dict[str, list[dict]] = {}
 
     def run(self, nodes: list[dict], deadline: float | None = None) -> dict:
         summary = {"done": [], "skipped": [], "failed": []}
@@ -851,6 +881,25 @@ class ExamRunner:
         )
         return summary
 
+    def _collect_materials(self, knowledge_id, name: str) -> list[dict]:
+        """按知识点缓存 PPT 参考资料, 多轮重考只下载解析一次."""
+        if knowledge_id in self._materials:
+            return self._materials[knowledge_id]
+        resources = self.api.list_knowledge_resources(
+            self.course_id, self.class_id, knowledge_id
+        )
+        materials = self.extractor.collect(
+            resources,
+            course_name=str(self.op_extra.get("courseName") or ""),
+        )
+        self._materials[knowledge_id] = materials
+        if materials:
+            logger.info(
+                f"知识点「{name}」已注入 {len(materials)} 份 PPT 参考资料 "
+                f"({sum(len(item['content']) for item in materials)} 字)."
+            )
+        return materials
+
     def _run_node(self, knowledge_id, name: str, extra: dict, deadline) -> str:
         for attempt in range(1, self.max_attempts + 1):
             if deadline is not None and time.monotonic() >= deadline:
@@ -870,6 +919,7 @@ class ExamRunner:
                 f"知识点「{name}」第 {attempt}/{self.max_attempts} 轮考试, "
                 f"当前掌握度 {mastery:g}."
             )
+            reference_materials = self._collect_materials(knowledge_id, name)
             ctx = ExamCtx(
                 api=self.api,
                 course_id=self.course_id,
@@ -880,7 +930,9 @@ class ExamRunner:
                 answer_bank=self.bank,
             )
             try:
-                success, correct, total = ctx.start()
+                success, correct, total = ctx.start(
+                    reference_materials=reference_materials
+                )
             except Exception as exc:
                 logger.log_exception(f"知识点「{name}」考试异常.", exc)
                 return "failed"

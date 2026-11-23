@@ -9,11 +9,14 @@ import requests
 
 from modules import zhidao_crypto
 from modules.exam_ctx import (
+    KNOWLEDGE_RESOURCE_LIST,
     AnswerBank,
     ExamApi,
     ExamApiError,
     ExamCtx,
+    ExamRunner,
     ZhidaoAnswerer,
+    build_answer_prompt,
     parse_answer_ids,
     parse_review_exam_url,
     select_random_answers,
@@ -223,6 +226,33 @@ class ExamApiTests(unittest.TestCase):
         with self.assertRaises(ExamApiError):
             api.query("https://example.com/api", {"courseId": 123})
 
+    def test_list_knowledge_resources_uses_ai_task_strategy(self):
+        api = ExamApi([])
+        calls = {}
+
+        def fake_query(strategy, url, data, method="POST", **kwargs):
+            calls.update(strategy=strategy, url=url, data=data, method=method)
+            return {"code": 200, "data": {"resourceList": [{"id": 1}]}}
+
+        api.query_strategy = fake_query
+        resources = api.list_knowledge_resources("c-1", "cl-1", "k-1")
+        self.assertEqual(resources, [{"id": 1}])
+        self.assertEqual(calls["strategy"], "ai_task")
+        self.assertEqual(calls["url"], KNOWLEDGE_RESOURCE_LIST)
+        self.assertEqual(
+            calls["data"],
+            {"courseId": "c-1", "classId": "cl-1", "knowledgeId": "k-1"},
+        )
+
+    def test_list_knowledge_resources_returns_empty_on_failure(self):
+        api = ExamApi([])
+
+        def boom(*args, **kwargs):
+            raise RuntimeError("network")
+
+        api.query_strategy = boom
+        self.assertEqual(api.list_knowledge_resources("c", "cl", "k"), [])
+
 
 class StubAnswerer:
     def __init__(self, result=None, error=None):
@@ -280,6 +310,30 @@ class ExamAnswerTests(unittest.TestCase):
             answers, source = ctx.get_question_answer(make_question(2))
         self.assertEqual(answers, ["2", "3"])
         self.assertEqual(source, "题库")
+
+    def test_reference_materials_are_injected_into_prompt(self):
+        ctx, _ = self.make_ctx()
+        ctx.reference_materials = [{"name": "课件", "content": "重点内容"}]
+        prompts = []
+
+        class CapturingAnswerer:
+            def answer(self, prompt):
+                prompts.append(prompt)
+                return [2]
+
+        ctx.zhidao_answerer = CapturingAnswerer()
+        ctx.deepseek_answerer = StubAnswerer(error=AssertionError("should not fallback"))
+        answers, source = ctx.get_question_answer(make_question(1))
+        self.assertEqual(answers, [2])
+        self.assertEqual(source, "AI")
+        self.assertIn("参考资料", prompts[0])
+        self.assertIn("重点内容", prompts[0])
+
+        standalone = build_answer_prompt(
+            1, "题干", [{"id": 2, "content": "B"}], [{"name": "讲义", "content": "考点"}]
+        )
+        self.assertIn("讲义", standalone)
+        self.assertIn("考点", standalone)
 
     def test_prefers_zhidao_ai_then_deepseek(self):
         ctx, _ = self.make_ctx()
@@ -377,6 +431,86 @@ class ExamAnswerTests(unittest.TestCase):
         self.assertEqual(len(answer_events), 1)
         self.assertEqual(answer_events[0]["方式"], "AI:智慧树AI")
         self.assertIn("选项B", answer_events[0]["答案"])
+
+
+class StubExtractor:
+    def __init__(self):
+        self.calls = []
+
+    def collect(self, resources, course_name=""):
+        self.calls.append((list(resources), course_name))
+        return [{"name": "课件", "content": "重点内容"}]
+
+
+class RunnerResourceApi:
+    proxy = ""
+    session = None
+
+    def __init__(self):
+        self.paper_calls = 0
+        self.resource_calls = []
+
+    def query_paper(self, course_id, class_id, knowledge_id):
+        self.paper_calls += 1
+        return {
+            "examTestId": "exam-r",
+            "paperId": "paper-r",
+            "masteryScore": 0 if self.paper_calls == 1 else 100,
+        }
+
+    def list_knowledge_resources(self, course_id, class_id, knowledge_id):
+        self.resource_calls.append((course_id, class_id, knowledge_id))
+        return [
+            {
+                "resourcesDetail": {
+                    "resourcesType": 1,
+                    "resourcesDistributeType": 4,
+                    "resourcesUrl": "https://example.com/lesson.pptx",
+                }
+            }
+        ]
+
+
+class ExamRunnerReferenceTests(unittest.TestCase):
+    def test_runner_collects_and_passes_reference_materials(self):
+        directory = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, directory, True)
+        bank = AnswerBank("course-1", base_dir=directory)
+        api = RunnerResourceApi()
+        runner = ExamRunner(
+            "course-1",
+            "class-1",
+            api,
+            target=100,
+            max_attempts=2,
+            op_extra={"courseName": "测试课程"},
+            bank=bank,
+        )
+        extractor = StubExtractor()
+        runner.extractor = extractor
+        recorded = {}
+
+        class RecordingCtx:
+            def __init__(self, *args, **kwargs):
+                recorded["args"] = (args, kwargs)
+
+            def start(self, reference_materials=None):
+                recorded["materials"] = reference_materials
+                return True, 1, 1
+
+        with (
+            patch("modules.exam_ctx.ExamCtx", RecordingCtx),
+            patch("modules.exam_ctx.time.sleep"),
+        ):
+            result = runner._run_node("k-1", "知识点", {}, None)
+
+        self.assertEqual(result, "done")
+        self.assertEqual(
+            recorded["materials"], [{"name": "课件", "content": "重点内容"}]
+        )
+        self.assertEqual(len(extractor.calls), 1)
+        self.assertEqual(api.resource_calls, [("course-1", "class-1", "k-1")])
+        self.assertEqual(extractor.calls[0][1], "测试课程")
 
 
 if __name__ == "__main__":
