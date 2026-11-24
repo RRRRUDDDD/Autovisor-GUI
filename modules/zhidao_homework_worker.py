@@ -193,7 +193,7 @@ def payload_total_score(payload, default: float = 100.0) -> float:
 
 def payload_is_marking(payload) -> int | None:
     for source in _source_dict(payload):
-        for key in ("isMarking", "maxRedo", "markingCount"):
+        for key in ("isMarking", "markingCount"):
             raw = source.get(key)
             if raw is None:
                 continue
@@ -473,7 +473,10 @@ class ZhidaoHomeworkWorker:
             analysis=analysis,
             bank_reference=bank_reference,
         )
-        wrong_signatures = {tuple(sorted(combo)) for combo in combos}
+        if qtype == 3:
+            wrong_signatures = {tuple(combo) for combo in combos}
+        else:
+            wrong_signatures = {tuple(sorted(combo)) for combo in combos}
         last: tuple[list, str] = ([], "")
         for _attempt in range(ROLLBACK_RETRIES):
             try:
@@ -488,7 +491,7 @@ class ZhidaoHomeworkWorker:
                     prompt += "\n【重要】答案不能为空，请重新作答。"
                     continue
                 last = (fills, "AI")
-                if tuple(sorted(fills)) not in wrong_signatures:
+                if tuple(fills) not in wrong_signatures:
                     return last
             else:
                 ids = [item for item in ids if item in valid_ids]
@@ -741,13 +744,15 @@ class ZhidaoHomeworkWorker:
                 )
                 continue
 
-            wrong = _split_user_answer(answer_text, question.get("type", 1))
+            qtype = question.get("type", 1)
+            wrong = _split_user_answer(answer_text, qtype)
             if wrong:
                 self.store.record_wrong(
                     course,
                     exam_key,
                     question_id=question_id,
                     wrong_options=wrong,
+                    preserve_order=(qtype == 3),
                 )
             if self.analysis_api is None:
                 continue
@@ -877,6 +882,28 @@ class ZhidaoHomeworkWorker:
             return self.max_rounds
         return payload_max_redo(payload) or AUTO_MAX_ROUNDS
 
+    @staticmethod
+    def _merge_row(remembered: dict | None, existing: dict | None) -> dict | None:
+        if remembered is None:
+            return existing
+        if existing is None or remembered.get("id") == existing.get("id"):
+            return remembered
+        merged = dict(remembered)
+        if not merged.get("correct_options") and existing.get("correct_options"):
+            merged["correct_options"] = list(existing["correct_options"])
+        if not merged.get("ai_analysis") and existing.get("ai_analysis"):
+            merged["ai_analysis"] = existing["ai_analysis"]
+        if not merged.get("question_id") and existing.get("question_id"):
+            merged["question_id"] = existing["question_id"]
+        existing_wrong = _wrong_combos(existing)
+        if existing_wrong:
+            combined = _wrong_combos(merged)
+            for combo in existing_wrong:
+                if combo not in combined:
+                    combined.append(combo)
+            merged["wrong_options"] = combined
+        return merged
+
     def _run(
         self,
         *,
@@ -927,9 +954,9 @@ class ZhidaoHomeworkWorker:
             stats["rounds"] += 1
             answered = 0
             for question in questions:
-                row = self._remember_question(
-                    question, exam_key, course_id
-                ) or self._find_row(question, exam_key, course_id)
+                existing = self._find_row(question, exam_key, course_id)
+                remembered = self._remember_question(question, exam_key, course_id)
+                row = self._merge_row(remembered, existing)
                 values, source = self._answer_question(question, row)
                 if source in ("题库", "随机", "排除法"):
                     self.sleep(random.uniform(1.5, 3.0))
@@ -940,7 +967,7 @@ class ZhidaoHomeworkWorker:
                     course_id=course_id,
                     homework_id=homework_id,
                     stu_exam_id=stu_exam_id,
-                    exam_id=exam_id,
+                    exam_id=exam_key,
                     school_id=school_id,
                 )
                 answered += 1
@@ -967,10 +994,15 @@ class ZhidaoHomeworkWorker:
             total_score = payload_total_score(payload)
             if stats["score"] is not None and total_score > 0:
                 stats["score_percent"] = stats["score"] / total_score * 100
-            if (
-                stats["score_percent"] is not None
-                and stats["score_percent"] >= self.target_score
-            ) or (stats["score"] is not None and stats["score"] >= self.target_score):
+            else:
+                stats["score_percent"] = None
+            if stats["score_percent"] is not None:
+                reached = stats["score_percent"] >= self.target_score
+            elif stats["score"] is not None:
+                reached = stats["score"] >= self.target_score
+            else:
+                reached = False
+            if reached:
                 stats["target_reached"] = True
                 logger.info(
                     f"作业得分 {stats['score']}/{total_score:g} 已达标, 停止重做."
@@ -992,10 +1024,11 @@ class ZhidaoHomeworkWorker:
                 break
             marking = payload_is_marking(payload)
             if marking is None:
-                stats["is_marking"] += 1
+                stats["is_marking"] = stats["rounds"]
             else:
                 stats["is_marking"] = marking
-                if self.max_rounds == 0 and marking >= limit:
+                server_limit = payload_max_redo(payload) or limit
+                if self.max_rounds == 0 and marking >= server_limit:
                     logger.warn("作业重做次数已达上限, 停止重做.")
                     break
             self.api.save_course_tran(

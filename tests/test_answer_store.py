@@ -121,6 +121,79 @@ class ZhidaoBridgeTests(StoreTestCase):
         self.assertEqual(row["correct_options"], [11])
         self.assertEqual(row["wrong_options"], [["12"]])
 
+    def test_record_wrong_preserve_order_keeps_order_and_duplicates(self):
+        store, _ = self.make_store()
+        store.save_options_by_eid("course-1", "exam-1", "F-1", [], content="多空填空")
+        store.record_wrong(
+            "course-1",
+            "exam-1",
+            eid="F-1",
+            wrong_options=["乙", "甲"],
+            preserve_order=True,
+        )
+        store.record_wrong(
+            "course-1",
+            "exam-1",
+            eid="F-1",
+            wrong_options=["1", "1"],
+            preserve_order=True,
+        )
+        store.record_wrong(
+            "course-1",
+            "exam-1",
+            eid="F-1",
+            wrong_options=["甲", "乙"],
+            preserve_order=True,
+        )
+        row = store.get_by_eid("course-1", "F-1", exam_id="exam-1")
+        self.assertEqual(
+            row["wrong_options"],
+            [["乙", "甲"], ["1", "1"], ["甲", "乙"]],
+        )
+
+    def test_save_by_eid_bridges_existing_qid_row_and_reencrypted_eid(self):
+        store, _ = self.make_store()
+        id_row = store.save_options_by_id(
+            "course-1",
+            "exam-1",
+            "Q-10",
+            OPTIONS,
+            question_type="1",
+            content="已缓存题",
+        )
+        store.mark_correct(
+            "course-1", "exam-1", question_id="Q-10", correct_options=["11"]
+        )
+
+        # 首次传入 eid 时回填到已有 question_id 行
+        bridged_row = store.save_options_by_eid(
+            "course-1",
+            "exam-1",
+            "E-OLD",
+            OPTIONS,
+            question_type="1",
+            content="已缓存题",
+        )
+        self.assertEqual(bridged_row, id_row)
+        row = store.get_by_eid("course-1", "E-OLD", exam_id="exam-1")
+        self.assertEqual(row["question_id"], "Q-10")
+        self.assertEqual(row["correct_options"], ["11"])
+
+        # 重做时服务端重新加密 eid，仍复用原行并保留已掌握答案
+        reused_row = store.save_options_by_eid(
+            "course-1",
+            "exam-1",
+            "E-NEW",
+            OPTIONS,
+            question_type="1",
+            content="已缓存题",
+        )
+        self.assertEqual(reused_row, id_row)
+        row_new = store.get_by_eid("course-1", "E-NEW", exam_id="exam-1")
+        self.assertEqual(row_new["question_id"], "Q-10")
+        self.assertEqual(row_new["correct_options"], ["11"])
+        self.assertEqual(store.stats("course-1")["zhidao_questions"], 1)
+
 
 class AiSearchTests(StoreTestCase):
     def test_exact_loose_and_fuzzy_lookup(self):

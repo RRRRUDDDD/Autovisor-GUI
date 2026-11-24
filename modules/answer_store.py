@@ -375,6 +375,50 @@ class AiQuestionStore:
         row = self._read(action)
         return None if row is None else self._zhidao_row(row)
 
+    def _bridge_zhidao_for_eid(
+        self,
+        conn,
+        course_id: str,
+        exam_id: str,
+        *,
+        hashed: str,
+        content: str,
+    ) -> sqlite3.Row | None:
+        if hashed:
+            row = conn.execute(
+                "SELECT * FROM zhidao_questions WHERE course_id=? AND exam_id=? "
+                "AND eid IS NULL AND option_ids_hash=? ORDER BY id LIMIT 1",
+                (str(course_id), str(exam_id), hashed),
+            ).fetchone()
+            if row is not None:
+                return row
+        if content:
+            row = conn.execute(
+                "SELECT * FROM zhidao_questions WHERE course_id=? AND exam_id=? "
+                "AND eid IS NULL AND content=? "
+                "AND (option_ids_hash='' OR ?='') ORDER BY id LIMIT 1",
+                (str(course_id), str(exam_id), content, hashed),
+            ).fetchone()
+            if row is not None:
+                return row
+        if hashed:
+            row = conn.execute(
+                "SELECT * FROM zhidao_questions WHERE course_id=? AND exam_id=? "
+                "AND option_ids_hash=? ORDER BY id LIMIT 1",
+                (str(course_id), str(exam_id), hashed),
+            ).fetchone()
+            if row is not None:
+                return row
+        elif content:
+            row = conn.execute(
+                "SELECT * FROM zhidao_questions WHERE course_id=? AND exam_id=? "
+                "AND option_ids_hash='' AND content=? ORDER BY id LIMIT 1",
+                (str(course_id), str(exam_id), content),
+            ).fetchone()
+            if row is not None:
+                return row
+        return None
+
     # -------------------------------------------------- zhidao: write / bridge
     def save_options_by_eid(
         self,
@@ -413,6 +457,32 @@ class AiQuestionStore:
                     ),
                 )
                 return int(row["id"])
+            bridge = self._bridge_zhidao_for_eid(
+                conn,
+                course_id,
+                exam_id,
+                hashed=hashed,
+                content=_as_text(content),
+            )
+            if bridge is not None:
+                conn.execute(
+                    "UPDATE zhidao_questions SET eid=?, options=?, option_ids_hash=?, "
+                    "content=COALESCE(NULLIF(?, ''), content), "
+                    "question_type=COALESCE(NULLIF(?, ''), question_type), "
+                    "course_name=COALESCE(NULLIF(?, ''), course_name), "
+                    "last_updated=? WHERE id=?",
+                    (
+                        eid,
+                        _json_dumps(list(options or [])),
+                        hashed,
+                        _as_text(content),
+                        _as_text(question_type),
+                        _as_text(course_name),
+                        now,
+                        bridge["id"],
+                    ),
+                )
+                return int(bridge["id"])
             cursor = conn.execute(
                 "INSERT INTO zhidao_questions(course_id, course_name, exam_id, eid, "
                 "question_id, question_type, content, options, option_ids_hash, "
@@ -546,8 +616,18 @@ class AiQuestionStore:
         eid=None,
         question_id=None,
         wrong_options=None,
+        preserve_order: bool = False,
     ) -> int:
-        combo = sorted({_as_text(item) for item in (wrong_options or []) if _as_text(item)})
+        if preserve_order:
+            combo = [
+                _as_text(item).strip()
+                for item in (wrong_options or [])
+                if _as_text(item).strip()
+            ]
+        else:
+            combo = sorted(
+                {_as_text(item) for item in (wrong_options or []) if _as_text(item)}
+            )
         if not combo:
             return 0
 
@@ -564,11 +644,22 @@ class AiQuestionStore:
             history = _json_load(row["wrong_options"], [])
             if not isinstance(history, list):
                 history = []
-            normalized = [
-                sorted({_as_text(part) for part in item if _as_text(part)})
-                for item in history
-                if isinstance(item, list)
-            ]
+            if preserve_order:
+                normalized = [
+                    [
+                        _as_text(part).strip()
+                        for part in item
+                        if _as_text(part).strip()
+                    ]
+                    for item in history
+                    if isinstance(item, list)
+                ]
+            else:
+                normalized = [
+                    sorted({_as_text(part) for part in item if _as_text(part)})
+                    for item in history
+                    if isinstance(item, list)
+                ]
             normalized = [item for item in normalized if item]
             if combo not in normalized:
                 normalized.append(combo)

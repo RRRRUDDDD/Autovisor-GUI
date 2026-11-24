@@ -626,7 +626,14 @@ async def auto_answer_homework(page, config=None) -> dict:
         if question is None:
             break
         dom_sig = await _signature(question)
+        if dom_sig:
+            if dom_sig in seen:
+                logger.info("题目未切换（可能已到最后一题）, 停止作答.")
+                break
+            seen.add(dom_sig)
         if await _has_answer(question):
+            if not dom_sig:
+                seen.add(f"answered:{index}")
             logger.info(f"第{index}题 已有答案（接口已保存）, 跳过视觉识别.")
             logger.event("作业答题", 题号=index, 结果="已作答跳过")
             advanced, had_next = await _goto_next(page, dom_sig or None)
@@ -651,11 +658,12 @@ async def auto_answer_homework(page, config=None) -> dict:
                 stuck = True
                 logger.warn("点击下一题后题目未切换, 停止作答.")
             break
-        sig = dom_sig or "img:" + hashlib.sha1(shot).hexdigest()[:16]
-        if sig in seen:
-            logger.info("题目未切换（可能已到最后一题）, 停止作答.")
-            break
-        seen.add(sig)
+        if not dom_sig:
+            sig = "img:" + hashlib.sha1(shot).hexdigest()[:16]
+            if sig in seen:
+                logger.info("题目未切换（可能已到最后一题）, 停止作答.")
+                break
+            seen.add(sig)
 
         try:
             reply = await asyncio.to_thread(

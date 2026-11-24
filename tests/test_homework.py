@@ -136,6 +136,69 @@ class HybridRoutingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(attempts["count"], 2)
         settle.assert_awaited_once()
 
+    async def test_visual_loop_counts_skipped_answered_questions_in_seen(self):
+        class _DummyQuestion:
+            def __init__(self, sig, answered):
+                self.sig = sig
+                self.answered = answered
+
+            async def screenshot(self, **_kwargs):
+                return b"fake-png"
+
+        class _VisualPage:
+            url = (
+                "https://onlineexamh5new.zhihuishu.com/stuExamWeb.html"
+                "#/webExamList/dohomework/458533/tok1/tok2/1000013343/1847/0"
+            )
+
+            async def wait_for_load_state(self, *_args, **_kwargs):
+                return None
+
+            async def reload(self, *_args, **_kwargs):
+                return None
+
+        questions = [_DummyQuestion("sig-1", True), _DummyQuestion("sig-2", True)]
+        cursor = {"idx": 0}
+
+        async def fake_visible(_page):
+            return questions[cursor["idx"]]
+
+        async def fake_sig(handle):
+            return handle.sig
+
+        async def fake_has_answer(handle):
+            return handle.answered
+
+        async def fake_goto_next(_page, _sig=None):
+            if cursor["idx"] == 0:
+                cursor["idx"] = 1
+                return True, True
+            # 最后一题：下一题按钮仍可见但点击不再翻页
+            return False, True
+
+        save_or_submit = AsyncMock()
+        config = types.SimpleNamespace(
+            enableHomeworkApi=False, enableFormalExamApi=False, proxy=""
+        )
+        with (
+            patch.object(homework.llm, "vision_enabled", return_value=True),
+            patch.object(homework.llm, "vision_label", return_value="test-vl"),
+            patch.object(homework.llm, "conf", return_value={"auto_submit": True}),
+            patch.object(homework, "_wait_question", new=AsyncMock(return_value=questions[0])),
+            patch.object(homework, "_visible_question", new=fake_visible),
+            patch.object(homework, "_signature", new=fake_sig),
+            patch.object(homework, "_has_answer", new=fake_has_answer),
+            patch.object(homework, "_question_total", new=AsyncMock(return_value=2)),
+            patch.object(homework, "_goto_next", new=fake_goto_next),
+            patch.object(homework, "_save_or_submit", new=save_or_submit),
+        ):
+            stats = await homework.auto_answer_homework(_VisualPage(), config=config)
+
+        self.assertEqual(stats, {"ok": 0, "fill": 0, "fail": 0})
+        # seen 已计满 total=2，不应误判 stuck=True 而取消自动提交
+        save_or_submit.assert_awaited_once()
+        self.assertTrue(save_or_submit.await_args.args[1])
+
 
 if __name__ == "__main__":
     unittest.main()

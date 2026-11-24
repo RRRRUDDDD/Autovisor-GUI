@@ -465,6 +465,176 @@ class HomeworkWorkerLifecycleTests(unittest.TestCase):
         self.assertEqual(stats["answered"], 1)
         self.assertEqual(api.saved[0]["answer"], "甲/乙")
 
+    def test_max_rounds_zero_with_server_max_redo_runs_up_to_three_rounds(self):
+        payload = _payload(
+            _dto("q1", 1, "1+1=?", [(11, "1"), (12, "2"), (13, "3")])
+        )
+        payload["rt"]["examBase"]["maxRedo"] = 3
+        api = FakeHomeworkApi(payload, [20, 40, 50])
+        answerer = ScriptedAnswerer([_ids(11), _ids(12), _ids(13)])
+        worker = self._worker(
+            api, answerer, None, target_score=80, max_rounds=0
+        )
+        stats = worker.run(
+            recruit_id="R1",
+            course_id="C1",
+            homework_id="H1",
+            stu_exam_id="S1",
+            exam_id="E1",
+        )
+        self.assertEqual(stats["rounds"], 3)
+        self.assertEqual(api.submit_calls, 3)
+        self.assertEqual(api.tran_calls, 2)
+        self.assertFalse(stats["target_reached"])
+
+    def test_non_100_scale_score_uses_percentage_not_raw_score(self):
+        payload = _payload(
+            _dto("q1", 1, "200分制题", [(11, "1"), (12, "2"), (13, "3")])
+        )
+        payload["rt"]["examBase"]["totalScore"] = 200
+        # 100/200 = 50% < 80% 不应提前停止; 160/200 = 80% >= 80% 达标停止
+        api = FakeHomeworkApi(payload, [100, 160])
+        answerer = ScriptedAnswerer([_ids(11), _ids(12)])
+        worker = self._worker(
+            api, answerer, None, target_score=80, max_rounds=3
+        )
+        stats = worker.run(
+            recruit_id="R1",
+            course_id="C1",
+            homework_id="H1",
+            stu_exam_id="S1",
+            exam_id="E1",
+        )
+        self.assertEqual(stats["rounds"], 2)
+        self.assertEqual(stats["score"], 160.0)
+        self.assertEqual(stats["score_percent"], 80.0)
+        self.assertTrue(stats["target_reached"])
+        self.assertEqual(api.submit_calls, 2)
+
+    def test_multi_blank_fill_preserves_order_and_duplicate_values(self):
+        payload = _payload(_dto("f2", 3, "双空填空题"))
+
+        class MultiBlankApi(FakeHomeworkApi):
+            def look_homework(self, **kwargs):
+                self.look_calls += 1
+                return {
+                    "rt": {
+                        "examBase": {
+                            "workExamParts": [
+                                {
+                                    "questionDtos": [
+                                        {
+                                            "eid": "f2",
+                                            "id": "f2",
+                                            "name": "双空填空题",
+                                            "questionType": {"id": 3},
+                                            "questionOptions": [],
+                                            "isCorrect": 0,
+                                            "userAnswerVo": {"answer": "1/1"},
+                                        }
+                                    ]
+                                }
+                            ]
+                        }
+                    }
+                }
+
+            def get_stu_answer_info(self, **kwargs):
+                self.info_calls += 1
+                return {"rt": [{"questionId": "f2", "isRight": 0, "userAnswer": "1/1"}]}
+
+        api = MultiBlankApi(payload, [0, 100])
+        # 预置历史错解 ["甲", "乙"]，第一轮填 ["1", "1"] 被判错后应原样保留两空，
+        # 第二轮模型返回逆序 ["乙", "甲"] 应被接受而非因无序去重被拒。
+        self.store.save_options_by_eid(
+            "C1", "E1", "f2", [], question_type="3", content="双空填空题"
+        )
+        self.store.record_wrong(
+            "C1",
+            "E1",
+            eid="f2",
+            wrong_options=["甲", "乙"],
+            preserve_order=True,
+        )
+        answerer = ScriptedAnswerer([_fills("1", "1"), _fills("乙", "甲")])
+        worker = self._worker(api, answerer, None, target_score=80, max_rounds=3)
+        stats = worker.run(
+            recruit_id="R1",
+            course_id="C1",
+            homework_id="H1",
+            stu_exam_id="S1",
+            exam_id="E1",
+        )
+        self.assertTrue(stats["target_reached"])
+        self.assertEqual([call["answer"] for call in api.saved], ["1/1", "乙/甲"])
+        row = self.store.get_by_eid("C1", "f2", "E1")
+        self.assertIn(["甲", "乙"], row["wrong_options"])
+        self.assertIn(["1", "1"], row["wrong_options"])
+
+    def test_cached_qid_or_old_eid_hits_bank_when_new_eid_arrives_and_uses_exam_key(self):
+        # 1) 缓存中仅有 question_id（无 eid）
+        self.store.save_options_by_id(
+            "C1",
+            "H1",
+            "901",
+            [{"id": "11", "content": "甲"}, {"id": "12", "content": "乙"}],
+            question_type="1",
+            content="仅qid题",
+        )
+        self.store.mark_correct(
+            "C1", "H1", question_id="901", correct_options=["12"]
+        )
+        # 2) 缓存中存在旧 eid 的已掌握记录
+        self.store.save_options_by_eid(
+            "C1",
+            "H1",
+            "old_eid",
+            [{"id": "21", "content": "丙"}, {"id": "22", "content": "丁"}],
+            question_type="1",
+            content="旧eid题",
+        )
+        self.store.mark_correct(
+            "C1", "H1", eid="old_eid", correct_options=["21"]
+        )
+
+        payload = _payload(
+            {
+                "eid": "fresh_eid_1",
+                "name": "仅qid题",
+                "questionType": {"id": 1},
+                "questionOptions": [
+                    {"id": 11, "content": "甲"},
+                    {"id": 12, "content": "乙"},
+                ],
+            },
+            {
+                "eid": "fresh_eid_2",
+                "name": "旧eid题",
+                "questionType": {"id": 1},
+                "questionOptions": [
+                    {"id": 21, "content": "丙"},
+                    {"id": 22, "content": "丁"},
+                ],
+            },
+        )
+        api = FakeHomeworkApi(payload, [])
+
+        def boom(_prompt):
+            raise AssertionError("命中已掌握缓存不应调用大模型")
+
+        worker = self._worker(api, boom, None, auto_submit=False)
+        stats = worker.run(
+            recruit_id="R1",
+            course_id="C1",
+            homework_id="H1",
+            stu_exam_id="S1",
+            exam_id="",
+        )
+        self.assertEqual(stats["answered"], 2)
+        self.assertEqual([call["answer"] for call in api.saved], ["12", "21"])
+        # exam_id 为空时 _save_answer 应统一使用 exam_key (homework_id="H1")
+        self.assertEqual([call["exam_id"] for call in api.saved], ["H1", "H1"])
+
 
 class PromptAndParseTests(unittest.TestCase):
     def test_parse_homework_answer_supports_ids_letters_and_text(self):
