@@ -415,6 +415,8 @@ pub struct AutovisorConfig {
     pub homework_max_redo: i64,
     #[serde(default = "default_true")]
     pub enable_formal_exam_api: bool,
+    #[serde(default)]
+    pub force_redo_answered: bool,
     #[serde(default = "default_log_max_size_mb")]
     pub log_max_size_mb: i64,
     #[serde(default = "default_log_retention_days")]
@@ -483,6 +485,7 @@ impl Default for AutovisorConfig {
             homework_threshold: 100.0,
             homework_max_redo: 3,
             enable_formal_exam_api: true,
+            force_redo_answered: false,
             log_max_size_mb: 10,
             log_retention_days: 14,
             log_max_files: 200,
@@ -709,6 +712,9 @@ pub fn parse_ini_str(content: &str) -> (AutovisorConfig, Vec<String>) {
                 "enableformalexamapi" => {
                     cfg.enable_formal_exam_api = parse_bool(&val, true);
                 }
+                "forceredoanswered" => {
+                    cfg.force_redo_answered = parse_bool(&val, false);
+                }
                 _ => {}
             },
             "course-url" => {
@@ -842,6 +848,11 @@ pub fn render_ini_str(cfg: &AutovisorConfig) -> String {
             "enablePptReference = {}",
             format_bool(cfg.enable_ppt_reference)
         ),
+        ";答题时遇到已有保存答案的题目是否强制重新作答 (默认:False)".to_string(),
+        format!(
+            "forceRedoAnswered = {}",
+            format_bool(cfg.force_redo_answered)
+        ),
         String::new(),
         "[course-url]".to_string(),
         ";配置要学习的课程链接,支持智慧共享课、翻转课、融合共享课、AI慕课(wisdom-mooc)、AI智慧课".to_string(),
@@ -867,20 +878,28 @@ pub fn render_ini_str(cfg: &AutovisorConfig) -> String {
 
 pub fn load_config_from_dir(base_dir: &Path) -> Result<AutovisorConfig, String> {
     let config_path = base_dir.join("config.ini");
-    let (mut cfg, ini_urls) = if config_path.is_file() {
-        let bytes = fs::read(&config_path).map_err(|e| format!("读取 config.ini 失败: {e}"))?;
-        let text = String::from_utf8_lossy(&bytes).to_string();
-        parse_ini_str(&text)
-    } else {
-        (AutovisorConfig::default(), Vec::new())
+    let (mut cfg, ini_urls) = match fs::read(&config_path) {
+        Ok(bytes) => {
+            if bytes.contains(&0) {
+                return Err("config.ini 文件已损坏（包含非法空字节）".to_string());
+            }
+            let text = String::from_utf8_lossy(&bytes).to_string();
+            parse_ini_str(&text)
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            (AutovisorConfig::default(), Vec::new())
+        }
+        Err(e) => return Err(format!("读取 config.ini 失败: {e}")),
     };
 
     // Merge companion metadata (gui_courses.json) to preserve custom titles and unchecked courses
     let meta_path = base_dir.join("data").join("gui_courses.json");
-    let saved_courses: Vec<CourseItem> = fs::read_to_string(&meta_path)
-        .ok()
-        .and_then(|raw| serde_json::from_str::<Vec<CourseItem>>(&raw).ok())
-        .unwrap_or_default();
+    let saved_courses: Vec<CourseItem> = match fs::read_to_string(&meta_path) {
+        Ok(raw) => serde_json::from_str::<Vec<CourseItem>>(raw.trim_start_matches('\u{feff}'))
+            .map_err(|e| format!("解析 gui_courses.json 失败: {e}"))?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(e) => return Err(format!("读取 gui_courses.json 失败: {e}")),
+    };
 
     let ini_set: HashSet<String> = ini_urls.iter().cloned().collect();
     let mut merged: Vec<CourseItem> = Vec::new();
@@ -929,20 +948,31 @@ pub fn load_config_from_dir(base_dir: &Path) -> Result<AutovisorConfig, String> 
 
     // Load mirrors.json
     let mirrors_path = base_dir.join("data").join("mirrors.json");
-    if let Ok(raw) = fs::read_to_string(&mirrors_path) {
-        if let Ok(parsed) = serde_json::from_str::<BTreeMap<String, String>>(raw.trim_start_matches('\u{feff}')) {
+    match fs::read_to_string(&mirrors_path) {
+        Ok(raw) => {
+            let parsed = serde_json::from_str::<BTreeMap<String, String>>(
+                raw.trim_start_matches('\u{feff}'),
+            )
+            .map_err(|e| format!("解析 mirrors.json 失败: {e}"))?;
             if !parsed.is_empty() {
                 cfg.mirrors = parsed;
             }
         }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(format!("读取 mirrors.json 失败: {e}")),
     }
 
     // Load data/llm.json (universal LLM quiz solver)
     let llm_path = base_dir.join("data").join("llm.json");
-    if let Ok(raw) = fs::read_to_string(&llm_path) {
-        if let Ok(parsed) = serde_json::from_str::<LlmDiskConfig>(raw.trim_start_matches('\u{feff}')) {
+    match fs::read_to_string(&llm_path) {
+        Ok(raw) => {
+            let parsed =
+                serde_json::from_str::<LlmDiskConfig>(raw.trim_start_matches('\u{feff}'))
+                    .map_err(|e| format!("解析 llm.json 失败: {e}"))?;
             cfg.llm = LlmConfig::from(parsed);
         }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(format!("读取 llm.json 失败: {e}")),
     }
 
     Ok(cfg)
@@ -1034,23 +1064,40 @@ pub fn merge_discovered_courses(
     result
 }
 
-fn write_file_atomic(target: &Path, content: &[u8], label: &str) -> Result<(), String> {
-    if let Some(parent) = target.parent() {
-        let _ = fs::create_dir_all(parent);
+fn atomic_io_lock() -> &'static std::sync::Mutex<()> {
+    static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| std::sync::Mutex::new(()))
+}
+
+pub fn write_file_atomic(target: &Path, content: &[u8], label: &str) -> Result<(), String> {
+    use std::io::Write;
+
+    let _guard = atomic_io_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let parent = target
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent).map_err(|e| format!("创建 {label} 目录失败: {e}"))?;
+
+    let mut tmp = tempfile::Builder::new()
+        .prefix(".tmp-autovisor-")
+        .tempfile_in(parent)
+        .map_err(|e| format!("创建 {label} 临时文件失败: {e}"))?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = tmp
+            .as_file()
+            .set_permissions(fs::Permissions::from_mode(0o600));
     }
-    let file_name = target
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or("config");
-    let tmp_path = target.with_file_name(format!(".tmp-{file_name}-{}", std::process::id()));
-    fs::write(&tmp_path, content).map_err(|e| format!("写入 {label} 失败: {e}"))?;
-    if fs::rename(&tmp_path, target).is_err() {
-        let _ = fs::remove_file(target);
-        if fs::rename(&tmp_path, target).is_err() {
-            let _ = fs::remove_file(&tmp_path);
-            fs::write(target, content).map_err(|e| format!("写入 {label} 失败: {e}"))?;
-        }
-    }
+
+    tmp.write_all(content)
+        .and_then(|_| tmp.as_file().sync_all())
+        .map_err(|e| format!("写入 {label} 失败: {e}"))?;
+
+    tmp.persist(target)
+        .map_err(|e| format!("保存 {label} 失败: {}", e.error))?;
     Ok(())
 }
 
@@ -1081,7 +1128,25 @@ pub fn save_config_to_dir(base_dir: &Path, cfg: &AutovisorConfig) -> Result<Auto
     let llm_text = format!("{llm_json}\n");
     write_file_atomic(&llm_path, llm_text.as_bytes(), "llm.json")?;
 
-    load_config_from_dir(base_dir)
+    // 在内存中构造规范化副本，避免每次保存都冗余重读磁盘和扫描本机浏览器
+    let (mut normalized, _) = parse_ini_str(&ini_text);
+    let mut cleaned_courses = Vec::with_capacity(cfg.courses.len());
+    let mut seen_urls = HashSet::new();
+    for item in &cfg.courses {
+        let trimmed = item.url.trim().to_string();
+        if !is_https_url(&trimmed) || !seen_urls.insert(trimmed.clone()) {
+            continue;
+        }
+        let mut copy = item.clone();
+        copy.url = trimmed;
+        cleaned_courses.push(copy);
+    }
+    normalized.courses = cleaned_courses;
+    if !cfg.mirrors.is_empty() {
+        normalized.mirrors = cfg.mirrors.clone();
+    }
+    normalized.llm = LlmConfig::from(llm_disk);
+    Ok(normalized)
 }
 
 #[cfg(test)]
@@ -1360,5 +1425,36 @@ mod tests {
         assert!(rendered.contains("shutdownOnComplete = True"));
         let (parsed, _) = parse_ini_str(&rendered);
         assert!(parsed.shutdown_on_complete);
+    }
+
+    #[test]
+    fn write_file_atomic_handles_concurrent_writers_without_conflict() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("autovisor_t16_atomic_{nanos}"));
+        fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("concurrent.json");
+
+        let mut handles = Vec::new();
+        for tid in 0..8usize {
+            let p = target.clone();
+            handles.push(std::thread::spawn(move || {
+                for iter in 0..15usize {
+                    let body = format!("{{\"tid\":{tid},\"iter\":{iter}}}");
+                    write_file_atomic(&p, body.as_bytes(), "concurrent.json").unwrap();
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+        let final_text = fs::read_to_string(&target).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&final_text).unwrap();
+        assert!(parsed.get("tid").is_some());
+        assert!(parsed.get("iter").is_some());
+
+        let _ = fs::remove_dir_all(&dir);
     }
 }

@@ -1,7 +1,10 @@
-use crate::backend::BackendManager;
+use crate::backend::{lock_unpoisoned, BackendManager};
 use crate::browser_detect::{detect_installed_browsers, resolve_browser_choice};
-use crate::config_ini::{load_config_from_dir, merge_discovered_courses, save_config_to_dir, CourseItem};
-use crate::runtime::{load_prefs, save_prefs, SessionProfile};
+use crate::config_ini::{
+    load_config_from_dir, merge_discovered_courses, save_config_to_dir, write_file_atomic,
+    AutovisorConfig, CourseItem,
+};
+use crate::runtime::{update_prefs, SavedLoginInfo, SessionProfile};
 use crate::process_tree::{configure_hidden_command, prepare_process_tree_command, Job};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -10,7 +13,7 @@ use std::fs;
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -93,57 +96,103 @@ struct PlaywrightCookie {
     same_site: Option<String>,
 }
 
+struct ActiveSession {
+    id: u64,
+    job: Option<Arc<Job>>,
+    cancel_flag: Arc<AtomicBool>,
+}
+
 pub struct ZhsSessionManager {
-    active_job: Mutex<Option<Arc<Job>>>,
-    cancelled: Arc<AtomicBool>,
+    active_session: Mutex<Option<ActiveSession>>,
+    next_session_id: AtomicU64,
 }
 
 impl ZhsSessionManager {
     pub fn new() -> Self {
         Self {
-            active_job: Mutex::new(None),
-            cancelled: Arc::new(AtomicBool::new(false)),
+            active_session: Mutex::new(None),
+            next_session_id: AtomicU64::new(0),
         }
     }
 
     pub fn cancel(&self) {
-        self.cancelled.store(true, Ordering::SeqCst);
-        let job = {
-            let mut guard = self.active_job.lock().unwrap();
+        let prev = {
+            let mut guard = lock_unpoisoned(&self.active_session);
             guard.take()
         };
-        if let Some(j) = job {
-            j.terminate();
+        if let Some(sess) = prev {
+            sess.cancel_flag.store(true, Ordering::SeqCst);
+            if let Some(j) = sess.job {
+                j.terminate();
+            }
         }
     }
 
-    fn begin(&self, job: Arc<Job>) {
-        self.cancelled.store(false, Ordering::SeqCst);
+    /// 开启一次新的登录尝试，返回专属的 (session_id, cancel_flag)。
+    /// 若存在尚未结束的旧登录会话，仅标记旧会话取消并终止其进程树，不会清掉旧会话的取消状态。
+    fn start_attempt(&self) -> (u64, Arc<AtomicBool>) {
+        let sid = self.next_session_id.fetch_add(1, Ordering::SeqCst) + 1;
+        let cancel_flag = Arc::new(AtomicBool::new(false));
         let prev = {
-            let mut guard = self.active_job.lock().unwrap();
-            guard.replace(job)
+            let mut guard = lock_unpoisoned(&self.active_session);
+            guard.replace(ActiveSession {
+                id: sid,
+                job: None,
+                cancel_flag: Arc::clone(&cancel_flag),
+            })
         };
         if let Some(old) = prev {
-            old.terminate();
+            old.cancel_flag.store(true, Ordering::SeqCst);
+            if let Some(j) = old.job {
+                j.terminate();
+            }
         }
+        (sid, cancel_flag)
     }
 
-    fn finish(&self) {
+    fn attach_job(&self, session_id: u64, job: Arc<Job>) -> bool {
+        let mut guard = lock_unpoisoned(&self.active_session);
+        if let Some(ref mut sess) = *guard {
+            if sess.id == session_id && !sess.cancel_flag.load(Ordering::SeqCst) {
+                let old_job = sess.job.replace(job);
+                drop(guard);
+                if let Some(old) = old_job {
+                    old.terminate();
+                }
+                return true;
+            }
+        }
+        drop(guard);
+        job.terminate();
+        false
+    }
+
+    #[cfg(test)]
+    fn begin(&self, job: Arc<Job>) -> u64 {
+        let (sid, _) = self.start_attempt();
+        let _ = self.attach_job(sid, job);
+        sid
+    }
+
+    fn finish_with_child(&self, session_id: u64, child: Option<&mut Child>) {
         let job = {
-            let mut guard = self.active_job.lock().unwrap();
-            guard.take()
+            let mut guard = lock_unpoisoned(&self.active_session);
+            if guard.as_ref().map(|s| s.id) == Some(session_id) {
+                guard.take().and_then(|s| s.job)
+            } else {
+                None
+            }
         };
         if let Some(j) = job {
-            j.terminate();
+            j.terminate_with_child(child);
+        } else if let Some(c) = child {
+            let _ = c.try_wait();
         }
     }
 
-    fn is_cancelled(&self) -> bool {
-        self.cancelled.load(Ordering::SeqCst)
-    }
-
-    fn reset_cancel(&self) {
-        self.cancelled.store(false, Ordering::SeqCst);
+    #[cfg(test)]
+    fn finish(&self, session_id: u64) {
+        self.finish_with_child(session_id, None);
     }
 }
 
@@ -169,7 +218,7 @@ fn emit_status(app: &AppHandle, phase: &str, message: &str, needs_action: bool) 
 pub fn search_schools(query: &str, proxy: &str) -> Result<Vec<SchoolItem>, String> {
     let cache_mutex = SCHOOL_CACHE.get_or_init(|| Mutex::new(None));
     let schools: Vec<SchoolItem> = {
-        let guard = cache_mutex.lock().unwrap();
+        let guard = lock_unpoisoned(cache_mutex);
         if let Some(ref list) = *guard {
             list.clone()
         } else {
@@ -226,7 +275,7 @@ pub fn search_schools(query: &str, proxy: &str) -> Result<Vec<SchoolItem>, Strin
             if parsed.is_empty() {
                 return Err("智慧树学校列表为空，请稍后重试".to_string());
             }
-            let mut guard = cache_mutex.lock().unwrap();
+            let mut guard = lock_unpoisoned(cache_mutex);
             *guard = Some(parsed.clone());
             parsed
         }
@@ -662,17 +711,10 @@ fn normalize_cdp_cookies(raw_cookies: &[Value]) -> Vec<PlaywrightCookie> {
 
 fn save_cookies_atomic(base_dir: &Path, cookies: &[PlaywrightCookie]) -> Result<(), String> {
     let data_dir = base_dir.join("data");
-    fs::create_dir_all(&data_dir).map_err(|e| format!("创建 data 目录失败: {e}"))?;
     let target = data_dir.join("cookies.json");
-    let tmp = data_dir.join(format!(".cookies-{}.tmp", std::process::id()));
     let json_text =
         serde_json::to_string(cookies).map_err(|e| format!("序列化 Cookie 失败: {e}"))?;
-    fs::write(&tmp, json_text.as_bytes()).map_err(|e| format!("写入临时 Cookie 文件失败: {e}"))?;
-    fs::rename(&tmp, &target).or_else(|_| {
-        let _ = fs::remove_file(&target);
-        fs::rename(&tmp, &target)
-    }).map_err(|e| format!("保存 Cookie 文件失败: {e}"))?;
-    Ok(())
+    write_file_atomic(&target, json_text.as_bytes(), "Cookie 文件")
 }
 
 fn load_saved_cookies(base_dir: &Path) -> Result<Vec<PlaywrightCookie>, String> {
@@ -737,6 +779,7 @@ fn launch_cdp_browser(
     initial_url: &str,
     proxy: &str,
     manager: &ZhsSessionManager,
+    session_id: u64,
 ) -> Result<Child, String> {
     let job = Arc::new(Job::create()?);
     let mut cmd = Command::new(exe_path);
@@ -765,21 +808,27 @@ fn launch_cdp_browser(
     prepare_process_tree_command(&mut cmd);
     cmd.arg(initial_url);
 
-    let child = cmd
+    let mut child = cmd
         .spawn()
         .map_err(|e| format!("启动浏览器失败 ({exe_path}): {e}"))?;
     if let Err(e) = job.assign(child.id()) {
-        job.terminate();
+        let _ = child.kill();
+        let _ = child.wait();
+        job.terminate_with_child(Some(&mut child));
         return Err(format!("托管浏览器进程树失败: {e}"));
     }
-    manager.begin(job);
+    if !manager.attach_job(session_id, job) {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err("已取消登录".to_string());
+    }
     Ok(child)
 }
 
 fn wait_for_cdp_ws_url(
     port: u16,
     child: &mut Child,
-    manager: &ZhsSessionManager,
+    cancel_flag: &AtomicBool,
 ) -> Result<String, String> {
     let client = reqwest::blocking::Client::builder()
         .no_proxy()
@@ -790,7 +839,7 @@ fn wait_for_cdp_ws_url(
     let list_url = format!("http://127.0.0.1:{port}/json/list");
     let deadline = Instant::now() + Duration::from_secs(20);
     while Instant::now() < deadline {
-        if manager.is_cancelled() {
+        if cancel_flag.load(Ordering::SeqCst) {
             return Err("已取消登录".to_string());
         }
         if let Ok(Some(_)) = child.try_wait() {
@@ -1184,6 +1233,42 @@ fn short_hash(input: &str) -> String {
     format!("{h:016x}")
 }
 
+fn is_user_profile_context(source_url: &str, parent_key: &str) -> bool {
+    let url_lower = source_url.trim().to_ascii_lowercase();
+    let parent_lower = parent_key.trim().to_ascii_lowercase();
+    let is_course_endpoint = !url_lower.is_empty()
+        && [
+            "course",
+            "share",
+            "recommend",
+            "banner",
+            "hot",
+            "teacher",
+            "schoollist",
+        ]
+        .iter()
+        .any(|bad| url_lower.contains(bad));
+    if is_course_endpoint {
+        return false;
+    }
+    let url_is_profile = !url_lower.is_empty()
+        && [
+            "getloginuserinfo",
+            "userinfo",
+            "loginuser",
+            "studentinfo",
+            "getloginschoolinfo",
+            "accountinfo",
+        ]
+        .iter()
+        .any(|good| url_lower.contains(good));
+    let parent_is_profile = matches!(
+        parent_lower.as_str(),
+        "userinfo" | "loginuser" | "loginuserinfo" | "studentinfo" | "accountinfo" | "user"
+    );
+    url_is_profile || parent_is_profile
+}
+
 fn extract_courses_and_profile_from_json_with_context(
     val: &Value,
     parent_key: &str,
@@ -1215,7 +1300,7 @@ fn extract_courses_and_profile_from_json_with_context(
                 || map.contains_key("courseId");
             if let Some(course) = built_course {
                 courses.push(course);
-            } else if !looks_like_course {
+            } else if !looks_like_course && is_user_profile_context(source_url, parent_key) {
                 if display_name.is_empty() {
                     let candidate =
                         get_string_field(map, &["realName", "nickName", "userName", "studentName"]);
@@ -1579,7 +1664,7 @@ fn collect_captured_responses(
 fn discover_courses_in_current_session(
     cdp: &mut CdpClient,
     app: &AppHandle,
-    manager: &ZhsSessionManager,
+    cancel_flag: &AtomicBool,
 ) -> Result<(Vec<CourseItem>, String, String), String> {
     emit_status(
         app,
@@ -1611,7 +1696,7 @@ fn discover_courses_in_current_session(
         let wait_deadline = Instant::now() + Duration::from_secs(6);
         let mut ready_ticks = 0u32;
         while Instant::now() < wait_deadline {
-            if manager.is_cancelled() {
+            if cancel_flag.load(Ordering::SeqCst) {
                 return Err("已取消操作".to_string());
             }
             cdp.drain_events(Duration::from_millis(400));
@@ -1860,6 +1945,27 @@ fn merge_cookies(base: &[PlaywrightCookie], updates: &[PlaywrightCookie]) -> Vec
     out
 }
 
+fn merge_and_save_session_config(
+    base_dir: &Path,
+    req: &LoginRequest,
+    browser_override: Option<(String, String)>,
+    discovered_courses: Vec<CourseItem>,
+) -> Result<AutovisorConfig, String> {
+    let mut cfg = load_config_from_dir(base_dir)?;
+    if let Some((driver, browser_exe)) = browser_override {
+        cfg.driver = driver;
+        cfg.exe_path = browser_exe;
+    }
+    if req.mode == "phone" && req.remember_credentials {
+        cfg.username = req.username.trim().to_string();
+        cfg.password = req.password.clone();
+    }
+    if !discovered_courses.is_empty() {
+        cfg.courses = merge_discovered_courses(&cfg.courses, discovered_courses);
+    }
+    save_config_to_dir(base_dir, &cfg)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn finalize_session_result(
     app: &AppHandle,
@@ -1874,89 +1980,133 @@ fn finalize_session_result(
 ) -> Result<SessionResult, String> {
     save_cookies_atomic(base_dir, cookies)?;
 
-    let mut cfg = load_config_from_dir(base_dir).unwrap_or_default();
-    if let Some((driver, browser_exe)) = browser_override {
-        cfg.driver = driver;
-        cfg.exe_path = browser_exe;
-    }
-    if req.mode == "phone" && req.remember_credentials {
-        cfg.username = req.username.trim().to_string();
-        cfg.password = req.password.clone();
-    }
-    if !discovered_courses.is_empty() {
-        cfg.courses = merge_discovered_courses(&cfg.courses, discovered_courses);
-    }
-    let saved_cfg = save_config_to_dir(base_dir, &cfg)?;
+    let saved_cfg =
+        merge_and_save_session_config(base_dir, req, browser_override, discovered_courses)?;
 
-    let mut prefs = load_prefs();
-    let prev_session = prefs.session.clone();
-    let account = if req.mode == "student" && !req.student_id.trim().is_empty() {
-        req.student_id.trim().to_string()
-    } else if req.mode == "phone" && !req.username.trim().is_empty() {
-        mask_account(&req.username)
-    } else if is_cookie_mode {
-        prev_session
-            .as_ref()
-            .map(|s| s.account.clone())
-            .unwrap_or_default()
-    } else {
-        String::new()
-    };
+    let mut profile_out: Option<SessionProfile> = None;
+    let _ = update_prefs(|prefs| {
+        let prev_session = prefs.session.clone();
+        let account = if req.mode == "student" && !req.student_id.trim().is_empty() {
+            req.student_id.trim().to_string()
+        } else if req.mode == "phone" && !req.username.trim().is_empty() {
+            mask_account(&req.username)
+        } else if is_cookie_mode {
+            prev_session
+                .as_ref()
+                .map(|s| s.account.clone())
+                .unwrap_or_default()
+        } else {
+            String::new()
+        };
 
-    let school_name = if !req.school_name.trim().is_empty() {
-        req.school_name.trim().to_string()
-    } else if !detected_school.is_empty() {
-        detected_school
-    } else {
-        prev_session
-            .as_ref()
-            .map(|s| s.school_name.clone())
-            .unwrap_or_default()
-    };
+        let school_name = if !req.school_name.trim().is_empty() {
+            req.school_name.trim().to_string()
+        } else if !detected_school.is_empty() {
+            detected_school.clone()
+        } else if is_cookie_mode {
+            prev_session
+                .as_ref()
+                .map(|s| s.school_name.clone())
+                .unwrap_or_default()
+        } else {
+            String::new()
+        };
 
-    let school_id = if !req.school_id.trim().is_empty() {
-        req.school_id.trim().to_string()
-    } else {
-        prev_session
-            .as_ref()
-            .map(|s| s.school_id.clone())
-            .unwrap_or_default()
-    };
+        let school_id = if !req.school_id.trim().is_empty() {
+            req.school_id.trim().to_string()
+        } else if is_cookie_mode {
+            prev_session
+                .as_ref()
+                .map(|s| s.school_id.clone())
+                .unwrap_or_default()
+        } else {
+            String::new()
+        };
 
-    let login_mode = if is_cookie_mode {
-        prev_session
-            .as_ref()
-            .map(|s| s.login_mode.clone())
-            .filter(|m| !m.is_empty())
-            .unwrap_or_else(|| "cookie".to_string())
-    } else {
-        req.mode.clone()
-    };
+        let login_mode = if is_cookie_mode {
+            prev_session
+                .as_ref()
+                .map(|s| s.login_mode.clone())
+                .filter(|m| !m.is_empty())
+                .unwrap_or_else(|| "cookie".to_string())
+        } else {
+            req.mode.clone()
+        };
 
-    let display_name = if !detected_name.is_empty() {
-        detected_name
-    } else if !account.is_empty() {
-        account.clone()
-    } else {
-        prev_session
-            .as_ref()
-            .map(|s| s.display_name.clone())
-            .filter(|d| !d.is_empty())
-            .unwrap_or_else(|| "智慧树学员".to_string())
-    };
+        let display_name = if !detected_name.is_empty() {
+            detected_name.clone()
+        } else if !account.is_empty() {
+            account.clone()
+        } else if is_cookie_mode {
+            prev_session
+                .as_ref()
+                .map(|s| s.display_name.clone())
+                .filter(|d| !d.is_empty())
+                .unwrap_or_else(|| "智慧树学员".to_string())
+        } else {
+            "智慧树学员".to_string()
+        };
 
-    let profile = SessionProfile {
+        let profile = SessionProfile {
+            logged_in: true,
+            display_name,
+            account,
+            login_mode,
+            school_name,
+            school_id,
+            last_synced_at: Some(now_epoch_secs()),
+        };
+
+        if !is_cookie_mode {
+            let mut saved: SavedLoginInfo = prefs.saved_login.clone().unwrap_or_default();
+            if matches!(req.mode.as_str(), "phone" | "student" | "qrcode") {
+                saved.login_mode = req.mode.clone();
+            }
+            if req.mode == "phone" {
+                if req.remember_credentials {
+                    saved.remember_phone = true;
+                    saved.phone_username = req.username.trim().to_string();
+                    saved.phone_password = req.password.clone();
+                } else {
+                    saved.remember_phone = false;
+                    saved.phone_username.clear();
+                    saved.phone_password.clear();
+                }
+            } else if req.mode == "student" {
+                if req.remember_credentials {
+                    saved.remember_student = true;
+                    saved.school_id = req.school_id.trim().to_string();
+                    saved.school_name = req.school_name.trim().to_string();
+                    saved.student_id = req.student_id.trim().to_string();
+                    saved.student_password = req.password.clone();
+                } else {
+                    saved.remember_student = false;
+                    saved.school_id.clear();
+                    saved.school_name.clear();
+                    saved.student_id.clear();
+                    saved.student_password.clear();
+                }
+            }
+            prefs.saved_login = Some(saved);
+        }
+
+        prefs.session = Some(profile.clone());
+        profile_out = Some(profile);
+    });
+
+    let profile = profile_out.unwrap_or_else(|| SessionProfile {
         logged_in: true,
-        display_name,
-        account,
-        login_mode,
-        school_name,
-        school_id,
+        display_name: if !detected_name.is_empty() {
+            detected_name
+        } else {
+            "智慧树学员".to_string()
+        },
+        account: String::new(),
+        login_mode: req.mode.clone(),
+        school_name: detected_school,
+        school_id: req.school_id.trim().to_string(),
         last_synced_at: Some(now_epoch_secs()),
-    };
-
-    prefs.session = Some(profile.clone());
-    let _ = save_prefs(&prefs);
+    });
 
     emit_status(
         app,
@@ -1979,7 +2129,7 @@ pub fn execute_zhs_login(
     base_dir: &Path,
     req: LoginRequest,
 ) -> Result<SessionResult, String> {
-    manager.reset_cancel();
+    let (session_id, cancel_flag) = manager.start_attempt();
     let is_cookie_mode = req.mode == "cookie";
     let auto_captcha = load_config_from_dir(base_dir)
         .map(|cfg| cfg.enable_auto_captcha)
@@ -2010,7 +2160,7 @@ pub fn execute_zhs_login(
         );
         let api_result =
             fetch_courses_via_backend_api(app, backend, existing_cookies, &effective_proxy);
-        if manager.is_cancelled() {
+        if cancel_flag.load(Ordering::SeqCst) {
             return Err("已取消操作".to_string());
         }
         if let Ok(api_res) = api_result {
@@ -2081,10 +2231,11 @@ pub fn execute_zhs_login(
         initial_url,
         &effective_proxy,
         manager,
+        session_id,
     )?;
 
     let result = (|| -> Result<SessionResult, String> {
-        let ws_url = wait_for_cdp_ws_url(port, &mut child, manager)?;
+        let ws_url = wait_for_cdp_ws_url(port, &mut child, &cancel_flag)?;
         let mut cdp = CdpClient::connect(&ws_url)?;
         let _ = cdp.send("Page.enable", json!({}))?;
         let _ = cdp.send("Network.enable", json!({}))?;
@@ -2098,7 +2249,7 @@ pub fn execute_zhs_login(
             let mut landed = false;
             let mut landed_at: Option<Instant> = None;
             while Instant::now() < check_deadline {
-                if manager.is_cancelled() {
+                if cancel_flag.load(Ordering::SeqCst) {
                     return Err("已取消操作".to_string());
                 }
                 if let Ok(Some(_)) = child.try_wait() {
@@ -2152,7 +2303,7 @@ pub fn execute_zhs_login(
             let ready_deadline = Instant::now() + Duration::from_secs(25);
             let mut legacy_seen_since: Option<Instant> = None;
             while Instant::now() < ready_deadline {
-                if manager.is_cancelled() {
+                if cancel_flag.load(Ordering::SeqCst) {
                     return Err("已取消登录".to_string());
                 }
                 if let Ok(Some(_)) = child.try_wait() {
@@ -2260,7 +2411,7 @@ pub fn execute_zhs_login(
                 let mut last_captcha_attempt: Option<Instant> = None;
                 let mut captcha_hint_shown = false;
                 while Instant::now() < login_deadline {
-                    if manager.is_cancelled() {
+                    if cancel_flag.load(Ordering::SeqCst) {
                         return Err("已取消登录".to_string());
                     }
                     if let Ok(Some(_)) = child.try_wait() {
@@ -2406,7 +2557,7 @@ pub fn execute_zhs_login(
 
         // Logged in! Collect cookies & discover courses via browser + direct Zhihuishu APIs
         let (browser_courses, mut detected_name, mut detected_school) =
-            discover_courses_in_current_session(&mut cdp, app, manager)?;
+            discover_courses_in_current_session(&mut cdp, app, &cancel_flag)?;
 
         let mut cookies = cdp.get_zhihuishu_cookies()?;
         if cookies.is_empty() {
@@ -2416,16 +2567,17 @@ pub fn execute_zhs_login(
         let mut combined_courses = Vec::new();
         let api_result =
             fetch_courses_via_backend_api(app, backend, &cookies, &effective_proxy);
-        if manager.is_cancelled() {
+        if cancel_flag.load(Ordering::SeqCst) {
             return Err("已取消操作".to_string());
         }
         if let Ok(api_res) = api_result {
             cookies = merge_cookies(&cookies, &api_res.cookies);
             combined_courses.extend(api_res.courses);
-            if detected_name.is_empty() && !api_res.display_name.is_empty() {
+            // 优先采用官方 getLoginUserInfo / CASLOGC 返回的本人姓名与学校，避免首页其他接口误覆盖
+            if !api_res.display_name.is_empty() {
                 detected_name = api_res.display_name;
             }
-            if detected_school.is_empty() && !api_res.school_name.is_empty() {
+            if !api_res.school_name.is_empty() {
                 detected_school = api_res.school_name;
             }
         }
@@ -2445,9 +2597,11 @@ pub fn execute_zhs_login(
         )
     })();
 
-    manager.finish();
-    let _ = child.kill();
-    let _ = child.wait();
+    manager.finish_with_child(session_id, Some(&mut child));
+    if child.try_wait().ok().flatten().is_none() {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
     if result.is_err() {
         if let Some((api_res, merged_cookies)) = valid_api_fallback {
             return finalize_session_result(
@@ -2879,12 +3033,130 @@ mod tests {
     }
 
     #[test]
-    fn session_manager_reset_cancel_clears_previous_cancellation() {
+    fn ignores_course_endpoint_nested_school_and_only_reads_user_profile_school() {
+        let course_resp = json!({
+            "code": 200,
+            "result": {
+                "schoolInfo": {
+                    "schoolName": "错误的外校开课单位"
+                },
+                "courseOpenDtos": [
+                    {
+                        "courseName": "共享通识课",
+                        "secret": "sec123456",
+                        "schoolName": "清华大学"
+                    }
+                ]
+            }
+        });
+        let mut courses = Vec::new();
+        let mut name = String::new();
+        let mut school = String::new();
+        extract_courses_and_profile_from_json_with_context(
+            &course_resp,
+            "",
+            "https://onlineservice-api.zhihuishu.com/gateway/t/v1/student/course/share/queryShareCourseInfo",
+            &mut courses,
+            &mut name,
+            &mut school,
+        );
+        assert_eq!(courses.len(), 1);
+        assert!(school.is_empty(), "course endpoint must not set user school_name");
+
+        let user_resp = json!({
+            "code": 200,
+            "result": {
+                "realName": "王五",
+                "schoolName": "真实就读大学"
+            }
+        });
+        extract_courses_and_profile_from_json_with_context(
+            &user_resp,
+            "",
+            "https://onlineservice-api.zhihuishu.com/gateway/f/v1/login/getLoginUserInfo",
+            &mut courses,
+            &mut name,
+            &mut school,
+        );
+        assert_eq!(name, "王五");
+        assert_eq!(school, "真实就读大学");
+    }
+
+    #[test]
+    fn session_manager_isolates_cancellation_across_overlapping_attempts() {
         let mgr = ZhsSessionManager::new();
-        assert!(!mgr.is_cancelled());
+        let (_sid1, cancel1) = mgr.start_attempt();
+        assert!(!cancel1.load(Ordering::SeqCst));
+
+        // 开启新会话会自动取消旧会话，且新会话拥有独立的未取消标志
+        let (sid2, cancel2) = mgr.start_attempt();
+        assert!(cancel1.load(Ordering::SeqCst));
+        assert!(!cancel2.load(Ordering::SeqCst));
+
+        // 显式取消仅标记当前活跃会话，开启第三次会话不影响第二次的取消状态
         mgr.cancel();
-        assert!(mgr.is_cancelled());
-        mgr.reset_cancel();
-        assert!(!mgr.is_cancelled());
+        assert!(cancel2.load(Ordering::SeqCst));
+
+        let (sid3, cancel3) = mgr.start_attempt();
+        assert_ne!(sid2, sid3);
+        assert!(cancel2.load(Ordering::SeqCst));
+        assert!(!cancel3.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn session_manager_finish_ignores_stale_session_id() {
+        let mgr = ZhsSessionManager::new();
+        let job1 = Arc::new(Job::create().unwrap());
+        let job2 = Arc::new(Job::create().unwrap());
+        let sid1 = mgr.begin(job1);
+        let sid2 = mgr.begin(job2);
+        assert_ne!(sid1, sid2);
+
+        // Stale finish(sid1) must NOT clear sid2's active session
+        mgr.finish(sid1);
+        {
+            let guard = lock_unpoisoned(&mgr.active_session);
+            assert_eq!(guard.as_ref().map(|s| s.id), Some(sid2));
+        }
+
+        // Matching finish(sid2) clears active session
+        mgr.finish(sid2);
+        {
+            let guard = lock_unpoisoned(&mgr.active_session);
+            assert!(guard.is_none());
+        }
+    }
+
+    #[test]
+    fn merge_and_save_session_config_errors_and_preserves_corrupt_config() {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let base_dir = std::env::temp_dir().join(format!("autovisor_t14_zhs_{nanos}"));
+        fs::create_dir_all(&base_dir).unwrap();
+        let config_path = base_dir.join("config.ini");
+        let corrupt_bytes = b"[user-account]\nusername = keepme\n\0corrupt";
+        fs::write(&config_path, corrupt_bytes).unwrap();
+
+        let req = LoginRequest {
+            mode: "cookie".to_string(),
+            username: String::new(),
+            school_id: String::new(),
+            school_name: String::new(),
+            student_id: String::new(),
+            password: String::new(),
+            browser_exe: String::new(),
+            proxy: String::new(),
+            remember_credentials: false,
+        };
+        let res = merge_and_save_session_config(&base_dir, &req, None, Vec::new());
+        assert!(res.is_err(), "corrupt config.ini must fail instead of falling back to default");
+        assert_eq!(
+            fs::read(&config_path).unwrap(),
+            corrupt_bytes,
+            "original config.ini must not be overwritten on read error"
+        );
+        let _ = fs::remove_dir_all(&base_dir);
     }
 }

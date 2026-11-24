@@ -2,7 +2,7 @@ use crate::backend::BackendStatusSnapshot;
 use crate::browser_detect::{
     detect_installed_browsers, refresh_installed_browsers, DetectedBrowser,
 };
-use crate::config_ini::{save_config_to_dir, AutovisorConfig};
+use crate::config_ini::{save_config_to_dir, write_file_atomic, AutovisorConfig};
 use crate::window_close::CloseAction;
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -22,12 +22,37 @@ pub struct SessionProfile {
     pub last_synced_at: Option<u64>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SavedLoginInfo {
+    #[serde(default)]
+    pub login_mode: String, // "phone" | "student" | "qrcode"
+    #[serde(default)]
+    pub remember_phone: bool,
+    #[serde(default)]
+    pub phone_username: String,
+    #[serde(default)]
+    pub phone_password: String,
+    #[serde(default)]
+    pub remember_student: bool,
+    #[serde(default)]
+    pub school_id: String,
+    #[serde(default)]
+    pub school_name: String,
+    #[serde(default)]
+    pub student_id: String,
+    #[serde(default)]
+    pub student_password: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct GuiPrefs {
     pub close_behavior: Option<String>,
     #[serde(default)]
     pub session: Option<SessionProfile>,
+    #[serde(default)]
+    pub saved_login: Option<SavedLoginInfo>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -47,6 +72,7 @@ pub struct RuntimeInfo {
     pub close_behavior: String,
     pub detected_browsers: Vec<DetectedBrowser>,
     pub session: Option<SessionProfile>,
+    pub saved_login: Option<SavedLoginInfo>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -173,39 +199,92 @@ fn legacy_prefs_path_for(paths: &AppPaths, appdata: &Path) -> Option<PathBuf> {
     Some(appdata.join("gui_prefs.json"))
 }
 
+fn backup_corrupt_prefs(path: &Path) -> Option<PathBuf> {
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let file_name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("gui_prefs.json");
+    let backup_path = path.with_file_name(format!("{file_name}.corrupt.{ts}"));
+    if fs::copy(path, &backup_path).is_ok() {
+        Some(backup_path)
+    } else {
+        None
+    }
+}
+
+pub fn load_prefs_from_path_strict(path: &Path) -> Result<GuiPrefs, String> {
+    match fs::read_to_string(path) {
+        Ok(raw) => serde_json::from_str::<GuiPrefs>(raw.trim_start_matches('\u{feff}')).map_err(|e| {
+            let backup_note = backup_corrupt_prefs(path)
+                .map(|p| format!("（已备份至 {}）", p.display()))
+                .unwrap_or_default();
+            format!("偏好配置文件已损坏{backup_note}: {e}")
+        }),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(GuiPrefs::default()),
+        Err(e) => Err(format!("读取偏好配置失败: {e}")),
+    }
+}
+
+#[allow(dead_code)]
 pub fn load_prefs_from_path(path: &Path) -> GuiPrefs {
-    fs::read_to_string(path)
-        .ok()
-        .and_then(|raw| serde_json::from_str::<GuiPrefs>(&raw).ok())
-        .unwrap_or_default()
+    load_prefs_from_path_strict(path).unwrap_or_default()
 }
 
 pub fn save_prefs_to_path(path: &Path, prefs: &GuiPrefs) -> Result<(), String> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|e| format!("创建配置目录失败: {e}"))?;
-    }
     let text = serde_json::to_string_pretty(prefs).map_err(|e| format!("序列化偏好失败: {e}"))?;
-    let tmp_path = path.with_extension("json.tmp");
-    fs::write(&tmp_path, &text).map_err(|e| format!("写入偏好失败: {e}"))?;
-    if fs::rename(&tmp_path, path).is_err() {
-        let _ = fs::remove_file(&tmp_path);
-        fs::write(path, &text).map_err(|e| format!("写入偏好失败: {e}"))?;
-    }
-    Ok(())
+    write_file_atomic(path, text.as_bytes(), "gui_prefs.json")
 }
 
-pub fn load_prefs_with_legacy(path: &Path, legacy_path: Option<&Path>) -> GuiPrefs {
-    if path.is_file() {
-        return load_prefs_from_path(path);
+pub fn load_prefs_with_legacy_strict(
+    path: &Path,
+    legacy_path: Option<&Path>,
+) -> Result<GuiPrefs, String> {
+    match fs::metadata(path) {
+        Ok(_) => return load_prefs_from_path_strict(path),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(format!("访问偏好配置失败: {e}")),
     }
     if let Some(legacy) = legacy_path {
         if legacy != path && legacy.is_file() {
-            let migrated = load_prefs_from_path(legacy);
+            let migrated = load_prefs_from_path_strict(legacy)?;
             let _ = save_prefs_to_path(path, &migrated);
-            return migrated;
+            return Ok(migrated);
         }
     }
-    GuiPrefs::default()
+    Ok(GuiPrefs::default())
+}
+
+pub fn load_prefs_with_legacy(path: &Path, legacy_path: Option<&Path>) -> GuiPrefs {
+    load_prefs_with_legacy_strict(path, legacy_path).unwrap_or_default()
+}
+
+pub fn update_prefs_at<F>(
+    path: &Path,
+    legacy_path: Option<&Path>,
+    mutator: F,
+) -> Result<GuiPrefs, String>
+where
+    F: FnOnce(&mut GuiPrefs),
+{
+    let _guard = prefs_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let mut prefs = load_prefs_with_legacy_strict(path, legacy_path)?;
+    mutator(&mut prefs);
+    save_prefs_to_path(path, &prefs)?;
+    Ok(prefs)
+}
+
+pub fn update_prefs<F>(mutator: F) -> Result<GuiPrefs, String>
+where
+    F: FnOnce(&mut GuiPrefs),
+{
+    let paths = resolve_app_paths();
+    let path = prefs_path_in_data_dir(&paths.data_dir);
+    let legacy = legacy_prefs_path_for(&paths, &appdata_dir());
+    update_prefs_at(&path, legacy.as_deref(), mutator)
 }
 
 pub fn load_prefs() -> GuiPrefs {
@@ -216,6 +295,7 @@ pub fn load_prefs() -> GuiPrefs {
     load_prefs_with_legacy(&path, legacy.as_deref())
 }
 
+#[allow(dead_code)]
 pub fn save_prefs(prefs: &GuiPrefs) -> Result<(), String> {
     let _guard = prefs_lock().lock().unwrap_or_else(|e| e.into_inner());
     save_prefs_to_path(&prefs_path(), prefs)
@@ -234,13 +314,10 @@ pub fn load_close_action() -> CloseAction {
 }
 
 pub fn save_close_action(action: CloseAction) -> Result<(), String> {
-    let _guard = prefs_lock().lock().unwrap_or_else(|e| e.into_inner());
-    let paths = resolve_app_paths();
-    let path = prefs_path_in_data_dir(&paths.data_dir);
-    let legacy = legacy_prefs_path_for(&paths, &appdata_dir());
-    let mut prefs = load_prefs_with_legacy(&path, legacy.as_deref());
-    prefs.close_behavior = Some(action.as_str().to_string());
-    save_prefs_to_path(&path, &prefs)
+    update_prefs(|prefs| {
+        prefs.close_behavior = Some(action.as_str().to_string());
+    })?;
+    Ok(())
 }
 
 fn dir_is_writable(dir: &Path) -> bool {
@@ -515,6 +592,7 @@ pub fn get_runtime_info_with_refresh(
         close_behavior,
         detected_browsers,
         session,
+        saved_login: prefs.saved_login,
     }
 }
 
@@ -779,6 +857,7 @@ mod tests {
             let prefs = GuiPrefs {
                 close_behavior: Some(action.as_str().to_string()),
                 session: None,
+                saved_login: None,
             };
             save_prefs_to_path(&path, &prefs).unwrap();
             let loaded = load_prefs_from_path(&path);
@@ -794,6 +873,15 @@ mod tests {
         let legacy_prefs = GuiPrefs {
             close_behavior: Some(CloseAction::Tray.as_str().to_string()),
             session: None,
+            saved_login: Some(SavedLoginInfo {
+                login_mode: "student".to_string(),
+                remember_student: true,
+                school_id: "1001".to_string(),
+                school_name: "清华大学".to_string(),
+                student_id: "20240001".to_string(),
+                student_password: "secret".to_string(),
+                ..Default::default()
+            }),
         };
         save_prefs_to_path(&legacy_path, &legacy_prefs).unwrap();
 
@@ -805,6 +893,7 @@ mod tests {
         // Non-portable mode (legacy = Some) migrates and writes new path
         let migrated = load_prefs_with_legacy(&path, Some(&legacy_path));
         assert_eq!(resolve_close_action(&migrated), CloseAction::Tray);
+        assert_eq!(migrated.saved_login, legacy_prefs.saved_login);
         assert!(path.is_file());
 
         let _ = fs::remove_dir_all(&root);
@@ -827,6 +916,28 @@ mod tests {
         assert!(read_log_tail_scoped(&root, &traversal, 1024).is_err());
         assert!(read_log_tail_scoped(&root, &outside_file, 1024).is_err());
         assert!(read_log_tail_scoped(&root, &logs_dir, 1024).is_err());
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn update_prefs_backs_up_corrupt_json_and_refuses_silent_overwrite() {
+        let root = make_temp_dir("corrupt_prefs");
+        let path = root.join("gui_prefs.json");
+        let corrupt = "{not valid json";
+        fs::write(&path, corrupt).unwrap();
+
+        let err = update_prefs_at(&path, None, |p| {
+            p.close_behavior = Some("tray".to_string());
+        });
+        assert!(err.is_err());
+        assert_eq!(fs::read_to_string(&path).unwrap(), corrupt);
+        let backups: Vec<_> = fs::read_dir(&root)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|e| e.file_name().to_string_lossy().contains(".corrupt."))
+            .collect();
+        assert_eq!(backups.len(), 1);
 
         let _ = fs::remove_dir_all(&root);
     }

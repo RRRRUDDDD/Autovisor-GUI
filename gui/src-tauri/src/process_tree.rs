@@ -88,6 +88,13 @@ mod imp {
                 let _ = TerminateJobObject(self.0, 1);
             }
         }
+
+        pub fn terminate_with_child(&self, child: Option<&mut std::process::Child>) {
+            if let Some(c) = child {
+                let _ = c.try_wait();
+            }
+            self.terminate();
+        }
     }
 
     impl Drop for Job {
@@ -126,16 +133,34 @@ mod imp {
             Ok(())
         }
 
-        pub fn terminate(&self) {
+        fn terminate_inner(&self, mut child: Option<&mut std::process::Child>) {
             let pgid = self.pgid.swap(0, Ordering::SeqCst);
             if pgid <= 0 {
+                if let Some(c) = child {
+                    let _ = c.try_wait();
+                }
                 return;
             }
+            // 优先通过 Child::try_wait() 回收组长，避免绕过 Child 调用 waitpid 导致后续 child.kill() 潜在 PID 复用误杀
+            let mut reap_leader = |c: &mut Option<&mut std::process::Child>| {
+                if let Some(ref mut ch) = c {
+                    let _ = ch.try_wait();
+                } else {
+                    unsafe {
+                        let _ = libc::waitpid(pgid as libc::pid_t, std::ptr::null_mut(), libc::WNOHANG);
+                    }
+                }
+            };
+            reap_leader(&mut child);
             unsafe {
+                if libc::kill(-pgid, 0) != 0 {
+                    return;
+                }
                 let _ = libc::kill(-pgid, libc::SIGTERM);
             }
             let deadline = Instant::now() + Duration::from_millis(350);
             while Instant::now() < deadline {
+                reap_leader(&mut child);
                 let alive = unsafe { libc::kill(-pgid, 0) == 0 };
                 if !alive {
                     return;
@@ -145,6 +170,15 @@ mod imp {
             unsafe {
                 let _ = libc::kill(-pgid, libc::SIGKILL);
             }
+            reap_leader(&mut child);
+        }
+
+        pub fn terminate(&self) {
+            self.terminate_inner(None);
+        }
+
+        pub fn terminate_with_child(&self, child: Option<&mut std::process::Child>) {
+            self.terminate_inner(child);
         }
     }
 
