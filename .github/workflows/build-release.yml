@@ -26,6 +26,72 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  validate-version:
+    name: Validate Version & Release Tag
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      app_version: ${{ steps.check.outputs.app_version }}
+      release_tag: ${{ steps.check.outputs.release_tag }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Validate version consistency across Python, Tauri, Cargo, package.json and tag
+        id: check
+        env:
+          REQUESTED_RELEASE_TAG: ${{ inputs.release_tag }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import pathlib
+          import re
+          import sys
+          import tomllib
+
+          ver_py_text = pathlib.Path("modules/version.py").read_text("utf-8")
+          m = re.search(r'__gui_version__\s*=\s*"([^"]+)"', ver_py_text)
+          if not m:
+              sys.exit("无法从 modules/version.py 解析 __gui_version__")
+          py_ver = m.group(1).strip()
+
+          tauri_conf = json.loads(pathlib.Path("gui/src-tauri/tauri.conf.json").read_text("utf-8"))
+          tauri_ver = str(tauri_conf.get("version") or "").strip()
+
+          cargo_toml = tomllib.loads(pathlib.Path("gui/src-tauri/Cargo.toml").read_text("utf-8"))
+          cargo_ver = str((cargo_toml.get("package") or {}).get("version") or "").strip()
+
+          pkg_json = json.loads(pathlib.Path("gui/package.json").read_text("utf-8"))
+          pkg_ver = str(pkg_json.get("version") or "").strip()
+
+          versions = {
+              "modules/version.py (__gui_version__)": py_ver,
+              "gui/src-tauri/tauri.conf.json": tauri_ver,
+              "gui/src-tauri/Cargo.toml": cargo_ver,
+              "gui/package.json": pkg_ver,
+          }
+          if not py_ver or len(set(versions.values())) != 1:
+              details = ", ".join(f"{k}={v!r}" for k, v in versions.items())
+              sys.exit(f"版本号不一致: {details}")
+
+          release_tag = f"v{py_ver}"
+          if os.environ.get("GITHUB_REF_TYPE") == "tag" and os.environ.get("GITHUB_REF_NAME"):
+              release_tag = os.environ["GITHUB_REF_NAME"].strip()
+          elif os.environ.get("REQUESTED_RELEASE_TAG", "").strip():
+              release_tag = os.environ["REQUESTED_RELEASE_TAG"].strip()
+
+          normalized_tag = release_tag.lstrip("vV")
+          if normalized_tag != py_ver:
+              sys.exit(f"Release Tag ({release_tag}) 与源码版本号 ({py_ver}) 不匹配")
+
+          out_path = pathlib.Path(os.environ["GITHUB_OUTPUT"])
+          with out_path.open("a", encoding="utf-8") as fh:
+              fh.write(f"app_version={py_ver}\n")
+              fh.write(f"release_tag={release_tag}\n")
+          print(f"Validated APP_VERSION={py_ver}, RELEASE_TAG={release_tag}")
+          PY
+
   test:
     name: Verify Tests (Windows)
     runs-on: windows-latest
@@ -90,7 +156,7 @@ jobs:
 
   build-windows:
     name: Build Windows (x64 Installer & Portable)
-    needs: [test]
+    needs: [validate-version, test]
     runs-on: windows-latest
     timeout-minutes: 90
     defaults:
@@ -98,6 +164,8 @@ jobs:
         shell: pwsh
     env:
       PYTHONUTF8: "1"
+      APP_VERSION: ${{ needs.validate-version.outputs.app_version }}
+      RELEASE_TAG: ${{ needs.validate-version.outputs.release_tag }}
     steps:
       - name: Checkout
         uses: actions/checkout@v7
@@ -128,34 +196,6 @@ jobs:
       - name: Install Python dependencies
         run: uv sync --extra captcha
 
-      - name: Validate version and resolve release tag
-        env:
-          REQUESTED_RELEASE_TAG: ${{ inputs.release_tag }}
-        run: |
-          $ErrorActionPreference = "Stop"
-          $pyVersion = (uv run --no-sync python -c "from modules.version import __gui_version__; print(__gui_version__)" | Select-Object -Last 1).Trim()
-          $tauriConf = Get-Content -Raw -Encoding UTF8 gui/src-tauri/tauri.conf.json | ConvertFrom-Json
-          $tauriVersion = [string]$tauriConf.version
-          if (-not $pyVersion -or $pyVersion -ne $tauriVersion) {
-            throw "版本号不一致: modules/version.py __gui_version__ ($pyVersion) != tauri.conf.json ($tauriVersion)"
-          }
-
-          $releaseTag = "v$pyVersion"
-          if ($env:GITHUB_REF_TYPE -eq "tag" -and $env:GITHUB_REF_NAME) {
-            $releaseTag = $env:GITHUB_REF_NAME.Trim()
-          } elseif ($env:REQUESTED_RELEASE_TAG -and $env:REQUESTED_RELEASE_TAG.Trim()) {
-            $releaseTag = $env:REQUESTED_RELEASE_TAG.Trim()
-          }
-
-          $normalizedTagVersion = $releaseTag.TrimStart("v", "V")
-          if ($normalizedTagVersion -ne $pyVersion) {
-            throw "Release Tag ($releaseTag) 与源码版本号 ($pyVersion) 不匹配"
-          }
-
-          "APP_VERSION=$pyVersion" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-          "RELEASE_TAG=$releaseTag" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-          Write-Host "Resolved APP_VERSION=$pyVersion, RELEASE_TAG=$releaseTag"
-
       - name: Install frontend dependencies
         working-directory: gui
         run: |
@@ -164,7 +204,7 @@ jobs:
 
       - name: Build and verify frozen Python backend
         run: |
-          uv run --with pyinstaller python build_backend.py
+          uv run --with pyinstaller==6.13.0 python build_backend.py
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
           $requiredPaths = @(
@@ -248,7 +288,7 @@ jobs:
 
   build-macos:
     name: Build macOS (${{ matrix.arch }} DMG)
-    needs: [test]
+    needs: [validate-version, test]
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 90
     strategy:
@@ -261,6 +301,8 @@ jobs:
             arch: x64
     env:
       PYTHONUTF8: "1"
+      APP_VERSION: ${{ needs.validate-version.outputs.app_version }}
+      RELEASE_TAG: ${{ needs.validate-version.outputs.release_tag }}
     steps:
       - name: Checkout
         uses: actions/checkout@v7
@@ -289,12 +331,6 @@ jobs:
       - name: Install Python dependencies
         run: uv sync --extra captcha
 
-      - name: Validate version
-        run: |
-          set -euo pipefail
-          PY_VER=$(uv run --no-sync python -c "from modules.version import __gui_version__; print(__gui_version__)" | tail -n 1 | tr -d '[:space:]')
-          echo "APP_VERSION=$PY_VER" >> "$GITHUB_ENV"
-
       - name: Install frontend dependencies
         working-directory: gui
         run: npm ci
@@ -302,7 +338,7 @@ jobs:
       - name: Build and verify frozen Python backend
         run: |
           set -euo pipefail
-          uv run --with pyinstaller python build_backend.py
+          uv run --with pyinstaller==6.13.0 python build_backend.py
           test -x dist/autovisor-backend/autovisor-backend
           test -d dist/autovisor-backend/internal/numpy
           test -d dist/autovisor-backend/internal/cv2
@@ -332,7 +368,8 @@ jobs:
           "$RUNTIME_DST/autovisor-backend" --verify-deps
           rm -rf "$RUNTIME_DST/logs"
 
-          codesign --force --deep --sign - "$APP_BUNDLE" || true
+          codesign --force --deep --sign - "$APP_BUNDLE"
+          codesign --verify --deep --strict "$APP_BUNDLE"
 
           mkdir -p dist
           DMG_NAME="Autovisor-GUI-${APP_VERSION}-macos-${{ matrix.arch }}.dmg"
@@ -354,11 +391,13 @@ jobs:
 
   build-linux:
     name: Build Linux (amd64 DEB & Portable)
-    needs: [test]
+    needs: [validate-version, test]
     runs-on: ubuntu-latest
     timeout-minutes: 90
     env:
       PYTHONUTF8: "1"
+      APP_VERSION: ${{ needs.validate-version.outputs.app_version }}
+      RELEASE_TAG: ${{ needs.validate-version.outputs.release_tag }}
     steps:
       - name: Checkout
         uses: actions/checkout@v7
@@ -400,12 +439,6 @@ jobs:
       - name: Install Python dependencies
         run: uv sync --extra captcha
 
-      - name: Validate version
-        run: |
-          set -euo pipefail
-          PY_VER=$(uv run --no-sync python -c "from modules.version import __gui_version__; print(__gui_version__)" | tail -n 1 | tr -d '[:space:]')
-          echo "APP_VERSION=$PY_VER" >> "$GITHUB_ENV"
-
       - name: Install frontend dependencies
         working-directory: gui
         run: npm ci
@@ -413,7 +446,7 @@ jobs:
       - name: Build and verify frozen Python backend
         run: |
           set -euo pipefail
-          uv run --with pyinstaller python build_backend.py
+          uv run --with pyinstaller==6.13.0 python build_backend.py
           test -x dist/autovisor-backend/autovisor-backend
           test -d dist/autovisor-backend/internal/numpy
           test -d dist/autovisor-backend/internal/cv2
@@ -487,30 +520,17 @@ jobs:
 
   publish-release:
     name: Verify Checksums & Publish GitHub Release
-    needs: [build-windows, build-macos, build-linux]
+    needs: [validate-version, build-windows, build-macos, build-linux]
     runs-on: ubuntu-latest
     timeout-minutes: 20
     permissions:
       contents: write
+    env:
+      APP_VERSION: ${{ needs.validate-version.outputs.app_version }}
+      RELEASE_TAG: ${{ needs.validate-version.outputs.release_tag }}
     steps:
       - name: Checkout
         uses: actions/checkout@v7
-
-      - name: Resolve version and release tag
-        env:
-          REQUESTED_RELEASE_TAG: ${{ inputs.release_tag }}
-        run: |
-          set -euo pipefail
-          PY_VER=$(python3 -c 'import pathlib, re; text = pathlib.Path("modules/version.py").read_text("utf-8"); print(re.search(r"__gui_version__\s*=\s*\"([^\"]+)\"", text).group(1))')
-          RELEASE_TAG="v$PY_VER"
-          if [ "${GITHUB_REF_TYPE:-}" = "tag" ] && [ -n "${GITHUB_REF_NAME:-}" ]; then
-            RELEASE_TAG="$GITHUB_REF_NAME"
-          elif [ -n "${REQUESTED_RELEASE_TAG:-}" ]; then
-            RELEASE_TAG="$REQUESTED_RELEASE_TAG"
-          fi
-          echo "APP_VERSION=$PY_VER" >> "$GITHUB_ENV"
-          echo "RELEASE_TAG=$RELEASE_TAG" >> "$GITHUB_ENV"
-          echo "Resolved APP_VERSION=$PY_VER, RELEASE_TAG=$RELEASE_TAG"
 
       - name: Download all platform artifacts
         uses: actions/download-artifact@v4

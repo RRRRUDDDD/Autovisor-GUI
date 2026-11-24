@@ -32,6 +32,9 @@ Issues = "https://github.com/RRRRUDDDD/Autovisor-GUI/issues"
 [project.optional-dependencies]
 captcha = []
 
+[dependency-groups]
+build = ["pyinstaller==6.13.0"]
+
 [tool.uv]
 package = false
 

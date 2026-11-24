@@ -16,6 +16,8 @@ $Version = [string]$TauriConf.version
 if (-not $Version) {
     throw "无法从 $TauriConfPath 读取版本号"
 }
+$MainBinaryName = if ($TauriConf.mainBinaryName) { [string]$TauriConf.mainBinaryName } else { "Autovisor GUI" }
+$PrimaryExeName = "$MainBinaryName.exe"
 
 if (-not $OutputDir) {
     $OutputDir = Join-Path $RepoRoot "dist\Autovisor-GUI-$Version-windows-amd64"
@@ -26,7 +28,7 @@ if (-not $SkipBackendBuild -or -not (Test-Path (Join-Path $BackendDist "autoviso
     Push-Location $RepoRoot
     try {
         if (Get-Command uv -ErrorAction SilentlyContinue) {
-            uv run --with pyinstaller python build_backend.py
+            uv run --with pyinstaller==6.13.0 python build_backend.py
         } else {
             $VenvPy = Join-Path $RepoRoot ".venv\Scripts\python.exe"
             if (Test-Path $VenvPy) {
@@ -49,9 +51,9 @@ if (-not (Test-Path (Join-Path $BackendDist "autovisor-backend.exe"))) {
 
 $ReleaseDir = Join-Path $GuiRoot "src-tauri\target\release"
 $CandidateExes = @(
-    (Join-Path $ReleaseDir "Autovisor GUI.exe"),
+    (Join-Path $ReleaseDir $PrimaryExeName),
     (Join-Path $ReleaseDir "autovisor-gui.exe")
-)
+) | Select-Object -Unique
 $ExistingExe = $CandidateExes | Where-Object { Test-Path $_ } | Select-Object -First 1
 
 if (-not $SkipTauriBuild -or -not $ExistingExe) {
@@ -80,12 +82,9 @@ if (-not $SkipTauriBuild -or -not $ExistingExe) {
     Write-Host "==> 2/4 & 3/4 复用已编译的 Tauri Release 宿主: $ExistingExe" -ForegroundColor DarkCyan
 }
 
-$BuiltExe = @(
-    (Join-Path $ReleaseDir "autovisor-gui.exe"),
-    (Join-Path $ReleaseDir "Autovisor GUI.exe")
-) | Where-Object { Test-Path $_ } | Select-Object -First 1
+$BuiltExe = $CandidateExes | Where-Object { Test-Path $_ } | Select-Object -First 1
 if (-not $BuiltExe) {
-    throw "未找到构建产物: $ReleaseDir\autovisor-gui.exe 或 Autovisor GUI.exe"
+    throw "未找到构建产物: $ReleaseDir\$PrimaryExeName 或 autovisor-gui.exe"
 }
 
 Write-Host "==> 4/4 组装便携成品目录: $OutputDir" -ForegroundColor Cyan
