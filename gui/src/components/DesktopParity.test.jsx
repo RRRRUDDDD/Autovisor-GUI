@@ -263,6 +263,24 @@ describe('Desktop Parity features (Phases 1-6)', () => {
     expect(await screen.findByText('题库缓存已为空，无需清理')).toBeTruthy();
   });
 
+  it('disables both import and clear cache buttons while taskRunning is true', () => {
+    render(
+      <SettingsView
+        config={defaultConfig()}
+        onChangeConfig={() => {}}
+        taskRunning={true}
+        onExportQuestionCache={vi.fn()}
+        onImportQuestionCache={vi.fn()}
+        onClearQuestionCache={vi.fn()}
+        onListLogFiles={vi.fn().mockResolvedValue([])}
+      />
+    );
+
+    expect(screen.getByRole('button', { name: '导入题库缓存' }).disabled).toBe(true);
+    expect(screen.getByRole('button', { name: '清理题库缓存' }).disabled).toBe(true);
+    expect(screen.getByRole('button', { name: '导出题库缓存' }).disabled).toBe(false);
+  });
+
   it('syncs exePath when switching browser driver in SettingsView', () => {
     let cfg = {
       ...defaultConfig(),

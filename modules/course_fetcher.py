@@ -563,7 +563,10 @@ def _is_auth_error(exc: Exception) -> bool:
     return any(tok in text for tok in ("401", "403", "unauthorized", "forbidden", "未登录"))
 
 
-def _refresh_onlineservice_sso(client) -> bool:
+_API_FETCH_TIMEOUT = 8
+
+
+def _refresh_onlineservice_sso(client, timeout: int = _API_FETCH_TIMEOUT) -> bool:
     ok = False
     try:
         ok = bool(client.ensure_service_sso(ONLINE_SERVICE_SSO_URL))
@@ -575,7 +578,7 @@ def _refresh_onlineservice_sso(client) -> bool:
                 client.session.get(
                     PASSPORT_LOGIN_URL,
                     params={"service": ONLINE_SERVICE_SSO_URL},
-                    timeout=15,
+                    timeout=timeout,
                 )
             ok = ok or _has_host_cookie(
                 client.session, "onlineservice-api.zhihuishu.com", "SESSION"
@@ -600,7 +603,12 @@ def fetch_courses_via_api(
     if own_client:
         if not cookies:
             return ApiCourseFetchResult()
-        client = ZhsApiClient(cookies, proxy=proxy)
+        client = ZhsApiClient(
+            cookies,
+            proxy=proxy,
+            total_retries=1,
+            timeout=_API_FETCH_TIMEOUT,
+        )
         client.session.headers.update(
             {
                 "Origin": "https://onlineweb.zhihuishu.com",
@@ -636,7 +644,7 @@ def fetch_courses_via_api(
             with client.lock:
                 u_resp = client.session.get(
                     f"{LOGIN_USER_INFO_URL}?time={int(time.time() * 1000)}",
-                    timeout=15,
+                    timeout=_API_FETCH_TIMEOUT,
                 )
             u_status = int(getattr(u_resp, "status_code", 0) or 0)
             if u_status != 200:
@@ -795,7 +803,9 @@ def fetch_courses_via_api(
                 def _fetch_hike() -> tuple[int, dict | None, bool]:
                     with client.lock:
                         h_resp = client.session.get(
-                            HIKE_COURSE_LIST_URL, params=params, timeout=15
+                            HIKE_COURSE_LIST_URL,
+                            params=params,
+                            timeout=_API_FETCH_TIMEOUT,
                         )
                     h_status = int(getattr(h_resp, "status_code", 0) or 0)
                     if h_status in (401, 403):

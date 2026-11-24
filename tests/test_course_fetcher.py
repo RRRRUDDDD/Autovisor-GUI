@@ -656,6 +656,79 @@ class CourseFetcherTests(unittest.TestCase):
         self.assertFalse(res_exp.session_valid)
         self.assertEqual(res_exp.sources["hike"], 0)
 
+    def test_fetch_courses_via_api_uses_compact_retry_and_timeout_budget(self):
+        from unittest.mock import patch
+        from modules.course_fetcher import _API_FETCH_TIMEOUT, fetch_courses_via_api
+        from modules.zhs_api import ZhsApiClient
+
+        captured_init = {}
+        timeouts = []
+
+        class _BudgetClient(ZhsApiClient):
+            def __init__(self, cookies, proxy="", user_agent="", *, total_retries=3, timeout=20):
+                captured_init["total_retries"] = total_retries
+                captured_init["timeout"] = timeout
+                super().__init__(
+                    cookies,
+                    proxy=proxy,
+                    user_agent=user_agent,
+                    total_retries=total_retries,
+                    timeout=timeout,
+                )
+
+                class _TimeoutRecordingSession:
+                    def __init__(self, cookies_jar):
+                        self.cookies = cookies_jar
+                        self.headers = {}
+
+                    def get(self, url, params=None, timeout=None, allow_redirects=True):
+                        timeouts.append((url, timeout))
+                        return type(
+                            "R",
+                            (),
+                            {
+                                "status_code": 200,
+                                "headers": {},
+                                "text": "{}",
+                                "json": lambda self: {"code": 200, "result": {"uuid": "u-b"}},
+                            },
+                        )()
+
+                    def post(self, url, data=None, headers=None, timeout=None):
+                        timeouts.append((url, timeout))
+                        return type(
+                            "R",
+                            (),
+                            {
+                                "status_code": 200,
+                                "headers": {},
+                                "text": "{}",
+                                "raise_for_status": lambda self: None,
+                                "json": lambda self: {
+                                    "code": 200,
+                                    "status": "200",
+                                    "result": {"totalCount": 0, "courseOpenDtos": []},
+                                    "rt": [],
+                                },
+                            },
+                        )()
+
+                    def close(self):
+                        pass
+
+                self.session = _TimeoutRecordingSession(self.session.cookies)
+
+        with patch("modules.zhs_api.ZhsApiClient", _BudgetClient):
+            fetch_courses_via_api(
+                [{"name": "CASTGC", "value": "tgt-1", "domain": ".zhihuishu.com"}]
+            )
+
+        self.assertEqual(captured_init, {"total_retries": 1, "timeout": _API_FETCH_TIMEOUT})
+        self.assertEqual(_API_FETCH_TIMEOUT, 8)
+        self.assertTrue(timeouts)
+        for _url, t in timeouts:
+            self.assertEqual(t, 8)
+
 
 if __name__ == "__main__":
     unittest.main()

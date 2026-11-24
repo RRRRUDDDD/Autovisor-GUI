@@ -586,6 +586,115 @@ class BackendServerProcessTests(unittest.TestCase):
         self.assertTrue(payload["numpy"])
         self.assertTrue(payload["cv2"])
 
+    def test_cache_dir_isolation_running_conflict_and_invalid_proxy_status(self):
+        import threading
+        from unittest import mock
+        import backend_server
+
+        token = "inproc-test-token"
+        with (
+            tempfile.TemporaryDirectory() as isolated_dir,
+            tempfile.TemporaryDirectory() as global_dir,
+        ):
+            class _FakeManager:
+                def __init__(self, data_dir):
+                    self.data_dir = data_dir
+                    self.status = "idle"
+
+                def snapshot(self):
+                    return {"status": self.status}
+
+                def shutdown(self):
+                    pass
+
+            mgr = _FakeManager(isolated_dir)
+            server = backend_server.BackendHTTPServer(
+                ("127.0.0.1", 0),
+                backend_server.BackendRequestHandler,
+                mgr,
+                token,
+                "1.0.0-test",
+            )
+            port = server.server_address[1]
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            base_url = f"http://127.0.0.1:{port}"
+
+            def _post(path, payload):
+                req = urllib.request.Request(
+                    f"{base_url}{path}",
+                    data=json.dumps(payload).encode("utf-8"),
+                    headers={
+                        "X-Autovisor-Token": token,
+                        "Content-Type": "application/json",
+                    },
+                    method="POST",
+                )
+                return urllib.request.urlopen(req, timeout=5)
+
+            try:
+                with mock.patch.dict(os.environ, {"AUTOVISOR_DATA_DIR": global_dir}):
+                    # 1. Import / Export / Clear are isolated to manager.data_dir/data/questions_bank.db
+                    import_payload = {
+                        "data": {
+                            "zhidao_questions": [
+                                {
+                                    "course_id": "iso-c1",
+                                    "exam_id": "iso-e1",
+                                    "eid": "ISO1",
+                                    "content": "隔离测试题",
+                                    "options": [{"id": 1, "content": "选项A"}],
+                                    "correct_options": [1],
+                                }
+                            ]
+                        }
+                    }
+                    with _post("/api/cache/import", import_payload) as resp:
+                        imp = json.loads(resp.read().decode("utf-8"))
+                    self.assertTrue(imp["ok"])
+                    self.assertEqual(imp["zhidao_questions"], 1)
+
+                    isolated_db = os.path.join(isolated_dir, "data", "questions_bank.db")
+                    global_db = os.path.join(global_dir, "data", "questions_bank.db")
+                    self.assertTrue(os.path.isfile(isolated_db))
+                    self.assertFalse(os.path.exists(global_db))
+
+                    with _post("/api/cache/export", {}) as resp:
+                        exp = json.loads(resp.read().decode("utf-8"))
+                    self.assertTrue(exp["ok"])
+                    self.assertEqual(len(exp["data"]["zhidao_questions"]), 1)
+
+                    # 2. Running task rejects /api/cache/clear and /api/cache/import with 409
+                    mgr.status = "running"
+                    with self.assertRaises(urllib.error.HTTPError) as clear_ctx:
+                        _post("/api/cache/clear", {})
+                    self.assertEqual(clear_ctx.exception.code, 409)
+
+                    with self.assertRaises(urllib.error.HTTPError) as imp_ctx:
+                        _post("/api/cache/import", import_payload)
+                    self.assertEqual(imp_ctx.exception.code, 409)
+
+                    mgr.status = "idle"
+                    with _post("/api/cache/clear", {}) as resp:
+                        cleared = json.loads(resp.read().decode("utf-8"))
+                    self.assertTrue(cleared["ok"])
+                    self.assertEqual(cleared["zhidao_questions"], 1)
+
+                    # 3. /api/courses/fetch with invalid proxy returns 400 BAD_REQUEST
+                    with self.assertRaises(urllib.error.HTTPError) as proxy_ctx:
+                        _post(
+                            "/api/courses/fetch",
+                            {
+                                "cookies": [{"name": "CASTGC", "value": "tgt-1"}],
+                                "proxy": "ftp://bad",
+                            },
+                        )
+                    self.assertEqual(proxy_ctx.exception.code, 400)
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=3)
+
 
 if __name__ == "__main__":
     unittest.main()

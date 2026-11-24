@@ -36,6 +36,7 @@ from modules.configs import Config, ConfigError, ensure_config_files
 from modules.course_fetcher import (
     append_courses_to_config,
     fetch_courses_from_page,
+    fetch_courses_via_api,
     save_fetched_courses,
 )
 from modules.course_runner import (
@@ -1311,27 +1312,114 @@ async def maybe_qr_login(config, cookies):
     return new_cookies
 
 
+def _merge_playwright_cookies(base: list[dict], updates: list[dict]) -> list[dict]:
+    """合并接口刷新的 Cookie 到本地 Playwright Cookie 列表, 不降级原有安全与过期属性."""
+    if not updates:
+        return list(base)
+    out = [dict(item) for item in base if isinstance(item, dict)]
+    for upd in updates:
+        if not isinstance(upd, dict) or not upd.get("name"):
+            continue
+        u_name = upd.get("name")
+        u_domain = str(upd.get("domain") or "").strip().lower()
+        u_path = str(upd.get("path") or "").strip() or "/"
+        matched = None
+        for slot in out:
+            s_domain = str(slot.get("domain") or "").strip().lower()
+            s_path = str(slot.get("path") or "").strip() or "/"
+            if slot.get("name") == u_name and s_domain == u_domain and s_path == u_path:
+                matched = slot
+                break
+        if matched is None:
+            out.append(dict(upd))
+            continue
+        u_exp = upd.get("expires")
+        u_exp_valid = (
+            u_exp
+            if isinstance(u_exp, (int, float))
+            and not isinstance(u_exp, bool)
+            and u_exp > 0
+            else None
+        )
+        s_exp = matched.get("expires")
+        s_exp_valid = (
+            s_exp
+            if isinstance(s_exp, (int, float))
+            and not isinstance(s_exp, bool)
+            and s_exp > 0
+            else None
+        )
+        if upd.get("value") == matched.get("value"):
+            if s_exp_valid is None and u_exp_valid is not None:
+                matched["expires"] = u_exp_valid
+            elif (
+                s_exp_valid is not None
+                and u_exp_valid is not None
+                and u_exp_valid > s_exp_valid
+            ):
+                matched["expires"] = u_exp_valid
+            if not matched.get("sameSite") and upd.get("sameSite"):
+                matched["sameSite"] = upd["sameSite"]
+            matched["secure"] = bool(matched.get("secure")) or bool(upd.get("secure"))
+            matched["httpOnly"] = bool(matched.get("httpOnly")) or bool(upd.get("httpOnly"))
+        else:
+            matched["value"] = upd.get("value")
+            if u_exp_valid is not None:
+                matched["expires"] = u_exp_valid
+            if upd.get("sameSite"):
+                matched["sameSite"] = upd["sameSite"]
+            matched["secure"] = bool(matched.get("secure")) or bool(upd.get("secure"))
+            matched["httpOnly"] = bool(matched.get("httpOnly")) or bool(upd.get("httpOnly"))
+    return out
+
+
 async def run_fetch_courses(config, write_config: bool = False) -> int:
     """登录并自动拉取账号下所有课程列表，导出到 data/courses.json（可选写入 config.ini）。"""
     logger.section("拉取账号课程列表")
-    cookies = None if getattr(config, "attach_existing_chrome", False) else load_cookies(COOKIE_PATH)
+    attach = bool(getattr(config, "attach_existing_chrome", False))
+    cookies = None if attach else load_cookies(COOKIE_PATH)
     remember_login_cookies(cookies)
-    if not getattr(config, "attach_existing_chrome", False):
+    if not attach:
         cookies = await maybe_qr_login(config, cookies)
-    async with async_playwright() as p:
-        session = await create_browser_session(p, config, cookies, logger)
-        page, context = session.page, session.context
+    proxy = str(getattr(config, "proxy", "") or "").strip()
+
+    courses = []
+    if not attach and cookies:
+        logger.info("检测到本地登录凭证，优先通过智慧树课程接口直拉课程列表...")
         try:
-            await ensure_login(context, page, cookies, config)
-            logger.info("正在从智慧树接口与学生主页读取课程列表...")
-            courses = await fetch_courses_from_page(
-                page,
+            api_res = await asyncio.to_thread(
+                fetch_courses_via_api,
+                cookies,
+                proxy=proxy,
                 logger=logger,
-                proxy=str(getattr(config, "proxy", "") or "").strip(),
             )
-            await persist_login_cookies(context)
-        finally:
-            await session.close()
+            if api_res.session_valid and api_res.courses:
+                courses = list(api_res.courses)
+                if api_res.cookies:
+                    merged_cookies = _merge_playwright_cookies(cookies, api_res.cookies)
+                    try:
+                        save_cookies(merged_cookies, COOKIE_PATH)
+                        remember_login_cookies(merged_cookies)
+                    except Exception as exc:
+                        logger.log_exception("写回刷新后的登录 Cookies 失败.", exc)
+        except Exception as exc:
+            logger.debug(f"接口直拉课程失败，回退浏览器流程: {exc}")
+
+    if not courses:
+        async with async_playwright() as p:
+            session = await create_browser_session(p, config, cookies, logger)
+            page, context = session.page, session.context
+            try:
+                await ensure_login(context, page, cookies, config)
+                logger.info("正在从智慧树接口与学生主页读取课程列表...")
+                courses = await fetch_courses_from_page(
+                    page,
+                    logger=logger,
+                    proxy=proxy,
+                )
+                await persist_login_cookies(context)
+            finally:
+                await session.close()
 
     if not courses:
         logger.warn("未能从当前账号主页识别到可用课程链接.", shift=True)

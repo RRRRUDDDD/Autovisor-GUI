@@ -141,6 +141,10 @@ impl ZhsSessionManager {
     fn is_cancelled(&self) -> bool {
         self.cancelled.load(Ordering::SeqCst)
     }
+
+    fn reset_cancel(&self) {
+        self.cancelled.store(false, Ordering::SeqCst);
+    }
 }
 
 fn now_epoch_secs() -> u64 {
@@ -1975,6 +1979,7 @@ pub fn execute_zhs_login(
     base_dir: &Path,
     req: LoginRequest,
 ) -> Result<SessionResult, String> {
+    manager.reset_cancel();
     let is_cookie_mode = req.mode == "cookie";
     let auto_captcha = load_config_from_dir(base_dir)
         .map(|cfg| cfg.enable_auto_captcha)
@@ -2003,9 +2008,12 @@ pub fn execute_zhs_login(
             "正在校验登录状态并同步智慧树课程队列...",
             false,
         );
-        if let Ok(api_res) =
-            fetch_courses_via_backend_api(app, backend, existing_cookies, &effective_proxy)
-        {
+        let api_result =
+            fetch_courses_via_backend_api(app, backend, existing_cookies, &effective_proxy);
+        if manager.is_cancelled() {
+            return Err("已取消操作".to_string());
+        }
+        if let Ok(api_res) = api_result {
             if api_res.session_valid {
                 let merged_cookies = merge_cookies(existing_cookies, &api_res.cookies);
                 if !api_res.courses.is_empty() {
@@ -2406,9 +2414,12 @@ pub fn execute_zhs_login(
         }
 
         let mut combined_courses = Vec::new();
-        if let Ok(api_res) =
-            fetch_courses_via_backend_api(app, backend, &cookies, &effective_proxy)
-        {
+        let api_result =
+            fetch_courses_via_backend_api(app, backend, &cookies, &effective_proxy);
+        if manager.is_cancelled() {
+            return Err("已取消操作".to_string());
+        }
+        if let Ok(api_res) = api_result {
             cookies = merge_cookies(&cookies, &api_res.cookies);
             combined_courses.extend(api_res.courses);
             if detected_name.is_empty() && !api_res.display_name.is_empty() {
@@ -2865,5 +2876,15 @@ mod tests {
             ai.url,
             "https://ai-smart-course-student-pro.zhihuishu.com/learnPage?courseId=303&classId=404"
         );
+    }
+
+    #[test]
+    fn session_manager_reset_cancel_clears_previous_cancellation() {
+        let mgr = ZhsSessionManager::new();
+        assert!(!mgr.is_cancelled());
+        mgr.cancel();
+        assert!(mgr.is_cancelled());
+        mgr.reset_cancel();
+        assert!(!mgr.is_cancelled());
     }
 }

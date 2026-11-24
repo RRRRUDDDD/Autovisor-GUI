@@ -1079,6 +1079,15 @@ class BackendRequestHandler(BaseHTTPRequestHandler):
             raise ValueError("请求体必须是 JSON 对象")
         return data
 
+    def _question_store(self):
+        from modules.answer_store import AiQuestionStore
+
+        data_root = os.path.join(self.server.manager.data_dir, "data")
+        return AiQuestionStore(
+            db_path=os.path.join(data_root, "questions_bank.db"),
+            data_root=data_root,
+        )
+
     def do_GET(self):
         if not self._authorized():
             self._send_json(HTTPStatus.UNAUTHORIZED, {"error": "unauthorized"})
@@ -1103,12 +1112,10 @@ class BackendRequestHandler(BaseHTTPRequestHandler):
             return
 
         if path == "/api/cache/stats":
-            from modules.answer_store import AiQuestionStore
-
             query = parse_qs(urlparse(self.path).query)
             course_id = (query.get("courseId") or query.get("course_id") or [""])[0]
             try:
-                stats = AiQuestionStore().stats(course_id.strip() or None)
+                stats = self._question_store().stats(course_id.strip() or None)
                 self._send_json(HTTPStatus.OK, {"ok": True, **stats})
             except Exception as exc:
                 self._send_json(HTTPStatus.BAD_GATEWAY, {"error": str(exc)})
@@ -1182,22 +1189,24 @@ class BackendRequestHandler(BaseHTTPRequestHandler):
             return
 
         if path == "/api/cache/export":
-            from modules.answer_store import AiQuestionStore
-
             course_id = str(body.get("courseId") or body.get("course_id") or "").strip()
             try:
-                payload = AiQuestionStore().export_data(course_id or None)
+                payload = self._question_store().export_data(course_id or None)
                 self._send_json(HTTPStatus.OK, {"ok": True, "data": payload})
             except Exception as exc:
                 self._send_json(HTTPStatus.BAD_GATEWAY, {"error": str(exc)})
             return
 
         if path == "/api/cache/import":
-            from modules.answer_store import AiQuestionStore
-
+            if self.server.manager.snapshot().get("status") == "running":
+                self._send_json(
+                    HTTPStatus.CONFLICT,
+                    {"error": "任务运行中，请先停止当前学习任务后再导入题库缓存"},
+                )
+                return
             payload = body.get("data") if isinstance(body.get("data"), dict) else body
             try:
-                counts = AiQuestionStore().import_data(payload)
+                counts = self._question_store().import_data(payload)
                 self._send_json(HTTPStatus.OK, {"ok": True, **counts})
             except ValueError as exc:
                 self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
@@ -1206,11 +1215,15 @@ class BackendRequestHandler(BaseHTTPRequestHandler):
             return
 
         if path == "/api/cache/clear":
-            from modules.answer_store import AiQuestionStore
-
+            if self.server.manager.snapshot().get("status") == "running":
+                self._send_json(
+                    HTTPStatus.CONFLICT,
+                    {"error": "任务运行中，请先停止当前学习任务后再清理题库缓存"},
+                )
+                return
             course_id = str(body.get("courseId") or body.get("course_id") or "").strip()
             try:
-                counts = AiQuestionStore().clear(course_id or None)
+                counts = self._question_store().clear(course_id or None)
                 self._send_json(HTTPStatus.OK, {"ok": True, **counts})
             except Exception as exc:
                 self._send_json(HTTPStatus.BAD_GATEWAY, {"error": str(exc)})
@@ -1359,6 +1372,8 @@ class BackendRequestHandler(BaseHTTPRequestHandler):
                         "cookies": fetched.cookies,
                     },
                 )
+            except ValueError as exc:
+                self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
             except Exception as exc:
                 self._send_json(HTTPStatus.BAD_GATEWAY, {"error": str(exc)})
             return

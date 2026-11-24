@@ -870,7 +870,7 @@ const SettingsView = ({
                 variant="tonal"
                 size="sm"
                 onClick={handleImportCache}
-                disabled={cacheBusy}
+                disabled={cacheBusy || taskRunning}
               >
                 <RefreshCw className="h-3.5 w-3.5" aria-hidden="true" />
                 导入题库缓存

@@ -156,9 +156,19 @@ def set_cookie_dict(cookie_jar, cookie: dict) -> None:
     cookie_jar.set(name, value, **kwargs)
 
 
-def build_session(cookies, proxy: str = "", user_agent: str = "") -> requests.Session:
+def build_session(
+    cookies,
+    proxy: str = "",
+    user_agent: str = "",
+    *,
+    total_retries: int = 3,
+) -> requests.Session:
     """用浏览器导出的 Cookie 构造带代理/重试的 requests 会话."""
-    session = create_retry_session(proxy, headers=dict(DEFAULT_HEADERS))
+    session = create_retry_session(
+        proxy,
+        total_retries=total_retries,
+        headers=dict(DEFAULT_HEADERS),
+    )
     if user_agent:
         session.headers["User-Agent"] = user_agent
     if isinstance(cookies, dict):
@@ -185,9 +195,20 @@ def _as_int(value) -> int | None:
 class ZhsApiClient:
     """带 Cookie/代理/重试的智慧树协议客户端."""
 
-    def __init__(self, cookies, proxy: str = "", user_agent: str = ""):
+    def __init__(
+        self,
+        cookies,
+        proxy: str = "",
+        user_agent: str = "",
+        *,
+        total_retries: int = 3,
+        timeout: int = REQUEST_TIMEOUT,
+    ):
         self.proxy = proxy
-        self.session = build_session(cookies, proxy, user_agent)
+        self.timeout = max(1, int(timeout))
+        self.session = build_session(
+            cookies, proxy, user_agent, total_retries=total_retries
+        )
         self.lock = threading.RLock()
         self._exam_sso_ready = False
 
@@ -225,8 +246,9 @@ class ZhsApiClient:
         *,
         method: str = "POST",
         extra_fields: dict | None = None,
-        timeout: int = REQUEST_TIMEOUT,
+        timeout: int | None = None,
     ) -> dict:
+        effective_timeout = self.timeout if timeout is None else timeout
         payload = dict(data)
         timestamp = None
         if strategy.set_timestamp:
@@ -245,16 +267,16 @@ class ZhsApiClient:
         method = (method or "POST").upper()
         with self.lock:
             if method == "GET":
-                response = self.session.get(url, params=form, timeout=timeout)
+                response = self.session.get(url, params=form, timeout=effective_timeout)
             elif strategy.content_type == "json":
                 response = self.session.post(
                     url,
                     data=json.dumps(form),
                     headers={"Content-Type": "application/json;charset=UTF-8"},
-                    timeout=timeout,
+                    timeout=effective_timeout,
                 )
             else:
-                response = self.session.post(url, data=form, timeout=timeout)
+                response = self.session.post(url, data=form, timeout=effective_timeout)
 
         response.raise_for_status()
         if strategy.raw_response:
@@ -291,13 +313,13 @@ class ZhsApiClient:
         """请求 CAS 登录入口, 返回 (service 票据地址, HTTP 状态码)."""
         url = f"{CAS_LOGIN}?service={service}"
         with self.lock:
-            response = self.session.get(url, allow_redirects=False, timeout=REQUEST_TIMEOUT)
+            response = self.session.get(url, allow_redirects=False, timeout=self.timeout)
             status = int(getattr(response, "status_code", 0) or 0)
             headers = getattr(response, "headers", {}) or {}
             location = headers.get("Location") or headers.get("location") or ""
             if status == 302 and location and CAS_TICKET_PARAM in location:
                 target = urljoin(PASSPORT_ORIGIN, location)
-                self.session.get(target, allow_redirects=True, timeout=REQUEST_TIMEOUT)
+                self.session.get(target, allow_redirects=True, timeout=self.timeout)
                 return target, status
         return None, status
 

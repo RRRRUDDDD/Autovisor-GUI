@@ -633,6 +633,12 @@ class AnswerCacheStoreTests(StoreTestCase):
         self.assertEqual(store.stats()["zhidao_questions"], 0)
         self.assertEqual(store.stats()["ai_questions"], 0)
 
+        # 全量清理并执行 WAL checkpoint + VACUUM 后，DB 仍可正常读写无锁异常
+        store.save_options_by_eid("course-after", "exam-after", "E-after", OPTIONS, content="清理后新题")
+        row = store.get_by_eid("course-after", "E-after", exam_id="exam-after")
+        self.assertIsNotNone(row)
+        self.assertEqual(row["content"], "清理后新题")
+
 
 if __name__ == "__main__":
     unittest.main()

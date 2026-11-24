@@ -832,6 +832,102 @@ class ZhidaoSharedCourseAssessmentTests(unittest.IsolatedAsyncioTestCase):
         skipped_fail = await _run_main_with(CourseOutcome.FAILED, review_mode=False)
         skipped_fail.assert_not_awaited()
 
+    async def test_run_fetch_courses_uses_api_fast_path_and_skips_playwright(self):
+        import json
+        import os
+        import tempfile
+        from modules.course_fetcher import ApiCourseFetchResult, FetchedCourse
+
+        with tempfile.TemporaryDirectory() as tmp:
+            courses_json = os.path.join(tmp, "data", "courses.json")
+            config_ini = os.path.join(tmp, "config.ini")
+            with open(config_ini, "w", encoding="utf-8") as f:
+                f.write("[course-url]\nURL1 =\n")
+
+            local_cookies = [
+                {
+                    "name": "CASTGC",
+                    "value": "tgt-keep",
+                    "domain": ".zhihuishu.com",
+                    "path": "/",
+                    "expires": 1893456000,
+                    "secure": True,
+                    "httpOnly": True,
+                    "sameSite": "Lax",
+                }
+            ]
+            api_result = ApiCourseFetchResult(
+                courses=[
+                    FetchedCourse(
+                        title="大学物理",
+                        url="https://studyvideoh5.zhihuishu.com/stuStudy?recruitAndCourseId=fast123",
+                        course_type="智慧共享课",
+                        teacher="姜老师",
+                        progress="80%",
+                    )
+                ],
+                display_name="测试学生",
+                school_name="示范大学",
+                session_valid=True,
+                sources={"zhidao": 1, "ai": 0, "hike": 0},
+                cookies=[
+                    {
+                        "name": "CASTGC",
+                        "value": "tgt-keep",
+                        "domain": ".zhihuishu.com",
+                        "path": "/",
+                        "expires": 1893456000,
+                        "secure": True,
+                        "httpOnly": True,
+                    },
+                    {
+                        "name": "SESSION",
+                        "value": "refreshed-sess",
+                        "domain": "onlineservice-api.zhihuishu.com",
+                        "path": "/",
+                        "secure": True,
+                        "httpOnly": True,
+                    },
+                ],
+            )
+            saved_cookies_calls = []
+
+            def _record_save_cookies(cookies, _path):
+                saved_cookies_calls.append(cookies)
+
+            pw_mock = MagicMock(side_effect=AssertionError("API 快速路径成功时不应启动浏览器"))
+            cfg = _config(
+                attach_existing_chrome=False,
+                proxy="",
+                config_path=config_ini,
+                qr_login=False,
+            )
+            with (
+                patch.object(Autovisor, "load_cookies", return_value=local_cookies),
+                patch.object(Autovisor, "fetch_courses_via_api", return_value=api_result),
+                patch.object(Autovisor, "async_playwright", pw_mock),
+                patch.object(Autovisor, "save_cookies", side_effect=_record_save_cookies),
+                patch.object(Autovisor, "get_runtime_path", return_value=courses_json),
+            ):
+                rc = await Autovisor.run_fetch_courses(cfg, write_config=True)
+
+            self.assertEqual(rc, 0)
+            pw_mock.assert_not_called()
+            self.assertTrue(os.path.isfile(courses_json))
+            with open(courses_json, "r", encoding="utf-8") as f:
+                exported = json.load(f)
+            self.assertEqual(len(exported), 1)
+            self.assertEqual(exported[0]["title"], "大学物理")
+
+            with open(config_ini, "r", encoding="utf-8") as f:
+                ini_text = f.read()
+            self.assertIn("recruitAndCourseId=fast123", ini_text)
+
+            self.assertEqual(len(saved_cookies_calls), 1)
+            merged_by_name = {c["name"]: c for c in saved_cookies_calls[0]}
+            self.assertEqual(merged_by_name["CASTGC"]["sameSite"], "Lax")
+            self.assertEqual(merged_by_name["SESSION"]["value"], "refreshed-sess")
+
 
 if __name__ == "__main__":
     unittest.main()

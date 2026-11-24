@@ -1263,6 +1263,22 @@ class AiQuestionStore:
             )
 
         zhidao_deleted, ai_deleted = self._write(action)
+        if course_id is None and (zhidao_deleted > 0 or ai_deleted > 0):
+            try:
+                with self._lock:
+                    conn = sqlite3.connect(
+                        str(self.db_path),
+                        timeout=BUSY_TIMEOUT_MS / 1000,
+                        isolation_level=None,
+                    )
+                    try:
+                        conn.execute(f"PRAGMA busy_timeout={BUSY_TIMEOUT_MS}")
+                        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                        conn.execute("VACUUM")
+                    finally:
+                        conn.close()
+            except sqlite3.Error:
+                pass
         json_deleted = (
             self._clear_json_snapshots(course_id) if include_snapshots else 0
         )
