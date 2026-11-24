@@ -360,64 +360,128 @@ async def run_resources_stage(
     return {"done": total_done, "failed": total_failed}
 
 
-async def run_exam_stage(page: Page, course_url: str, config, logger) -> dict:
-    """AI 智慧课: 用接口版 ExamCtx 按知识点刷计分考试并交卷."""
-    logger.section("接口考试")
-    payload = await enumerate_nodes(page, course_url)
-    nodes = [node for node in payload.get("nodes") or [] if node.get("nodeUid")]
-    if not nodes:
-        logger.warn("没有枚举到知识点, 跳过接口考试阶段.")
+def _formal_exam_succeeded(
+    ctx, submitted: bool, answered: int, total: int, auto_submit: bool
+) -> bool:
+    failed_saves = getattr(ctx, "_failed_saves", 0)
+    if not isinstance(failed_saves, int) or isinstance(failed_saves, bool):
+        failed_saves = 0
+    if auto_submit:
+        return bool(submitted)
+    return (total == 0) or (answered >= total and failed_saves == 0)
+
+
+async def run_formal_exam_stage(
+    page: Page,
+    course_url: str,
+    config,
+    logger,
+    *,
+    api: ExamApi | None = None,
+    course_id: str = "",
+    class_id: str = "",
+) -> dict:
+    """AI 智慧课: 独立扫描并执行综合/单元测试任务."""
+    if not getattr(config, "enableFormalExamApi", True):
         return {}
-    cookies = await page.context.cookies()
-    try:
-        user_agent = await page.evaluate("navigator.userAgent")
-    except Exception:
-        user_agent = ""
-    api = ExamApi(
-        cookies,
-        proxy=getattr(config, "proxy", ""),
-        user_agent=user_agent,
-    )
-    limit = getattr(config, "limitMaxTime", 0) or 0
-    deadline = time.monotonic() + limit * 60 if limit > 0 else None
-    runner = ExamRunner(
-        payload["courseId"],
-        payload["classId"],
-        api,
-        target=int(config.masteryTarget),
-        enable_ppt=getattr(config, "enablePptReference", True),
-    )
-    logger.info(f"开始接口考试: 知识点 {len(nodes)} 个, 目标掌握度 {int(config.masteryTarget)}%")
-    logger.event("接口考试范围", 知识点=len(nodes), 目标掌握度=int(config.masteryTarget))
-    summary = await asyncio.to_thread(runner.run, nodes, deadline)
-    logger.event(
-        "接口考试汇总",
-        达标=len(summary.get("done") or []),
-        跳过=len(summary.get("skipped") or []),
-        未完成=len(summary.get("failed") or []),
-    )
-    if getattr(config, "enableFormalExamApi", True):
-        auto_submit = bool(quiz_page.llm.conf().get("auto_submit", False))
+    if not course_id or not class_id:
+        parsed = parse_url(course_url)
+        course_id = course_id or str(parsed.get("courseId") or "")
+        class_id = class_id or str(parsed.get("classId") or "")
+    if not course_id:
         try:
-            formal = await asyncio.to_thread(
-                run_formal_exam_tasks,
-                api,
-                payload.get("courseId", ""),
-                payload.get("classId", ""),
-                auto_submit,
+            payload = await enumerate_nodes(page, course_url)
+        except Exception as exc:
+            logger.debug(f"综合考试解析课程 ID 失败: {exc}")
+            payload = {}
+        course_id = course_id or str(payload.get("courseId") or "")
+        class_id = class_id or str(payload.get("classId") or "")
+    if api is None:
+        api = await build_page_exam_api(page, config)
+    auto_submit = bool(quiz_page.llm.conf().get("auto_submit", False))
+    logger.section("综合考试")
+    formal = await asyncio.to_thread(
+        run_formal_exam_tasks,
+        api,
+        course_id,
+        class_id,
+        auto_submit,
+        logger,
+    )
+    if formal.get("found"):
+        logger.event(
+            "综合考试汇总",
+            任务=formal["found"],
+            完成=formal["done"],
+            已交卷=formal.get("submitted", 0),
+            失败=formal["failed"],
+        )
+    return formal
+
+
+async def run_exam_stage(
+    page: Page, course_url: str, config, logger, *, run_formal: bool = True
+) -> dict:
+    """AI 智慧课: 用接口版 ExamCtx 按知识点刷计分考试，并独立调度综合考试扫描."""
+    summary: dict = {}
+    api = None
+    course_id = ""
+    class_id = ""
+    if getattr(config, "enableExamApi", True):
+        logger.section("接口考试")
+        try:
+            payload = await enumerate_nodes(page, course_url)
+            course_id = str(payload.get("courseId") or "")
+            class_id = str(payload.get("classId") or "")
+            nodes = [
+                node for node in payload.get("nodes") or [] if node.get("nodeUid")
+            ]
+            if not nodes:
+                logger.warn("没有枚举到知识点, 跳过知识点接口考试.")
+            else:
+                api = await build_page_exam_api(page, config)
+                limit = getattr(config, "limitMaxTime", 0) or 0
+                deadline = time.monotonic() + limit * 60 if limit > 0 else None
+                runner = ExamRunner(
+                    course_id,
+                    class_id,
+                    api,
+                    target=int(config.masteryTarget),
+                    enable_ppt=getattr(config, "enablePptReference", True),
+                )
+                logger.info(
+                    f"开始接口考试: 知识点 {len(nodes)} 个, 目标掌握度 {int(config.masteryTarget)}%"
+                )
+                logger.event(
+                    "接口考试范围",
+                    知识点=len(nodes),
+                    目标掌握度=int(config.masteryTarget),
+                )
+                summary = await asyncio.to_thread(runner.run, nodes, deadline)
+                logger.event(
+                    "接口考试汇总",
+                    达标=len(summary.get("done") or []),
+                    跳过=len(summary.get("skipped") or []),
+                    未完成=len(summary.get("failed") or []),
+                )
+        except Exception as exc:
+            logger.log_exception("接口考试阶段失败.", exc)
+
+    if run_formal and getattr(config, "enableFormalExamApi", True):
+        try:
+            formal = await run_formal_exam_stage(
+                page,
+                course_url,
+                config,
                 logger,
+                api=api,
+                course_id=course_id,
+                class_id=class_id,
             )
         except Exception as exc:
             logger.log_exception("综合考试扫描失败.", exc)
         else:
             summary["formal_exams"] = formal
-            if formal.get("found"):
-                logger.event(
-                    "综合考试汇总",
-                    任务=formal["found"],
-                    完成=formal["done"],
-                    失败=formal["failed"],
-                )
     return summary
 
 
@@ -435,7 +499,13 @@ def run_formal_exam_tasks(
         auto_submit=auto_submit,
     )
     tasks = probe.scan_pending_tasks()
-    summary = {"found": len(tasks), "done": 0, "failed": 0, "details": []}
+    summary = {
+        "found": len(tasks),
+        "done": 0,
+        "submitted": 0,
+        "failed": 0,
+        "details": [],
+    }
     for task in tasks:
         task = dict(task)
         if not task.get("courseId"):
@@ -450,20 +520,33 @@ def run_formal_exam_tasks(
         )
         ctx = AiFormalExamCtx.from_task(api, task, auto_submit=auto_submit)
         try:
-            success, answered, total = ctx.start(submit=auto_submit)
+            submitted, answered, total = ctx.start(submit=auto_submit)
         except Exception as exc:
             summary["failed"] += 1
-            summary["details"].append({"name": name, "error": str(exc)})
+            summary["details"].append(
+                {
+                    "name": name,
+                    "ok": False,
+                    "success": False,
+                    "submitted": False,
+                    "error": str(exc),
+                }
+            )
             logger.log_exception(f"综合考试「{name}」执行失败.", exc)
             continue
-        if success:
+        ok = _formal_exam_succeeded(ctx, submitted, answered, total, auto_submit)
+        if submitted:
+            summary["submitted"] += 1
+        if ok:
             summary["done"] += 1
         else:
             summary["failed"] += 1
         summary["details"].append(
             {
                 "name": name,
-                "success": success,
+                "ok": ok,
+                "success": ok,
+                "submitted": bool(submitted),
                 "answered": answered,
                 "total": total,
             }
@@ -497,9 +580,17 @@ async def run_formal_exam_route(page: Page, parsed: dict, config, logger) -> dic
     logger.info(f"检测到综合考试链接, 开始接口作答 (自动交卷={auto_submit}) ...")
     logger.event("综合考试", 状态="开始", 自动交卷=auto_submit)
     ctx = AiFormalExamCtx.from_task(api, task, auto_submit=auto_submit)
-    success, answered, total = await asyncio.to_thread(ctx.start, submit=auto_submit)
-    logger.event("综合考试", 状态="结束", 成功=success, 作答=answered, 总数=total)
-    return {"success": success, "answered": answered, "total": total}
+    submitted, answered, total = await asyncio.to_thread(ctx.start, submit=auto_submit)
+    ok = _formal_exam_succeeded(ctx, submitted, answered, total, auto_submit)
+    logger.event(
+        "综合考试",
+        状态="结束",
+        成功=ok,
+        已交卷=bool(submitted),
+        作答=answered,
+        总数=total,
+    )
+    return {"success": ok, "answered": answered, "total": total}
 
 
 async def run_learn_page_route(
@@ -850,8 +941,10 @@ async def main(config) -> bool:
                         )
                     except Exception as exc:
                         logger.log_exception("必学资源补齐失败.", exc)
-                    # 视频刷完后先用接口版 ExamCtx 刷计分考试, 再走 UI 掌握度兜底
-                    if getattr(config, "enableExamApi", True):
+                    # 视频刷完后先用接口版 ExamCtx 刷计分考试, 综合考试按开关独立调度
+                    if getattr(config, "enableExamApi", True) or getattr(
+                        config, "enableFormalExamApi", True
+                    ):
                         try:
                             await run_exam_stage(page, course_url, config, logger)
                         except Exception as exc:

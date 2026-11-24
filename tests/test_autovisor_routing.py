@@ -192,6 +192,27 @@ class FormalExamRouteTests(unittest.IsolatedAsyncioTestCase):
         ctx_cls.from_task.assert_called_once_with(api, task, auto_submit=True)
         self.assertEqual(stats, {"success": True, "answered": 5, "total": 5})
 
+    async def test_test_detail_auto_submit_false_saved_all_succeeds(self):
+        parsed = parse_url(TEST_DETAIL_URL)
+        api = object()
+        ctx = MagicMock()
+        ctx._failed_saves = 0
+        ctx.start.return_value = (False, 4, 4)
+        with (
+            patch.object(
+                Autovisor, "build_page_exam_api", AsyncMock(return_value=api)
+            ),
+            patch.object(Autovisor, "AiFormalExamCtx") as ctx_cls,
+            patch.object(
+                Autovisor.quiz_page.llm, "conf", return_value={"auto_submit": False}
+            ),
+        ):
+            ctx_cls.from_task.return_value = ctx
+            stats = await Autovisor.run_formal_exam_route(
+                MagicMock(), parsed, _config(), MagicMock()
+            )
+        self.assertEqual(stats, {"success": True, "answered": 4, "total": 4})
+
     def test_formal_task_scan_executes_each_task_with_auto_submit(self):
         api = object()
         probe = MagicMock()
@@ -242,6 +263,99 @@ class FormalExamRouteTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(summary["failed"], 1)
         self.assertEqual(summary["done"], 0)
         logger.log_exception.assert_called_once()
+
+    def test_auto_submit_false_saved_all_counts_as_done_not_failed(self):
+        api = object()
+        probe = MagicMock()
+        probe.scan_pending_tasks.return_value = [{"examTestId": "E1", "taskName": "单元测试"}]
+        ctx = MagicMock()
+        ctx._failed_saves = 0
+        ctx.start.return_value = (False, 5, 5)
+        logger = MagicMock()
+        with patch.object(
+            Autovisor.AiFormalExamCtx,
+            "from_task",
+            side_effect=[probe, ctx],
+        ):
+            summary = Autovisor.run_formal_exam_tasks(
+                api, "C1", "CL1", False, logger
+            )
+        self.assertEqual(summary["found"], 1)
+        self.assertEqual(summary["done"], 1)
+        self.assertEqual(summary["submitted"], 0)
+        self.assertEqual(summary["failed"], 0)
+        self.assertTrue(summary["details"][0]["ok"])
+        self.assertFalse(summary["details"][0]["submitted"])
+
+    def test_auto_submit_false_with_failed_saves_counts_as_failed(self):
+        api = object()
+        probe = MagicMock()
+        probe.scan_pending_tasks.return_value = [{"examTestId": "E1"}]
+        ctx = MagicMock()
+        ctx._failed_saves = 2
+        ctx.start.return_value = (False, 3, 5)
+        logger = MagicMock()
+        with patch.object(
+            Autovisor.AiFormalExamCtx,
+            "from_task",
+            side_effect=[probe, ctx],
+        ):
+            summary = Autovisor.run_formal_exam_tasks(
+                api, "C1", "CL1", False, logger
+            )
+        self.assertEqual(summary["done"], 0)
+        self.assertEqual(summary["failed"], 1)
+        self.assertFalse(summary["details"][0]["ok"])
+
+    async def test_formal_exam_runs_when_exam_api_disabled(self):
+        api = object()
+        logger = MagicMock()
+        formal_result = {"found": 1, "done": 1, "submitted": 0, "failed": 0, "details": []}
+        with (
+            patch.object(Autovisor, "enumerate_nodes", AsyncMock()) as enum_nodes,
+            patch.object(Autovisor, "ExamRunner") as runner_cls,
+            patch.object(Autovisor, "build_page_exam_api", AsyncMock(return_value=api)) as build_api,
+            patch.object(Autovisor, "run_formal_exam_tasks", return_value=formal_result) as run_formal,
+            patch.object(Autovisor.quiz_page.llm, "conf", return_value={"auto_submit": False}),
+        ):
+            summary = await Autovisor.run_exam_stage(
+                MagicMock(),
+                KNOWLEDGE_URL,
+                _config(enableExamApi=False, enableFormalExamApi=True),
+                logger,
+            )
+        enum_nodes.assert_not_awaited()
+        runner_cls.assert_not_called()
+        build_api.assert_awaited_once()
+        run_formal.assert_called_once_with(api, "100", "200", False, logger)
+        self.assertEqual(summary["formal_exams"], formal_result)
+
+    async def test_formal_exam_runs_when_nodes_are_empty(self):
+        api = object()
+        logger = MagicMock()
+        formal_result = {"found": 1, "done": 1, "submitted": 1, "failed": 0, "details": []}
+        with (
+            patch.object(
+                Autovisor,
+                "enumerate_nodes",
+                AsyncMock(return_value={"courseId": "100", "classId": "200", "nodes": []}),
+            ) as enum_nodes,
+            patch.object(Autovisor, "ExamRunner") as runner_cls,
+            patch.object(Autovisor, "build_page_exam_api", AsyncMock(return_value=api)) as build_api,
+            patch.object(Autovisor, "run_formal_exam_tasks", return_value=formal_result) as run_formal,
+            patch.object(Autovisor.quiz_page.llm, "conf", return_value={"auto_submit": True}),
+        ):
+            summary = await Autovisor.run_exam_stage(
+                MagicMock(),
+                KNOWLEDGE_URL,
+                _config(enableExamApi=True, enableFormalExamApi=True),
+                logger,
+            )
+        enum_nodes.assert_awaited_once()
+        runner_cls.assert_not_called()
+        build_api.assert_awaited_once()
+        run_formal.assert_called_once_with(api, "100", "200", True, logger)
+        self.assertEqual(summary["formal_exams"], formal_result)
 
 
 if __name__ == "__main__":
