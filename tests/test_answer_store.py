@@ -441,6 +441,50 @@ class ExportImportTests(StoreTestCase):
         self.assertEqual(row["correct_options"], [11])
         self.assertEqual(store.stats("course-1")["zhidao_questions"], 1)
 
+    def test_import_conflict_merge_preserves_dropped_row_learning_records(self):
+        store, _ = self.make_store()
+        store.save_options_by_eid(
+            "course-1", "exam-1", "E-10", [], content=""
+        )
+        store.save_options_by_id(
+            "course-1", "exam-1", "Q-10", OPTIONS, content="原题干"
+        )
+        store.record_wrong("course-1", "exam-1", question_id="Q-10", wrong_options=["12"])
+        store.mark_correct(
+            "course-1",
+            "exam-1",
+            question_id="Q-10",
+            correct_options=["11"],
+            ai_analysis="保留的旧解析",
+            auto_clear_wrong=False,
+        )
+
+        payload = {
+            "zhidao_questions": [
+                {
+                    "course_id": "course-1",
+                    "exam_id": "exam-1",
+                    "eid": "E-10",
+                    "question_id": "Q-10",
+                    "content": "",
+                    "options": [],
+                    "correct_options": [],
+                    "wrong_options": [],
+                    "ai_analysis": "",
+                }
+            ]
+        }
+        store.import_data(payload)
+
+        row = store.get_by_eid("course-1", "E-10", exam_id="exam-1")
+        self.assertEqual(row["question_id"], "Q-10")
+        self.assertEqual(row["correct_options"], ["11"])
+        self.assertEqual(row["wrong_options"], [["12"]])
+        self.assertEqual(row["ai_analysis"], "保留的旧解析")
+        self.assertEqual(row["content"], "原题干")
+        self.assertEqual(row["options"], OPTIONS)
+        self.assertEqual(store.stats("course-1")["zhidao_questions"], 1)
+
 
 class MarkCorrectTests(StoreTestCase):
     def test_mark_correct_clears_stale_ai_analysis(self):

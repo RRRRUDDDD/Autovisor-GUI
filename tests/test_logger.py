@@ -277,7 +277,41 @@ class LoggerInitTests(unittest.TestCase):
         ) as opener:
             logger._init()
         maintain.assert_not_called()
-        opener.assert_called_once()
+        opener.assert_called_once_with(prune=False)
+
+    def test_init_does_not_prune_below_user_max_files_before_config_loaded(self):
+        logger = Logger()
+        saved = (logger.filename, logger.log_dir, logger.runtime_root)
+        saved_class = {name: getattr(Logger, name) for name in self.ATTRS}
+
+        def restore():
+            logger.filename, logger.log_dir, logger.runtime_root = saved
+            for name, value in saved_class.items():
+                setattr(Logger, name, value)
+
+        self.addCleanup(restore)
+        with tempfile.TemporaryDirectory() as tmp:
+            log_dir = os.path.join(tmp, "logs")
+            os.makedirs(log_dir, exist_ok=True)
+            for idx in range(1, 211):
+                with open(os.path.join(log_dir, f"Log{idx}.txt"), "w", encoding="utf-8") as f:
+                    f.write("old")
+
+            Logger.MAX_LOG_FILES = 200
+            with mock.patch.object(Logger, "get_runtime_root", return_value=tmp):
+                logger._init()
+
+            # 初始化阶段绝不按默认 200 裁剪：原有 210 个旧日志 + 1 个新日志 = 211
+            self.assertEqual(len(os.listdir(log_dir)), 211)
+
+            cfg = SimpleNamespace(
+                log_max_size_mb=10,
+                log_retention_days=0,
+                log_max_files=300,
+                log_compress_after_days=0,
+            )
+            logger.configure_from_config(cfg)
+            self.assertEqual(len(os.listdir(log_dir)), 211)
 
 
 class LogProductionTests(unittest.TestCase):

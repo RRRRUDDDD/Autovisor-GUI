@@ -204,6 +204,17 @@ class ExtractionTests(unittest.TestCase):
             [1],
         )
 
+    def test_match_choices_increments_hit_count_and_preserves_prefix_only_options(self):
+        self.interceptor.ingest(
+            make_payload(77, [("A.", 1), ("B.", 0)], "仅前缀选项题")
+        )
+        self.assertEqual(self.interceptor.hit_count, 0)
+        self.assertEqual(self.interceptor.match_choices(["A.", "B."]), [0])
+        self.assertEqual(self.interceptor.hit_count, 1)
+        # 未命中不递增
+        self.assertEqual(self.interceptor.match_choices(["不存在"]), [])
+        self.assertEqual(self.interceptor.hit_count, 1)
+
     def test_ttl_expiry_clears_cache(self):
         self.interceptor = PopupAnswerInterceptor(
             FakePage(), ttl=10, clock=self.clock

@@ -437,6 +437,22 @@ def _captcha_modules():
     return [np, cv2]
 
 
+_CAPTCHA_APPEAR_TIMEOUT = 25.0
+_CAPTCHA_MANUAL_TIMEOUT = 120.0
+
+
+async def _reload_for_captcha(page) -> bool:
+    reload = getattr(page, "reload", None)
+    if not callable(reload):
+        return False
+    try:
+        await reload(wait_until="domcontentloaded", timeout=15000)
+        return True
+    except Exception as exc:
+        logger.debug(f"人机验证前刷新页面失败: {exc}")
+        return False
+
+
 async def _settle_captcha(page, config) -> bool:
     """作业接口触发人机验证: 显示窗口, 自动/手动处理后再决定是否重试."""
     from modules.slider import captcha_visible, slider_verify
@@ -451,18 +467,33 @@ async def _settle_captcha(page, config) -> bool:
     solved = False
     modules = _captcha_modules() if getattr(config, "enableAutoCaptcha", True) else None
     try:
+        reloaded = False
+        if not await captcha_visible(page):
+            reloaded = await _reload_for_captcha(page)
         if modules:
             solved = bool(
                 await slider_verify(page, modules, appear_timeout_ms=6000, max_attempts=3)
             )
         if not solved:
-            deadline = time.monotonic() + 120
+            if not reloaded and not await captcha_visible(page):
+                await _reload_for_captcha(page)
+            start = time.monotonic()
+            appear_deadline = start + _CAPTCHA_APPEAR_TIMEOUT
+            deadline = start + _CAPTCHA_MANUAL_TIMEOUT
             seen = False
             while time.monotonic() < deadline:
                 visible = await captcha_visible(page)
-                seen = seen or visible
+                if visible and not seen:
+                    seen = True
+                    deadline = time.monotonic() + _CAPTCHA_MANUAL_TIMEOUT
                 if seen and not visible:
                     solved = True
+                    break
+                if not seen and time.monotonic() >= appear_deadline:
+                    logger.warn(
+                        "等待页面出现验证码超时, 结束人工等待并回退后续流程.",
+                        shift=True,
+                    )
                     break
                 await page.wait_for_timeout(1000)
     finally:

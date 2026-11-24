@@ -187,7 +187,10 @@ class PopupAnswerInterceptor:
                 added += len(entry["correct"])
                 option_keys = frozenset(
                     key
-                    for key in (strip_option_prefix(text) for text in entry["options"])
+                    for key in (
+                        strip_option_prefix(text) or text
+                        for text in entry["options"]
+                    )
                     if key
                 )
                 record = {
@@ -268,41 +271,44 @@ class PopupAnswerInterceptor:
         if not records:
             return []
 
+        result: list[int] | None = None
         if question_id not in (None, ""):
             matched = [
                 record
                 for record in records
                 if record["question_id"] == str(question_id)
             ]
-            resolved = self._resolve(matched, dom_keys)
-            if resolved is not None:
-                return resolved
+            result = self._resolve(matched, dom_keys)
 
-        title = normalize_option_text(question_title)
-        if title:
-            exact = [
-                record
-                for record in records
-                if self._title_matches(record["title"], title) == 2
-            ]
-            resolved = self._resolve(exact, dom_keys)
-            if resolved is not None:
-                return resolved
+        if result is None:
+            title = normalize_option_text(question_title)
+            if title:
+                exact = [
+                    record
+                    for record in records
+                    if self._title_matches(record["title"], title) == 2
+                ]
+                result = self._resolve(exact, dom_keys)
+                if result is None:
+                    dom_set = set(dom_keys)
+                    contained = [
+                        record
+                        for record in records
+                        if self._title_matches(record["title"], title) == 1
+                        and dom_set <= record["option_keys"]
+                    ]
+                    result = self._resolve(contained, dom_keys)
+
+        if result is None:
             dom_set = set(dom_keys)
-            contained = [
-                record
-                for record in records
-                if self._title_matches(record["title"], title) == 1
-                and dom_set <= record["option_keys"]
-            ]
-            resolved = self._resolve(contained, dom_keys)
-            if resolved is not None:
-                return resolved
+            subset = [record for record in records if dom_set <= record["option_keys"]]
+            result = self._resolve(subset, dom_keys)
 
-        dom_set = set(dom_keys)
-        subset = [record for record in records if dom_set <= record["option_keys"]]
-        resolved = self._resolve(subset, dom_keys)
-        return resolved or []
+        matched_indices = result or []
+        if matched_indices:
+            with self._lock:
+                self.hit_count += 1
+        return matched_indices
 
     # --------------------------------------------------------------- lookups
     def is_correct(self, text, question_id=None) -> bool:

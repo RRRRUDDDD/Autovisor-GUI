@@ -205,6 +205,14 @@ describe('Desktop Parity features (Phases 1-6)', () => {
     expect(screen.getByLabelText('作业达标得分率（%）').value).toBe('100');
     expect(screen.getByLabelText('作业错题重做轮数').value).toBe('3');
     expect(screen.getByLabelText('日志上限（MB）').value).toBe('10');
+    const retentionInput = screen.getByLabelText('保留天数（0 表示关闭）');
+    const compressInput = screen.getByLabelText('压缩归档天数（0 表示关闭）');
+    expect(retentionInput.getAttribute('min')).toBe('0');
+    expect(compressInput.getAttribute('min')).toBe('0');
+    fireEvent.change(retentionInput, { target: { value: '0' } });
+    expect(cfg.logRetentionDays).toBe(0);
+    fireEvent.change(compressInput, { target: { value: '0' } });
+    expect(cfg.logCompressAfterDays).toBe(0);
     expect(screen.getByLabelText('流式总超时（秒）').value).toBe('120');
     expect(screen.getByLabelText('第三方题库 Token（可选）').value).toBe('bank-token');
 

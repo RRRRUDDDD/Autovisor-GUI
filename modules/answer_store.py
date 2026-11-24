@@ -1074,15 +1074,16 @@ class AiQuestionStore:
                     conn, course_id, exam_id, question_id=str(question_id)
                 )
             row = eid_row or qid_row
+            dropped = None
             if (
                 eid_row is not None
                 and qid_row is not None
                 and eid_row["id"] != qid_row["id"]
             ):
-                keep, drop = (
+                keep, dropped = (
                     (eid_row, qid_row) if eid_row["id"] < qid_row["id"] else (qid_row, eid_row)
                 )
-                conn.execute("DELETE FROM zhidao_questions WHERE id=?", (drop["id"],))
+                conn.execute("DELETE FROM zhidao_questions WHERE id=?", (dropped["id"],))
                 row = conn.execute(
                     "SELECT * FROM zhidao_questions WHERE id=?", (keep["id"],)
                 ).fetchone()
@@ -1115,40 +1116,66 @@ class AiQuestionStore:
                     ),
                 )
                 return int(cursor.lastrowid)
+
+            drop_options = _json_load(dropped["options"], []) if dropped is not None else []
+            drop_correct = _json_load(dropped["correct_options"], []) if dropped is not None else []
+            drop_wrong = _json_load(dropped["wrong_options"], []) if dropped is not None else []
+            drop_analysis = _as_text(dropped["ai_analysis"]) if dropped is not None else ""
+            drop_content = _as_text(dropped["content"]) if dropped is not None else ""
+            drop_hashed = _as_text(dropped["option_ids_hash"]) if dropped is not None else ""
+            drop_qtype = _as_text(dropped["question_type"]) if dropped is not None else ""
+            drop_course_name = _as_text(dropped["course_name"]) if dropped is not None else ""
+
+            existing_options = _json_load(row["options"], [])
+            merged_options = options or existing_options or drop_options
+            merged_hashed = (
+                hashed
+                or _as_text(row["option_ids_hash"])
+                or drop_hashed
+                or option_hash(merged_options)
+            )
             existing_correct = _json_load(row["correct_options"], [])
+            merged_correct = correct_options or existing_correct or drop_correct
             existing_history = _json_load(row["wrong_options"], [])
             if not isinstance(existing_history, list):
                 existing_history = []
-            incoming_history = wrong_options if isinstance(wrong_options, list) else []
             merged_history = list(existing_history)
-            for combo in incoming_history:
-                if combo not in merged_history:
-                    merged_history.append(combo)
+            for source_history in (
+                drop_wrong if isinstance(drop_wrong, list) else [],
+                wrong_options if isinstance(wrong_options, list) else [],
+            ):
+                for combo in source_history:
+                    if combo not in merged_history:
+                        merged_history.append(combo)
+            merged_analysis = ai_analysis or _as_text(row["ai_analysis"]) or drop_analysis
+            merged_content = content or _as_text(row["content"]) or drop_content
+            merged_qtype = (
+                _as_text(item.get("question_type"))
+                or _as_text(row["question_type"])
+                or drop_qtype
+            )
+            merged_course_name = (
+                _as_text(item.get("course_name"))
+                or _as_text(row["course_name"])
+                or drop_course_name
+            )
             conn.execute(
                 "UPDATE zhidao_questions SET eid=COALESCE(eid, ?), "
                 "question_id=COALESCE(question_id, ?), "
-                "course_name=COALESCE(NULLIF(?, ''), course_name), "
-                "question_type=COALESCE(NULLIF(?, ''), question_type), "
-                "content=COALESCE(NULLIF(?, ''), content), "
-                "options=CASE WHEN ? <> '' THEN ? ELSE options END, "
-                "option_ids_hash=COALESCE(NULLIF(?, ''), option_ids_hash), "
-                "correct_options=CASE WHEN ? <> '[]' THEN ? ELSE correct_options END, "
-                "wrong_options=?, "
-                "ai_analysis=COALESCE(NULLIF(?, ''), ai_analysis), "
-                "last_updated=? WHERE id=?",
+                "course_name=?, question_type=?, content=?, options=?, "
+                "option_ids_hash=?, correct_options=?, wrong_options=?, "
+                "ai_analysis=?, last_updated=? WHERE id=?",
                 (
                     None if eid is None else str(eid),
                     None if question_id is None else str(question_id),
-                    _as_text(item.get("course_name")),
-                    _as_text(item.get("question_type")),
-                    content,
-                    _json_dumps(options) if options else "",
-                    _json_dumps(options),
-                    hashed,
-                    _json_dumps(correct_options) if correct_options else "[]",
-                    _json_dumps(correct_options),
+                    merged_course_name,
+                    merged_qtype,
+                    merged_content,
+                    _json_dumps(merged_options),
+                    merged_hashed,
+                    _json_dumps(merged_correct),
                     _json_dumps(merged_history),
-                    ai_analysis,
+                    merged_analysis,
                     now,
                     row["id"],
                 ),

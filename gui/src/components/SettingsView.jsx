@@ -726,11 +726,11 @@ const SettingsView = ({
                 />
               </div>
               <div className="space-y-1.5">
-                <Label htmlFor="logRetentionDays">保留天数</Label>
+                <Label htmlFor="logRetentionDays">保留天数（0 表示关闭）</Label>
                 <Input
                   id="logRetentionDays"
                   type="number"
-                  min="1"
+                  min="0"
                   value={config.logRetentionDays ?? 14}
                   onChange={(e) => updateField({ logRetentionDays: Number(e.target.value) })}
                 />
@@ -746,11 +746,11 @@ const SettingsView = ({
                 />
               </div>
               <div className="space-y-1.5">
-                <Label htmlFor="logCompressAfterDays">压缩归档天数</Label>
+                <Label htmlFor="logCompressAfterDays">压缩归档天数（0 表示关闭）</Label>
                 <Input
                   id="logCompressAfterDays"
                   type="number"
-                  min="1"
+                  min="0"
                   value={config.logCompressAfterDays ?? 3}
                   onChange={(e) => updateField({ logCompressAfterDays: Number(e.target.value) })}
                 />

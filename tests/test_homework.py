@@ -199,6 +199,70 @@ class HybridRoutingTests(unittest.IsolatedAsyncioTestCase):
         save_or_submit.assert_awaited_once()
         self.assertTrue(save_or_submit.await_args.args[1])
 
+    async def test_settle_captcha_reloads_when_not_visible_and_exits_after_appear_timeout(self):
+        class _Clock:
+            def __init__(self):
+                self.now = 100.0
+
+            def monotonic(self):
+                return self.now
+
+        clock = _Clock()
+        reloads = []
+        waits = []
+
+        class _CaptchaPage:
+            async def reload(self, **kwargs):
+                reloads.append(kwargs)
+
+            async def wait_for_timeout(self, ms):
+                waits.append(ms)
+                clock.now += ms / 1000.0
+
+        config = types.SimpleNamespace(enableAutoCaptcha=False, enableHideWindow=False)
+        with (
+            patch.object(homework.time, "monotonic", side_effect=clock.monotonic),
+            patch("modules.slider.captcha_visible", new=AsyncMock(return_value=False)),
+            patch("modules.window_control.should_hide_window", return_value=False),
+        ):
+            solved = await homework._settle_captcha(_CaptchaPage(), config)
+
+        self.assertFalse(solved)
+        self.assertEqual(len(reloads), 1)
+        # 从未出现验证码时应在 _CAPTCHA_APPEAR_TIMEOUT 处提前退出，远小于 120s
+        self.assertLessEqual(len(waits), 30)
+
+    async def test_settle_captcha_keeps_waiting_once_captcha_appears(self):
+        class _Clock:
+            def __init__(self):
+                self.now = 100.0
+
+            def monotonic(self):
+                return self.now
+
+        clock = _Clock()
+
+        class _CaptchaPage:
+            async def reload(self, **_kwargs):
+                return None
+
+            async def wait_for_timeout(self, ms):
+                clock.now += ms / 1000.0
+
+        # 验证码在第 102s 出现，直到第 140s（超过 25s appear 超时，但仍在 120s 内）被用户解除
+        async def fake_visible(_page):
+            return 102.0 <= clock.now < 140.0
+
+        config = types.SimpleNamespace(enableAutoCaptcha=False, enableHideWindow=False)
+        with (
+            patch.object(homework.time, "monotonic", side_effect=clock.monotonic),
+            patch("modules.slider.captcha_visible", new=fake_visible),
+            patch("modules.window_control.should_hide_window", return_value=False),
+        ):
+            solved = await homework._settle_captcha(_CaptchaPage(), config)
+
+        self.assertTrue(solved)
+
 
 if __name__ == "__main__":
     unittest.main()

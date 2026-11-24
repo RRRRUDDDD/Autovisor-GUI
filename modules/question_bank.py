@@ -159,7 +159,11 @@ class QuestionBankClient:
         if self.session is None:
             return None, "disabled"
         kwargs = {"params": params, "timeout": self.timeout}
-        proxies = build_requests_proxies(self.proxy)
+        try:
+            proxies = build_requests_proxies(self.proxy)
+        except ValueError as exc:
+            logger.debug(f"题库代理配置无效({self.proxy!r}): {exc}")
+            return None, "network"
         if proxies:
             kwargs["proxies"] = proxies
         try:

@@ -83,7 +83,7 @@ class Logger:
         self.console_debug = False
         self.emit_debug = False
         self.filename = ""
-        self._open_new_log_file()
+        self._open_new_log_file(prune=False)
 
     def configure(
         self,
@@ -193,7 +193,7 @@ class Logger:
         for path in removable[: max(0, excess)]:
             self._remove_quietly(path)
 
-    def _open_new_log_file(self):
+    def _open_new_log_file(self, *, prune: bool = True):
         os.makedirs(self.log_dir, exist_ok=True)
         existing_logs = []
         max_index = 0
@@ -213,18 +213,19 @@ class Logger:
         if os.name != "nt":
             os.chmod(self.filename, 0o600)
 
-        max_files = max(1, int(getattr(self, "MAX_LOG_FILES", 200)))
-        if len(existing_logs) >= max_files:
-            def _sort_key(item):
-                idx, path = item
-                return (self._mtime(path), idx)
+        if prune:
+            max_files = max(1, int(getattr(self, "MAX_LOG_FILES", 200)))
+            if len(existing_logs) >= max_files:
+                def _sort_key(item):
+                    idx, path = item
+                    return (self._mtime(path), idx)
 
-            existing_logs.sort(key=_sort_key)
-            excess = len(existing_logs) - (max_files - 1)
-            for _, old_path in existing_logs[:excess]:
-                if old_path == self.filename:
-                    continue
-                self._remove_quietly(old_path)
+                existing_logs.sort(key=_sort_key)
+                excess = len(existing_logs) - (max_files - 1)
+                for _, old_path in existing_logs[:excess]:
+                    if old_path == self.filename:
+                        continue
+                    self._remove_quietly(old_path)
         return self.filename
 
     def start_new_run(self):

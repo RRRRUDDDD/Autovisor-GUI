@@ -151,6 +151,17 @@ class QuestionBankClientTests(unittest.TestCase):
             {"http": "http://127.0.0.1:7890", "https": "http://127.0.0.1:7890"},
         )
 
+    def test_malformed_proxy_degrades_gracefully_in_probe_and_query(self):
+        def handler(url, kwargs):  # pragma: no cover - 畸形代理不应发出请求
+            raise AssertionError("畸形代理不应发起网络请求")
+
+        client, session = self._client(handler, proxy="not-a-valid-proxy")
+        result = client.probe()
+        self.assertFalse(result["ok"])
+        self.assertIn("失败", result["message"])
+        self.assertIsNone(client.query("题目", ["A", "B"]))
+        self.assertEqual(session.calls, [])
+
     def test_sanitize_session_clears_cookies(self):
         class _Cookies:
             def __init__(self):
