@@ -9,6 +9,11 @@ import threading
 import time
 
 from modules import llm
+from modules.answer_parser import (
+    parse_homework_answer,
+    parse_json_list as _load_json_list,
+)
+from modules.answer_service import LlmCircuitBreaker, QuestionBankHelper
 from modules.answer_store import AiQuestionStore, option_hash
 from modules.html_utils import extract_plain_text, has_meaningful_image
 from modules.logger import Logger
@@ -26,13 +31,6 @@ from modules.zhs_api import ZhsApiError
 
 logger = Logger()
 
-_ANSWER_BLOCK_RE = re.compile(r"```answer\s*(.*?)```", re.DOTALL | re.IGNORECASE)
-_THINK_RE = re.compile(
-    r"<think\b[^>]*>.*?</thi" + "nk>",
-    re.DOTALL | re.IGNORECASE,
-)
-_THINK_TAG_RE = re.compile(r"</?think[^>]*>", re.IGNORECASE)
-_LIST_RE = re.compile(r"\[.*\]", re.DOTALL)
 _LETTERS = "ABCDEFGH"
 
 ROLLBACK_RETRIES = 3
@@ -53,78 +51,6 @@ def question_has_image(question: dict) -> bool:
         has_meaningful_image(option.get("content"))
         for option in question.get("options") or []
     )
-
-
-def _load_json_list(text: str):
-    raw = _THINK_RE.sub("", text or "")
-    raw = _THINK_TAG_RE.sub("", raw)
-    block = _ANSWER_BLOCK_RE.search(raw)
-    candidates = [block.group(1).strip()] if block else []
-    candidates.append(raw)
-    for candidate in candidates:
-        try:
-            data = json.loads(candidate)
-            if isinstance(data, list):
-                return data
-        except (ValueError, TypeError):
-            pass
-        match = _LIST_RE.search(candidate)
-        if match:
-            try:
-                data = json.loads(match.group(0))
-                if isinstance(data, list):
-                    return data
-            except (ValueError, TypeError):
-                continue
-    return None
-
-
-def parse_homework_answer(text: str, question: dict) -> tuple[list, list]:
-    """解析模型回复, 返回 (选项 ID 列表, 填空文本列表)."""
-    data = _load_json_list(text)
-    if data is None:
-        return [], []
-    options = question.get("options") or []
-    by_id = {str(option["id"]): str(option["id"]) for option in options}
-    by_text = {_plain(option.get("content")): str(option["id"]) for option in options}
-    if question.get("type") == 3:
-        values = []
-        for item in data:
-            if isinstance(item, dict):
-                item = item.get("content") or item.get("text") or item.get("answer")
-            cleaned = str(item or "").strip()
-            if cleaned:
-                values.append(cleaned)
-        return [], values
-
-    selected: list[str] = []
-    for item in data:
-        value = item
-        if isinstance(item, dict):
-            value = item.get("id") or item.get("content") or item.get("answer")
-        token = str(value or "").strip()
-        if not token:
-            continue
-        if token in by_id:
-            target = by_id[token]
-        elif token in by_text:
-            target = by_text[token]
-        elif re.fullmatch(r"[A-Ha-h]+", token) and len(token) <= len(options):
-            target = None
-            for char in token.upper():
-                idx = _LETTERS.index(char)
-                if idx < len(options):
-                    ident = str(options[idx]["id"])
-                    if ident not in selected:
-                        selected.append(ident)
-            continue
-        elif token.isdigit() and 0 < int(token) <= len(options):
-            target = str(options[int(token) - 1]["id"])
-        else:
-            target = None
-        if target and target not in selected:
-            selected.append(target)
-    return selected, []
 
 
 def _wrong_combos(row: dict | None) -> list[list[str]]:
@@ -415,24 +341,56 @@ class ZhidaoHomeworkWorker:
         # 0 表示按服务端 maxRedo / 保底 AUTO_MAX_ROUNDS 轮
         self.max_rounds = int(max_rounds or 0)
         self.sleep = sleep
-        self.question_bank = question_bank
-        self._question_bank_ready = question_bank is not None
-        self._owns_question_bank = False
+        api_client = getattr(api, "client", None)
+        bank_proxy = getattr(api_client, "proxy", "") if api_client is not None else ""
+        self._bank_helper = QuestionBankHelper(question_bank, proxy=bank_proxy)
         self.cancel_event = cancel_event
         self._ai_user_id = None
         self._recruit_id = str(recruit_id or "")
-        self._llm_disabled = False
-        self._llm_warned = False
+        self._llm_breaker = LlmCircuitBreaker()
+
+    @property
+    def question_bank(self):
+        return self._bank_helper.client
+
+    @question_bank.setter
+    def question_bank(self, value) -> None:
+        self._bank_helper.client = value
+
+    @property
+    def _question_bank_ready(self) -> bool:
+        return self._bank_helper.ready
+
+    @_question_bank_ready.setter
+    def _question_bank_ready(self, value: bool) -> None:
+        self._bank_helper.ready = bool(value)
+
+    @property
+    def _owns_question_bank(self) -> bool:
+        return self._bank_helper.owns_client
+
+    @_owns_question_bank.setter
+    def _owns_question_bank(self, value: bool) -> None:
+        self._bank_helper.owns_client = bool(value)
+
+    @property
+    def _llm_disabled(self) -> bool:
+        return self._llm_breaker.disabled
+
+    @_llm_disabled.setter
+    def _llm_disabled(self, value: bool) -> None:
+        self._llm_breaker.disabled = bool(value)
+
+    @property
+    def _llm_warned(self) -> bool:
+        return self._llm_breaker.warned
+
+    @_llm_warned.setter
+    def _llm_warned(self, value: bool) -> None:
+        self._llm_breaker.warned = bool(value)
 
     def close(self) -> None:
-        if self._owns_question_bank and self.question_bank is not None:
-            close_fn = getattr(self.question_bank, "close", None)
-            if callable(close_fn):
-                try:
-                    close_fn()
-                except Exception:
-                    pass
-            self._owns_question_bank = False
+        self._bank_helper.close()
 
     def __enter__(self) -> "ZhidaoHomeworkWorker":
         return self
@@ -451,39 +409,15 @@ class ZhidaoHomeworkWorker:
 
     # ------------------------------------------------------------- answering
     def _get_question_bank(self):
-        if self._question_bank_ready:
-            return self.question_bank
-        self._question_bank_ready = True
-        try:
-            api_client = getattr(self.api, "client", None)
-            proxy = getattr(api_client, "proxy", "") if api_client is not None else ""
-            self.question_bank = QuestionBankClient.from_config(proxy=proxy)
-            self._owns_question_bank = self.question_bank is not None
-        except Exception as exc:
-            logger.debug(f"初始化外部题库失败: {exc}")
-            self.question_bank = None
-            self._owns_question_bank = False
-        return self.question_bank
+        return self._bank_helper.get()
 
     def _bank_reference(self, question: dict) -> str:
-        bank = self._get_question_bank()
-        if bank is None or not bank.enabled():
-            return ""
-        try:
-            title = _plain(question.get("content"))
-            options = [_plain(option.get("content")) for option in question.get("options") or []]
-            return bank.query(title, options, question.get("type", 1)) or ""
-        except Exception as exc:
-            logger.debug(f"外部题库查询降级: {exc}")
-            return ""
+        title = _plain(question.get("content"))
+        options = [_plain(option.get("content")) for option in question.get("options") or []]
+        return self._bank_helper.query(title, options, question.get("type", 1))
 
     def _log_bank_stats(self) -> None:
-        if self.question_bank is None:
-            return
-        try:
-            self.question_bank.log_stats()
-        except Exception as exc:
-            logger.debug(f"外部题库统计输出失败: {exc}")
+        self._bank_helper.log_stats()
 
     def _ask(self, prompt: str) -> str:
         if self.answerer is not None:
@@ -493,14 +427,11 @@ class ZhidaoHomeworkWorker:
         return llm.chat_sync(prompt, json_mode=False, stream=True)
 
     def _disable_llm(self, exc) -> None:
-        self._llm_disabled = True
-        if not self._llm_warned:
-            self._llm_warned = True
-            logger.warn(
-                f"大模型不可用({exc}), 本卷后续题目将跳过 LLM 并降级处理.",
-                shift=True,
-            )
-            logger.event("作业作答", 结果="LLM 已禁用", 错误=logger.summarize_exception(exc))
+        self._llm_breaker.trip(
+            exc,
+            warn_message=f"大模型不可用({exc}), 本卷后续题目将跳过 LLM 并降级处理.",
+            event_name="作业作答",
+        )
 
     def _fallback_values(self, question: dict, options: list | None = None) -> list[str]:
         qtype = question.get("type", 1)

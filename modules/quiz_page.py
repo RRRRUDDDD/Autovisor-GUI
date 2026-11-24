@@ -12,10 +12,18 @@ import hashlib
 import re
 import time
 
-from playwright._impl._errors import TargetClosedError
-
 from modules import homework, llm
 from modules.logger import Logger
+from modules.quiz_dom import (
+    JS_FIND_BUTTON,
+    TargetClosedError,
+    click_button_by_text,
+)
+from modules.text_utils import (
+    brief as _brief,
+    compact_text as _norm,
+    similarity as _text_similarity,
+)
 
 logger = Logger()
 
@@ -121,39 +129,6 @@ JS_FILL = r"""
 }
 """
 
-JS_FIND_BUTTON = r"""
-(texts) => {
-  const norm = (s) => (s || "").replace(/[\s\u3000]+/g, "");
-  const wanted = texts.map(t => norm(t)).filter(Boolean);
-  if (!wanted.length) return false;
-  const els = [...document.querySelectorAll(
-    "button, a, input, div, span, li, p, img, [role=button], .el-button, .btn"
-  )];
-  let best = null, bestScore = Infinity;
-  for (const el of els) {
-    const r = el.getBoundingClientRect();
-    if (r.width === 0 || r.height === 0 || r.height > 120) continue;
-    let t = "";
-    if (el.tagName === "INPUT") t = el.value || "";
-    if (!t) t = el.innerText || "";
-    if (!t) t = el.getAttribute("title") || "";
-    if (!t) t = el.getAttribute("aria-label") || "";
-    if (!t) t = el.getAttribute("alt") || "";
-    t = String(t).trim();
-    if (!t || t.length > 12) continue;
-    const nt = norm(t);
-    if (!wanted.some(w => nt === w || nt.includes(w))) continue;
-    const style = getComputedStyle(el);
-    const isBtn = ["BUTTON", "A", "INPUT"].includes(el.tagName) || style.cursor === "pointer";
-    const score = (isBtn ? 0 : 5) + nt.length;
-    if (score < bestScore) { best = el; bestScore = score; }
-  }
-  if (!best) return false;
-  best.click();
-  return true;
-}
-"""
-
 # 返回码: 0=没找到选项 1=已选中(跳过) 2=已点击
 JS_OPTION_CLICK = r"""
 (args) => {
@@ -196,17 +171,6 @@ JS_SELECTED_TEXTS = r"""
 """
 
 
-def _norm(s: str) -> str:
-    return re.sub(r"[\s\u3000]+", "", s or "")
-
-
-def _brief(text: str, limit: int = 60) -> str:
-    cleaned = " ".join(str(text or "").split())
-    if len(cleaned) <= limit:
-        return cleaned
-    return f"{cleaned[:limit]}..."
-
-
 def _format_selected_options(q: dict, answers: list[int]) -> str:
     opts = q.get("options") or []
     letters = "ABCDEFGH"
@@ -221,12 +185,7 @@ def _format_selected_options(q: dict, answers: list[int]) -> str:
 
 
 def _sim(a: str, b: str) -> float:
-    a, b = _norm(a), _norm(b)
-    if not a or not b:
-        return 0.0
-    if a == b:
-        return 1.0
-    return difflib.SequenceMatcher(None, a, b).ratio()
+    return _text_similarity(a, b, compact=True)
 
 
 def match_group(question: dict, groups: list):
@@ -268,10 +227,9 @@ async def _click_by_text(page, option_text: str, force: bool = False) -> str:
 
 
 async def _click_prev(page) -> bool:
-    try:
-        return bool(await page.evaluate(JS_FIND_BUTTON, ["上一题", "上一页", "上一步"]))
-    except Exception:
-        return False
+    return await click_button_by_text(
+        page, ["上一题", "上一页", "上一步"], allow_substring=True
+    )
 
 
 async def _click_next(page) -> bool:

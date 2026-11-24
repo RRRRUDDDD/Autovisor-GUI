@@ -582,17 +582,37 @@ class AnswerBankStoreTests(StoreTestCase):
 
 
 class AnswerCacheStoreTests(StoreTestCase):
-    def test_answer_cache_syncs_to_store_and_falls_back(self):
+    def test_answer_cache_syncs_to_store_without_writing_json(self):
         store, root = self.make_store()
         cache_path = root / "mastery_answers.json"
         cache = AnswerCache(cache_path, store=store)
         cache.put("光合作用的主要产物是什么？", {"letters": ["A"]})
+        self.assertFalse(cache_path.exists())
 
         fresh = AnswerCache(root / "empty.json", store=store)
         self.assertEqual(
             fresh.get("光合作用的主要产物是什么"),
             {"letters": ["A"]},
         )
+
+    def test_answer_cache_migrates_legacy_mastery_json_once(self):
+        store, root = self.make_store()
+        legacy_path = root / "legacy_mastery.json"
+        legacy_path.write_text(
+            json.dumps(
+                {
+                    "旧版掌握度题目": {"text": "A、B、C"},
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+        cache = AnswerCache(legacy_path, store=store)
+        self.assertEqual(cache.get("旧版掌握度题目"), {"letters": ["A", "B", "C"]})
+        cache.put("新增题目", {"values": ["填空一"]})
+        # Legacy JSON file must not be rewritten on put()
+        raw_after = json.loads(legacy_path.read_text(encoding="utf-8"))
+        self.assertNotIn("新增题目", raw_after)
 
     def test_clear_removes_sqlite_rows_and_json_snapshots(self):
         store, root = self.make_store()

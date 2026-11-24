@@ -21,7 +21,7 @@ import asyncio
 import time
 
 from playwright.async_api import Page
-from playwright._impl._errors import TargetClosedError
+from modules.quiz_dom import TargetClosedError
 
 from modules.logger import Logger
 from modules.login import is_login_page

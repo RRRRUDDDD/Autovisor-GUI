@@ -32,6 +32,13 @@ except ImportError:  # pragma: no cover
 
 from modules.http_utils import build_requests_proxies
 from modules.logger import Logger
+from modules.paths import get_resource_path
+from modules.text_utils import (
+    brief as _text_brief,
+    compact_text as _norm,
+    similarity as _text_similarity,
+    strip_think_tags as _strip_think_tags,
+)
 
 logger = Logger()
 
@@ -39,7 +46,27 @@ _LLM_CONF = None
 _WARNED = False
 _RUNTIME_PROXY = ""
 
-SUPPORTED_API_FORMATS = (
+
+def _load_provider_catalog() -> dict:
+    """从共享 resources/llm_providers.json 加载三端统一的厂商与协议元数据。"""
+    path = get_resource_path("resources", "llm_providers.json")
+    try:
+        with open(path, "r", encoding="utf-8-sig") as f:
+            data = json.load(f)
+        if isinstance(data, dict) and isinstance(data.get("providers"), list):
+            return data
+    except Exception:
+        pass
+    return {}
+
+
+_PROVIDER_CATALOG = _load_provider_catalog()
+
+SUPPORTED_API_FORMATS = tuple(
+    str(item.get("id") or "").strip().lower()
+    for item in (_PROVIDER_CATALOG.get("apiFormats") or [])
+    if isinstance(item, dict) and str(item.get("id") or "").strip()
+) or (
     "openai",
     "openai-responses",
     "anthropic",
@@ -128,7 +155,7 @@ def _positive_float(value, default: float) -> float:
 
 _LOCAL_HOSTS = {"localhost", "127.0.0.1", "::1", "0.0.0.0"}
 
-_PROVIDER_LABELS = {
+_FALLBACK_PROVIDER_LABELS = {
     "deepseek": "DeepSeek",
     "openai": "OpenAI",
     "anthropic": "Anthropic Claude",
@@ -152,6 +179,36 @@ _PROVIDER_LABELS = {
     "lmstudio": "LM Studio 本地",
     "custom": "自定义大模型",
 }
+
+_PROVIDER_LABELS = {
+    str(item["id"]).strip().lower(): str(
+        item.get("pyLabel") or item.get("shortName") or item["id"]
+    )
+    for item in (_PROVIDER_CATALOG.get("providers") or [])
+    if isinstance(item, dict) and str(item.get("id") or "").strip()
+} or dict(_FALLBACK_PROVIDER_LABELS)
+
+_PROVIDER_HOST_RULES: list[tuple[str, tuple[str, ...]]] = [
+    (
+        str(item["id"]).strip().lower(),
+        tuple(str(h).strip().lower() for h in (item.get("matchHosts") or []) if str(h).strip()),
+    )
+    for item in (_PROVIDER_CATALOG.get("providers") or [])
+    if isinstance(item, dict)
+    and str(item.get("id") or "").strip()
+    and (item.get("matchHosts") or [])
+]
+
+_PROVIDER_FORMAT_RULES: list[tuple[str, tuple[str, ...]]] = [
+    (
+        str(item["id"]).strip().lower(),
+        tuple(str(fmt).strip().lower() for fmt in (item.get("matchFormats") or []) if str(fmt).strip()),
+    )
+    for item in (_PROVIDER_CATALOG.get("providers") or [])
+    if isinstance(item, dict)
+    and str(item.get("id") or "").strip()
+    and (item.get("matchFormats") or [])
+]
 
 
 def reset_cache():
@@ -203,51 +260,15 @@ def infer_api_format(api_base: str = "", provider: str = "") -> str:
 
 
 def infer_provider(api_base: str = "", api_format: str = "") -> str:
-    """根据接口地址与协议推断服务商标识。"""
+    """根据接口地址与协议推断服务商标识（规则来自共享 resources/llm_providers.json）。"""
     base = (api_base or "").strip().lower()
     fmt = (api_format or "").strip().lower()
-    if "api.deepseek.com" in base:
-        return "deepseek"
-    if "api.openai.com" in base:
-        return "openai"
-    if "anthropic.com" in base or fmt == "anthropic":
-        return "anthropic"
-    if "generativelanguage.googleapis.com" in base or fmt == "gemini":
-        return "gemini"
-    if "dashscope.aliyuncs.com" in base:
-        return "qwen"
-    if "open.bigmodel.cn" in base:
-        return "zhipu"
-    if "api.moonshot.cn" in base or "api.moonshot.ai" in base:
-        return "moonshot"
-    if "volces.com" in base:
-        return "doubao"
-    if "siliconflow.cn" in base or "siliconflow.com" in base:
-        return "siliconflow"
-    if "hunyuan.cloud.tencent.com" in base:
-        return "hunyuan"
-    if "spark-api-open.xf-yun.com" in base:
-        return "spark"
-    if "qianfan.baidubce.com" in base:
-        return "qianfan"
-    if "minimax.chat" in base or "minimaxi.com" in base:
-        return "minimax"
-    if "lingyiwanwu.com" in base:
-        return "yi"
-    if "api.x.ai" in base:
-        return "xai"
-    if "api.groq.com" in base:
-        return "groq"
-    if "api.mistral.ai" in base:
-        return "mistral"
-    if "openrouter.ai" in base:
-        return "openrouter"
-    if ".openai.azure.com" in base or fmt == "azure":
-        return "azure"
-    if fmt == "ollama" or ":11434" in base:
-        return "ollama"
-    if ":1234" in base:
-        return "lmstudio"
+    for prov_id, hosts in _PROVIDER_HOST_RULES:
+        if any(h in base for h in hosts):
+            return prov_id
+    for prov_id, formats in _PROVIDER_FORMAT_RULES:
+        if fmt in formats:
+            return prov_id
     return "custom"
 
 
@@ -383,36 +404,13 @@ def vision_label() -> str:
     return f"{name}({model})" if model else f"{name}(未配置视觉模型)"
 
 
-def _norm(s: str) -> str:
-    return re.sub(r"[\s\u3000]+", "", s or "")
-
-
 def _brief(text: str, limit: int = 80) -> str:
     """将题干/选项/回答折叠成单行摘要，避免多行文本破坏日志格式。"""
-    cleaned = " ".join(str(text or "").split())
-    if len(cleaned) <= limit:
-        return cleaned
-    return f"{cleaned[:limit]}..."
+    return _text_brief(text, limit=limit)
 
 
 def _sim(a: str, b: str) -> float:
-    a, b = _norm(a), _norm(b)
-    if not a or not b:
-        return 0.0
-    if a == b:
-        return 1.0
-    return difflib.SequenceMatcher(None, a, b).ratio()
-
-
-def _strip_think_tags(text: str) -> str:
-    """移除推理模型可能输出的 <think>...</think> 及截断未闭合的 <think>... 思考过程，保留最终答案。"""
-    cleaned = re.sub(
-        r"<think\b[^>]*>.*?</think>", "", text or "", flags=re.DOTALL | re.IGNORECASE
-    )
-    cleaned = re.sub(
-        r"<think\b[^>]*>.*$", "", cleaned, flags=re.DOTALL | re.IGNORECASE
-    )
-    return cleaned.strip()
+    return _text_similarity(a, b, compact=True)
 
 
 _HTTP_LOCAL = threading.local()

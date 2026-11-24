@@ -7,7 +7,7 @@ import sys
 from urllib.parse import urlparse
 
 from playwright.async_api import Browser, BrowserContext, Page, Playwright
-from playwright._impl._errors import TargetClosedError
+from modules.quiz_dom import TargetClosedError
 
 from modules.http_utils import build_playwright_proxy
 from modules.utils import get_resource_path

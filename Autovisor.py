@@ -16,7 +16,7 @@ from modules.stdio import configure_stdio
 configure_stdio()
 
 from playwright.async_api import BrowserContext, Page, Playwright, TimeoutError, async_playwright
-from playwright._impl._errors import TargetClosedError
+from modules.quiz_dom import TargetClosedError
 
 from modules import homework, installer, quiz_page, updater
 from modules.ai_smart import (

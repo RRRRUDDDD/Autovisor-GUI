@@ -13,7 +13,19 @@ import re
 import time
 
 from modules import llm
+from modules.answer_parser import (
+    letters_to_indexes as _letters_to_indexes,
+    parse_vision_answer,
+)
 from modules.logger import Logger
+from modules.quiz_dom import (
+    JS_CLICK_OPTION,
+    JS_CLICK_TEXT,
+    JS_FILL_CONTAINER as JS_FILL,
+    JS_OPTION_CHECKED,
+    click_button_by_text,
+)
+from modules.text_utils import strip_think_tags as _strip_think
 
 logger = Logger()
 
@@ -31,14 +43,6 @@ VISION_PROMPT = """你是一名网课答题助手。图片是智慧树作业/考
 - 判断题: 按从上到下的顺序把两个选项当作 A、B，输出正确的一个
 - 填空题: 输出「FILL: 答案原文」
 选项按图片中从上到下的顺序依次为 A、B、C、D、E、F...，不要输出解释或多余文字。"""
-
-_THINK_RE = re.compile(r"<think\b[^>]*>.*?</thi" + "nk>", re.IGNORECASE | re.DOTALL)
-_THINK_TAG_RE = re.compile(r"</?think[^>]*>", re.IGNORECASE)
-_LETTER_TOKEN_RE = re.compile(r"^[A-H](?:[A-H])*$", re.IGNORECASE)
-_LETTER_ANSWER_RE = re.compile(
-    r"(?:答案|正确选项|选择|应选|选)\s*(?:是|为)?\s*[:：]?\s*([A-Ha-h]{1,8})"
-)
-_FILL_RE = re.compile(r"FILL\s*[:：]\s*(.+)", re.IGNORECASE | re.DOTALL)
 
 JS_SIGNATURE = r"""
 el => {
@@ -72,31 +76,6 @@ el => {
   if (/填空|简答|问答/.test(text)) return "fill";
   if (/单选/.test(text)) return "single";
   return "choice";
-}
-"""
-
-JS_CLICK_OPTION = r"""
-el => {
-  const input = el.querySelector("input");
-  if (input && input.disabled) return false;
-  let target = el;
-  const label = el.querySelector("label, .label");
-  if (label) target = label;
-  target.click();
-  if (input) {
-    input.dispatchEvent(new Event("change", { bubbles: true }));
-  }
-  return true;
-}
-"""
-
-JS_OPTION_CHECKED = r"""
-el => {
-  const cls = (el.className || "") + " " + ((el.parentElement && el.parentElement.className) || "");
-  const active = /(^|\s)(active|checked|selected|is-active|is-checked|is-selected)(\s|$)/.test(cls);
-  const input = el.querySelector("input");
-  if (input) return !!input.checked || active;
-  return active;
 }
 """
 
@@ -144,43 +123,6 @@ el => {
 }
 """
 
-JS_FILL = r"""
-(el, value) => {
-  const box = el.querySelector("textarea, input[type=text], [contenteditable=true]");
-  if (!box) return false;
-  box.focus();
-  if (box.isContentEditable) box.innerText = value;
-  else box.value = value;
-  box.dispatchEvent(new Event("input", { bubbles: true }));
-  box.dispatchEvent(new Event("change", { bubbles: true }));
-  return true;
-}
-"""
-
-JS_CLICK_TEXT = r"""
-([texts, maxLen]) => {
-  const norm = (s) => (s || "").replace(/[\s\u3000]+/g, "");
-  const wanted = texts.map(norm).filter(Boolean);
-  if (!wanted.length) return false;
-  const els = [...document.querySelectorAll(
-    "button, a, [role=button], .el-button, .btn, div, span, li"
-  )];
-  for (const el of els) {
-    const r = el.getBoundingClientRect();
-    if (r.width === 0 || r.height === 0) continue;
-    if (el.disabled || el.getAttribute("aria-disabled") === "true") continue;
-    if (/disabled/i.test(el.className || "")) continue;
-    const t = norm(el.innerText || el.value || el.getAttribute("title") || "");
-    if (!t || t.length > (maxLen || 12)) continue;
-    if (!wanted.includes(t)) continue;
-    el.click();
-    return true;
-  }
-  return false;
-}
-"""
-
-
 def is_homework_url(url: str) -> bool:
     """是否为智慧树作业/考试的答题页（列表页、学习报告不算）。"""
     low = (url or "").lower()
@@ -199,53 +141,6 @@ def is_non_quiz_exam_page(url: str) -> bool:
     if is_homework_url(low):
         return False
     return "stulearnreportnew" in low or "webexamlist" in low
-
-
-def _strip_think(text: str) -> str:
-    cleaned = _THINK_RE.sub("", text or "")
-    return _THINK_TAG_RE.sub("", cleaned)
-
-
-def _letters_to_indexes(letters: str, option_count: int = 0) -> list[int]:
-    idxs = []
-    for ch in (letters or "").upper():
-        idx = ord(ch) - ord("A")
-        if idx < 0 or idx > 7 or idx in idxs:
-            continue
-        if option_count and idx >= option_count:
-            continue
-        idxs.append(idx)
-    return idxs
-
-
-def parse_vision_answer(answer: str, option_count: int = 0) -> tuple[list[int], str]:
-    """解析视觉模型回复, 返回 (选项下标列表, 填空文本)。
-
-    兼容 "B" / "ABD" / "答案：A、C" / "正确答案是 B" / "FILL: xxx" 等形态。
-    """
-    text = _strip_think(str(answer or "")).strip()
-    if not text:
-        return [], ""
-
-    fill = _FILL_RE.search(text)
-    if fill:
-        value = fill.group(1).strip().splitlines()[0].strip().strip("`\"'。；; ")
-        return [], value
-
-    lines = [line.strip() for line in text.splitlines() if line.strip()]
-    for cand in [text, *reversed(lines)]:
-        compact = re.sub(r"[\s,，、和/|+]+", "", cand).strip("。；;.!！?？:：()（）[]【】")
-        if _LETTER_TOKEN_RE.match(compact):
-            idxs = _letters_to_indexes(compact, option_count)
-            if idxs:
-                return idxs, ""
-
-    match = _LETTER_ANSWER_RE.search(text)
-    if match:
-        idxs = _letters_to_indexes(match.group(1), option_count)
-        if idxs:
-            return idxs, ""
-    return [], ""
 
 
 async def _visible_question(page):
@@ -393,10 +288,7 @@ async def _fill_question(handle, value: str) -> bool:
 
 
 async def _click_text(page, texts, max_len: int = 12) -> bool:
-    try:
-        return bool(await page.evaluate(JS_CLICK_TEXT, [list(texts), max_len]))
-    except Exception:
-        return False
+    return await click_button_by_text(page, texts, max_len=max_len, allow_substring=False)
 
 
 async def _question_total(page) -> int:

@@ -22,12 +22,19 @@ from urllib.parse import unquote
 import requests
 
 from modules import llm, zhidao_crypto, zhs_api
+from modules.answer_parser import (
+    QUESTION_TYPE_NAMES,
+    answer_separator,
+    parse_answer_ids,
+)
+from modules.answer_service import LlmCircuitBreaker, QuestionBankHelper
 from modules.answer_store import AiQuestionStore
 from modules.html_utils import extract_plain_text
 from modules.http_utils import build_requests_proxies
 from modules.logger import Logger
 from modules.ppt_extractor import PptExtractor
 from modules.question_bank import QuestionBankClient
+from modules.text_utils import brief as _text_brief
 from modules.utils import get_runtime_path
 from modules.zhs_api import (  # noqa: F401  兼容旧的导入路径
     CaptchaRequiredError,
@@ -69,7 +76,6 @@ ZHIDAO_AI_HEADERS = {
     "Content-Type": "application/json",
 }
 
-QUESTION_TYPE_NAMES = {1: "单选题", 2: "多选题", 14: "判断题"}
 MAX_EXAM_ATTEMPTS = 6
 DEFAULT_PROMPT_CHAR_LIMIT = 28000
 MATERIAL_TRUNCATED_MARK = "\n…[参考资料已截断]"
@@ -88,11 +94,7 @@ def as_number(value, default: float = 0.0) -> float:
 
 def _brief_html(text: str | None, limit: int = 60) -> str:
     """去除 HTML 标签并折叠空白，供答题日志展示题干与选项摘要。"""
-    plain = re.sub(r"<[^>]+>", " ", str(text or ""))
-    plain = " ".join(plain.split())
-    if len(plain) <= limit:
-        return plain
-    return f"{plain[:limit]}..."
+    return _text_brief(text, limit=limit, strip_html=True)
 
 
 def _format_answer_choices(content: dict, answer_ids: list) -> str:
@@ -112,52 +114,6 @@ def _format_answer_choices(content: dict, answer_ids: list) -> str:
 
 # 兼容旧名称: 智慧树接口异常统一由 modules.zhs_api.ZhsApiError 表示.
 ExamApiError = zhs_api.ZhsApiError
-
-
-def answer_separator(question_type) -> str:
-    """填空题多空用 "/" 拼接, 其余题型沿用 "#@#"."""
-    try:
-        return "/" if int(question_type) == 3 else "#@#"
-    except (TypeError, ValueError):
-        return "#@#"
-
-
-def parse_answer_ids(text: str | None) -> list:
-    """从 ```answer`` 代码块或裸 JSON/列表文本里解析出选项 id."""
-    raw = (text or "").strip()
-    if not raw:
-        return []
-    block = re.search(r"```answer\s*(.*?)```", raw, re.DOTALL | re.IGNORECASE)
-    candidates = [block.group(1).strip()] if block else []
-    candidates.append(raw)
-    for candidate in candidates:
-        data = None
-        try:
-            data = json.loads(candidate)
-        except (ValueError, TypeError):
-            try:
-                data = ast.literal_eval(candidate)
-            except (ValueError, SyntaxError):
-                match = re.search(r"\[.*\]", candidate, re.DOTALL)
-                if match:
-                    try:
-                        data = json.loads(match.group(0))
-                    except (ValueError, TypeError):
-                        try:
-                            data = ast.literal_eval(match.group(0))
-                        except (ValueError, SyntaxError):
-                            data = None
-        if not isinstance(data, list):
-            continue
-        ids = []
-        for item in data:
-            if isinstance(item, dict) and item.get("id") is not None:
-                ids.append(item["id"])
-            elif isinstance(item, (int, str)) and str(item).strip():
-                ids.append(item)
-        if ids:
-            return ids
-    return []
 
 
 def parse_review_exam_url(url: str | None) -> dict:
@@ -264,7 +220,10 @@ def build_answer_prompt(
 
 
 class AnswerBank:
-    """按课程保存题库: 底层写入 SQLite, 同时保留 data.json 快照兼容旧版本."""
+    """按课程保存题库：完全以 SQLite (AiQuestionStore) 为单一数据源。
+
+    旧版目录中的 *.json 仅在首次初始化时一次性迁移至 SQLite，不再逐题重写 JSON。
+    """
 
     def __init__(self, course_id, base_dir: str | Path | None = None, store=None):
         self.course_id = str(course_id)
@@ -279,7 +238,7 @@ class AnswerBank:
         if store is not None:
             self.store = store
         elif explicit_dir:
-            # 显式目录通常来自测试: 数据库与旧 JSON 都隔离在该目录内
+            # 显式目录通常来自测试: 数据库与旧 JSON 一次性迁移均隔离在该目录内
             self.store = AiQuestionStore(
                 self.base_dir / "questions_bank.db", data_root=self.base_dir
             )
@@ -287,47 +246,55 @@ class AnswerBank:
         else:
             self.store = AiQuestionStore()
 
-    def _path(self, name: str) -> Path:
-        self.base_dir.mkdir(parents=True, exist_ok=True)
-        return self.base_dir / name
-
     @staticmethod
     def _key(question_id, version: int) -> str:
         return str(question_id) if version == 1 else f"{question_id}_{version}"
 
+    @staticmethod
+    def _row_to_record(row: dict) -> dict:
+        return {
+            "version": int(row.get("version") or 1),
+            "question": row.get("question_raw") or row.get("question_plain") or "",
+            "answer": row.get("answer") or "",
+            "answer_content": row.get("answer_content") or "",
+            "questionDict": row.get("question_dict") or {},
+        }
+
     def load(self, exam_test_id) -> None:
         self.exam_test_id = exam_test_id
+        target_exam = str(exam_test_id or "")
+        rows = self.store.load_course_questions(self.course_id)
         merged: dict[str, dict] = {}
-        if self.base_dir.is_dir():
-            for file in self.base_dir.glob("*.json"):
-                if file.name == "data.json":
-                    continue
-                try:
-                    merged.update(json.loads(file.read_text(encoding="utf-8")))
-                except (OSError, json.JSONDecodeError):
-                    continue
-        try:
-            merged.update(
-                json.loads(self._path("data.json").read_text(encoding="utf-8"))
-            )
-        except (OSError, json.JSONDecodeError):
-            pass
-        try:
-            current = json.loads(
-                self._path(f"{exam_test_id}.json").read_text(encoding="utf-8")
-            )
-        except (OSError, json.JSONDecodeError):
-            current = {}
-        merged.update(current)
-        self.items = {}
-        for key, value in merged.items():
-            if not isinstance(value, dict):
+        # 先加载同课程历史记录，再用当前 exam_id 的记录覆盖同 key
+        for row in rows:
+            if str(row.get("exam_id") or "") == target_exam:
                 continue
-            value.setdefault("version", 1)
-            self.items[key] = value
+            key = self._key(row.get("question_id", ""), int(row.get("version") or 1))
+            merged[key] = self._row_to_record(row)
+        for row in rows:
+            if str(row.get("exam_id") or "") != target_exam:
+                continue
+            key = self._key(row.get("question_id", ""), int(row.get("version") or 1))
+            merged[key] = self._row_to_record(row)
+        self.items = merged
 
     def get(self, question_id, version: int = 1) -> dict | None:
-        return self.items.get(self._key(question_id, version))
+        key = self._key(question_id, version)
+        cached = self.items.get(key)
+        if cached is not None:
+            return cached
+        row = self.store.get_ai_question(
+            self.course_id, self.exam_test_id or "", str(question_id), version
+        )
+        if row is None and self.exam_test_id:
+            row = self.store.get_ai_question(
+                self.course_id, "", str(question_id), version
+            )
+        if row is None:
+            return None
+        record = self._row_to_record(row)
+        self.items[key] = record
+        return record
 
     def set(self, question_id, version: int, answer: dict) -> None:
         record = {
@@ -349,19 +316,34 @@ class AnswerBank:
             answer_content=record["answer_content"],
             question_dict=record["questionDict"],
         )
-        self.save()
 
     def save(self, exam_test_id=None) -> None:
-        if exam_test_id is not None:
+        """SQLite 在 set() 时已落盘；若延迟绑定 exam_test_id，则按新 exam_id 批量同步一次。"""
+        if exam_test_id is not None and str(exam_test_id) != str(self.exam_test_id or ""):
             self.exam_test_id = exam_test_id
-        merged_path = self._path("data.json")
-        merged_path.write_text(
-            json.dumps(self.items, ensure_ascii=False, indent=2), encoding="utf-8"
-        )
-        if exam_test_id is not None:
-            self._path(f"{exam_test_id}.json").write_text(
-                json.dumps(self.items, ensure_ascii=False, indent=2), encoding="utf-8"
-            )
+            batch = []
+            for raw_key, record in self.items.items():
+                version = int(record.get("version") or 1)
+                suffix = f"_{version}"
+                if version != 1 and raw_key.endswith(suffix):
+                    qid = raw_key[: -len(suffix)]
+                else:
+                    qid = raw_key
+                batch.append(
+                    {
+                        "course_id": self.course_id,
+                        "exam_id": str(exam_test_id),
+                        "question_id": qid,
+                        "version": version,
+                        "question_plain": record.get("question", ""),
+                        "question_raw": record.get("question", ""),
+                        "answer": record.get("answer", ""),
+                        "answer_content": record.get("answer_content", ""),
+                        "question_dict": record.get("questionDict", {}),
+                    }
+                )
+            if batch:
+                self.store.upsert_ai_questions_batch(batch)
 
     def search_in_course(self, question: str, exclude_exam_id=None) -> dict | None:
         """跨 exam_id 检索同课程答案 (精确 -> 宽松 -> 模糊)."""
@@ -370,11 +352,63 @@ class AnswerBank:
         )
 
 
-class ExamApi(zhs_api.ZhsApiClient):
-    """带 Cookie/代理/重试的智慧树考试接口客户端 (复用 zhs_api 策略层)."""
+class ExamApi:
+    """带 Cookie/代理/重试的智慧树考试接口客户端（组合 ZhsApiClient，消除 LSP 签名冲突）。"""
 
-    def __init__(self, cookies, proxy: str = "", user_agent: str = ""):
-        super().__init__(cookies, proxy, user_agent)
+    def __init__(self, cookies, proxy: str = "", user_agent: str = "", *, client=None):
+        self.client = (
+            client
+            if client is not None
+            else zhs_api.ZhsApiClient(cookies, proxy, user_agent)
+        )
+
+    @property
+    def session(self):
+        return self.client.session
+
+    @session.setter
+    def session(self, value) -> None:
+        self.client.session = value
+
+    @property
+    def lock(self):
+        return self.client.lock
+
+    @property
+    def proxy(self) -> str:
+        return self.client.proxy
+
+    @property
+    def timeout(self):
+        return self.client.timeout
+
+    @property
+    def user_agent(self) -> str:
+        return self.client.user_agent
+
+    def execute(self, *args, **kwargs) -> dict:
+        return self.client.execute(*args, **kwargs)
+
+    def clone_session(self):
+        return self.client.clone_session()
+
+    def sync_cookies(self, cookies) -> None:
+        self.client.sync_cookies(cookies)
+
+    def reset_exam_sso(self) -> None:
+        self.client.reset_exam_sso()
+
+    def ensure_service_sso(self, service: str) -> bool:
+        return self.client.ensure_service_sso(service)
+
+    def close(self) -> None:
+        self.client.close()
+
+    def __enter__(self) -> "ExamApi":
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        self.close()
 
     def query(
         self,
@@ -388,7 +422,7 @@ class ExamApi(zhs_api.ZhsApiClient):
         extra_fields: dict | None = None,
         allow_retry: bool = True,
     ) -> dict:
-        """兼容旧方法签名: 按调用参数临时构造策略后走统一 query 流程."""
+        """兼容旧方法签名: 按调用参数临时构造策略后走统一 execute 流程."""
         strategy = zhs_api.QueryStrategy(
             key=key,
             set_timestamp=set_timestamp,
@@ -397,7 +431,7 @@ class ExamApi(zhs_api.ZhsApiClient):
             ok_value=ok_code,
             allow_retry=allow_retry,
         )
-        return self.execute(
+        return self.client.execute(
             strategy,
             url,
             data,
@@ -410,7 +444,7 @@ class ExamApi(zhs_api.ZhsApiClient):
         self, strategy_name: str, url: str, data: dict, method: str = "POST", **kwargs
     ) -> dict:
         """按命名策略提交 (供知到作业/考试/题库等新接口使用)."""
-        return zhs_api.ZhsApiClient.query(self, strategy_name, url, data, method, **kwargs)
+        return self.client.query(strategy_name, url, data, method, **kwargs)
 
     def query_paper(self, course_id, class_id, knowledge_id) -> dict | None:
         data = {
@@ -635,9 +669,9 @@ class AiExamBase(ABC):
         self.exam_paper_id = exam_paper_id
         self.op_extra = op_extra or {}
         self.answer_bank = answer_bank or AnswerBank(course_id)
-        self.question_bank = question_bank
-        self._question_bank_ready = question_bank is not None
-        self._owns_question_bank = False
+        self._bank_helper = QuestionBankHelper(
+            question_bank, proxy=getattr(api, "proxy", "")
+        )
         self.cancel_event = cancel_event
         self.reference_materials: list[dict] = []
         self.sheet_content: list | None = None
@@ -658,8 +692,47 @@ class AiExamBase(ABC):
             )
         self.deepseek_answerer = DeepSeekAnswerer(getattr(api, "proxy", ""))
         self._last_ai_provider = ""
-        self._llm_disabled = False
-        self._llm_warned = False
+        self._llm_breaker = LlmCircuitBreaker()
+
+    @property
+    def question_bank(self):
+        return self._bank_helper.client
+
+    @question_bank.setter
+    def question_bank(self, value) -> None:
+        self._bank_helper.client = value
+
+    @property
+    def _question_bank_ready(self) -> bool:
+        return self._bank_helper.ready
+
+    @_question_bank_ready.setter
+    def _question_bank_ready(self, value: bool) -> None:
+        self._bank_helper.ready = bool(value)
+
+    @property
+    def _owns_question_bank(self) -> bool:
+        return self._bank_helper.owns_client
+
+    @_owns_question_bank.setter
+    def _owns_question_bank(self, value: bool) -> None:
+        self._bank_helper.owns_client = bool(value)
+
+    @property
+    def _llm_disabled(self) -> bool:
+        return self._llm_breaker.disabled
+
+    @_llm_disabled.setter
+    def _llm_disabled(self, value: bool) -> None:
+        self._llm_breaker.disabled = bool(value)
+
+    @property
+    def _llm_warned(self) -> bool:
+        return self._llm_breaker.warned
+
+    @_llm_warned.setter
+    def _llm_warned(self, value: bool) -> None:
+        self._llm_breaker.warned = bool(value)
 
     def close(self) -> None:
         self._stop_heartbeat()
@@ -669,14 +742,7 @@ class AiExamBase(ABC):
                 close_ai()
             except Exception:
                 pass
-        if self._owns_question_bank and self.question_bank is not None:
-            close_qb = getattr(self.question_bank, "close", None)
-            if callable(close_qb):
-                try:
-                    close_qb()
-                except Exception:
-                    pass
-            self._owns_question_bank = False
+        self._bank_helper.close()
 
     def __enter__(self) -> "AiExamBase":
         return self
@@ -826,31 +892,12 @@ class AiExamBase(ABC):
 
     def _get_question_bank(self):
         """懒加载外部题库客户端; 未配置 token 时返回 None."""
-        if self._question_bank_ready:
-            return self.question_bank
-        self._question_bank_ready = True
-        try:
-            self.question_bank = QuestionBankClient.from_config(
-                proxy=getattr(self.api, "proxy", "")
-            )
-            self._owns_question_bank = self.question_bank is not None
-        except Exception as exc:
-            logger.debug(f"初始化外部题库失败: {exc}")
-            self.question_bank = None
-            self._owns_question_bank = False
-        return self.question_bank
+        return self._bank_helper.get()
 
     def _bank_reference(self, question: dict, question_type, choices: list[dict]) -> str:
-        bank = self._get_question_bank()
-        if bank is None or not bank.enabled():
-            return ""
-        try:
-            title = extract_plain_text(question.get("content", ""))
-            options = [extract_plain_text(choice.get("content", "")) for choice in choices]
-            return bank.query(title, options, question_type) or ""
-        except Exception as exc:
-            logger.debug(f"外部题库查询降级: {exc}")
-            return ""
+        title = extract_plain_text(question.get("content", ""))
+        options = [extract_plain_text(choice.get("content", "")) for choice in choices]
+        return self._bank_helper.query(title, options, question_type)
 
     def _generate_answer(self, question_type: int, question: dict, choices: list[dict]) -> list:
         extra = dict(self.op_extra)
@@ -865,36 +912,23 @@ class AiExamBase(ABC):
             extra,
             max_chars=self.op_extra.get("promptMaxChars"),
         )
-        for name, answerer in (
-            ("智慧树AI", self.zhidao_answerer),
-            (llm.provider_label(), self.deepseek_answerer),
-        ):
-            if name != "智慧树AI" and self._llm_disabled:
-                continue
-            try:
-                ids = answerer.answer(prompt)
-            except llm.NonRetryableLLMError as exc:
-                if name != "智慧树AI":
-                    self._llm_disabled = True
-                    if not self._llm_warned:
-                        self._llm_warned = True
-                        logger.warn(
-                            f"自定义大模型不可用({exc}), 本试卷后续题目将跳过 LLM 直接降级.",
-                            shift=True,
-                        )
-                logger.debug(f"{name} 答题快速失败: {exc}")
-                continue
-            except Exception as exc:
-                logger.debug(f"{name} 答题失败: {exc}")
-                continue
-            by_text = {str(choice["id"]): choice["id"] for choice in choices}
-            ids = [by_text[str(item)] for item in ids if str(item) in by_text]
-            if ids:
-                self._last_ai_provider = name
-                logger.debug(f"{name} 给出有效选项: {ids}")
-                return ids
-            logger.debug(f"{name} 返回的答案不在选项内, 继续兜底.")
-        raise ValueError("AI 未给出可用的选项 id")
+        by_text = {str(choice["id"]): choice["id"] for choice in choices}
+        try:
+            name, ids = self._llm_breaker.run_fallback_chain(
+                [
+                    ("智慧树AI", lambda: self.zhidao_answerer.answer(prompt), False),
+                    (llm.provider_label(), lambda: self.deepseek_answerer.answer(prompt), True),
+                ],
+                validate=lambda raw: [
+                    by_text[str(item)] for item in (raw or []) if str(item) in by_text
+                ],
+                fail_log_prefix="答题",
+            )
+        except ValueError:
+            raise ValueError("AI 未给出可用的选项 id")
+        self._last_ai_provider = name
+        logger.debug(f"{name} 给出有效选项: {ids}")
+        return ids
 
     def _generate_fill_answer(self, question: dict) -> list:
         prompt = (
@@ -904,34 +938,21 @@ class AiExamBase(ABC):
             '```answer\n["答案一", "答案二"]\n```\n'
             "代码块外不要写任何解释。"
         )
-        for name, answerer in (
-            ("智慧树AI", self.zhidao_answerer),
-            (llm.provider_label(), self.deepseek_answerer),
-        ):
-            if name != "智慧树AI" and self._llm_disabled:
-                continue
-            try:
-                values = answerer.answer(prompt)
-            except llm.NonRetryableLLMError as exc:
-                if name != "智慧树AI":
-                    self._llm_disabled = True
-                    if not self._llm_warned:
-                        self._llm_warned = True
-                        logger.warn(
-                            f"自定义大模型不可用({exc}), 本试卷后续题目将跳过 LLM 直接降级.",
-                            shift=True,
-                        )
-                logger.debug(f"{name} 填空作答快速失败: {exc}")
-                continue
-            except Exception as exc:
-                logger.debug(f"{name} 填空作答失败: {exc}")
-                continue
-            cleaned = [str(item).strip() for item in values if str(item).strip()]
-            if cleaned:
-                self._last_ai_provider = name
-                return cleaned
-            logger.debug(f"{name} 未给出有效填空答案, 继续兜底.")
-        raise ValueError("AI 未给出有效的填空答案")
+        try:
+            name, cleaned = self._llm_breaker.run_fallback_chain(
+                [
+                    ("智慧树AI", lambda: self.zhidao_answerer.answer(prompt), False),
+                    (llm.provider_label(), lambda: self.deepseek_answerer.answer(prompt), True),
+                ],
+                validate=lambda raw: [
+                    str(item).strip() for item in (raw or []) if str(item).strip()
+                ],
+                fail_log_prefix="填空作答",
+            )
+        except ValueError:
+            raise ValueError("AI 未给出有效的填空答案")
+        self._last_ai_provider = name
+        return cleaned
 
     def _cached_answer(
         self, question: dict, question_id, version: int, valid_ids: set

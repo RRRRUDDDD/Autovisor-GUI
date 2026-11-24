@@ -12,7 +12,7 @@ from modules.utils import (
     run_on,
     should_hide_window,
 )
-from playwright._impl._errors import TargetClosedError
+from modules.quiz_dom import TargetClosedError
 from modules.logger import Logger
 from modules.click_captcha import solve_click_captcha
 from modules.fusion_adapter import FusionAdapter

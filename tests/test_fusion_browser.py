@@ -9,7 +9,7 @@ from unittest.mock import Mock, patch
 from types import SimpleNamespace
 import asyncio
 from playwright.async_api import async_playwright
-from playwright._impl._errors import Error
+from playwright.async_api import Error
 from modules.lesson_navigation import FUSION_CATALOG, lesson_progress, wait_for_lesson_active
 from modules.utils import get_filtered_class
 

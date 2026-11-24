@@ -9,6 +9,7 @@ from playwright.async_api import Locator, Page, TimeoutError
 from modules.course_runner import CourseOutcome
 from modules.popups import dismiss_course_popups
 from modules.progress import show_course_progress
+from modules.text_utils import normalize_text, parse_percent as _parse_percent_shared
 from modules.utils import get_video_attr
 
 
@@ -46,21 +47,9 @@ def is_ai_smart_url(url: str | None) -> bool:
     return hostname == AI_SMART_HOST
 
 
-def normalize_text(value: str | None) -> str:
-    return " ".join((value or "").split())
-
-
 def parse_percent(value: str | None) -> int:
-    matched = re.search(r"学习进度\s*(\d+(?:\.\d+)?)\s*%", value or "")
-    if not matched:
-        matched = re.search(r"(\d+(?:\.\d+)?)\s*%", value or "")
-    if not matched:
-        return 0
-    try:
-        number = float(matched.group(1))
-    except (TypeError, ValueError, OverflowError):
-        return 0
-    return max(0, min(int(number), 100))
+    result = _parse_percent_shared(value, default=0, require_symbol=True)
+    return int(result) if result is not None else 0
 
 
 def parse_clock(value: str | None) -> int | None:

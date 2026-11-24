@@ -2,7 +2,7 @@ import asyncio
 import time
 
 from playwright.async_api import Page, TimeoutError
-from playwright._impl._errors import TargetClosedError
+from modules.quiz_dom import TargetClosedError
 
 from modules.lesson_navigation import (
     CatalogSelectors,

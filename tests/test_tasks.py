@@ -1,7 +1,7 @@
 import unittest
 from unittest.mock import AsyncMock, patch
 
-from playwright._impl._errors import TargetClosedError
+from modules.quiz_dom import TargetClosedError
 
 from modules import tasks
 

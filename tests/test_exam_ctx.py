@@ -74,12 +74,17 @@ class ReviewExamUrlTests(unittest.TestCase):
 
 
 class AnswerBankTests(unittest.TestCase):
-    def test_roundtrip_with_versions_and_merge_file(self):
+    def test_roundtrip_with_versions_and_sqlite_ssot(self):
         with tempfile.TemporaryDirectory() as directory:
             bank = AnswerBank("course-1", base_dir=directory)
             bank.set(100, 1, {"answer": "1#@#2", "question": "q1"})
             bank.set(100, 2, {"answer": "3", "question": "q2"})
             bank.save("exam-9")
+
+            # SQLite is the single source of truth: no per-question JSON rewrite
+            self.assertTrue(os.path.isfile(os.path.join(directory, "questions_bank.db")))
+            self.assertFalse(os.path.exists(os.path.join(directory, "data.json")))
+            self.assertFalse(os.path.exists(os.path.join(directory, "exam-9.json")))
 
             loaded = AnswerBank("course-1", base_dir=directory)
             loaded.load("exam-9")
@@ -87,11 +92,18 @@ class AnswerBankTests(unittest.TestCase):
             self.assertEqual(loaded.get(100, 2)["answer"], "3")
             self.assertIsNone(loaded.get(100, 3))
 
-            for name in ("data.json", "exam-9.json"):
-                path = os.path.join(directory, name)
-                self.assertTrue(os.path.isfile(path))
-                with open(path, encoding="utf-8") as file:
-                    self.assertNotIn("version", json.load(file))
+    def test_migrates_legacy_json_once_into_sqlite(self):
+        with tempfile.TemporaryDirectory() as directory:
+            legacy_path = os.path.join(directory, "exam-old.json")
+            with open(legacy_path, "w", encoding="utf-8") as f:
+                json.dump(
+                    {"200": {"question": "旧版题干", "answer": "9", "version": 1}},
+                    f,
+                    ensure_ascii=False,
+                )
+            bank = AnswerBank("course-legacy", base_dir=directory)
+            bank.load("exam-old")
+            self.assertEqual(bank.get(200, 1)["answer"], "9")
 
 
 class FakeResponse:

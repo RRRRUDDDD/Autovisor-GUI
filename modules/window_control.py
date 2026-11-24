@@ -22,7 +22,7 @@ import sys
 import uuid
 import weakref
 
-from playwright._impl._errors import TargetClosedError
+from modules.quiz_dom import TargetClosedError
 from playwright.async_api import Page, TimeoutError as PlaywrightTimeoutError
 
 from modules.logger import Logger

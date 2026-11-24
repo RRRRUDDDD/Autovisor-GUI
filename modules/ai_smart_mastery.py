@@ -21,6 +21,16 @@ from pathlib import Path
 
 from playwright.async_api import Locator, Page
 
+from modules.answer_parser import parse_reference_answer_text as parse_answer_text
+from modules.text_utils import (
+    brief as _text_brief,
+    cache_key,
+    loose_key,
+    normalize_text,
+    parse_percent as _parse_percent_shared,
+    similarity,
+)
+
 QUESTION_ITEM = ".question-item"
 MASTERY_PERCENT = ".simplified-mastery__percent"
 MASTERY_ACTION = ".simplified-mastery__action"
@@ -31,47 +41,12 @@ EXAM_SUBMIT = ".reviewDone"
 MAX_MASTERY = 100
 
 
-def normalize_text(value: str | None) -> str:
-    return " ".join((value or "").split())
-
-
 def _brief(value: str | None, limit: int = 48) -> str:
-    text = normalize_text(value)
-    if len(text) <= limit:
-        return text
-    return f"{text[:limit]}..."
-
-
-def cache_key(value: str | None) -> str:
-    """答案缓存的键: 去掉所有空白和首尾括号, 避免判断题/空格差异导致查不到."""
-    text = re.sub(r"[\s\u3000]+", "", value or "")
-    text = text.replace("（", "(").replace("）", ")")
-    while text.endswith("()"):
-        text = text[:-2]
-    return text
-
-
-def loose_key(value: str | None) -> str:
-    """更宽松的键: 只保留中英文和数字, 用于模糊匹配(题干里的 ____ 会被去掉)."""
-    text = re.sub(r"[^0-9A-Za-z\u4e00-\u9fff]+", "", value or "")
-    return text.lower()
-
-
-def parse_answer_text(value: str | None) -> dict:
-    """把「参考答案：B」/「参考答案：错」/「参考答案：A、B、C」解析成答案."""
-    raw = " ".join((value or "").split())
-    raw = raw.replace("参考答案", "").replace("：", " ").replace(":", " ").strip()
-    cleaned = re.sub(r"[\s、，,;；/]+", "", raw)
-    if cleaned and re.fullmatch(r"[A-Za-z]+", cleaned):
-        return {"letters": [letter.upper() for letter in cleaned]}
-    return {"text": raw} if raw else {}
+    return _text_brief(value, limit=limit)
 
 
 def parse_percent(value: str | None) -> int | None:
-    digits = "".join(ch for ch in (value or "") if ch.isdigit())
-    if not digits:
-        return None
-    return min(int(digits), 100)
+    return _parse_percent_shared(value, default=None, require_symbol=False)
 
 
 def is_ai_leaning_url(url: str) -> bool:
@@ -106,56 +81,52 @@ def parse_exam_url(url: str) -> dict:
 
 
 class AnswerCache:
-    def __init__(self, path: Path, store=None):
-        self.path = path
-        self.store = store
-        self.items: dict[str, dict] = {}
-        if path.is_file():
-            try:
-                self.items = json.loads(path.read_text(encoding="utf-8"))
-            except (OSError, json.JSONDecodeError):
-                self.items = {}
-        self._loose: dict[str, dict] = {}
-        for key, record in self.items.items():
-            self._loose.setdefault(loose_key(key), record)
+    """掌握度题库缓存：读写直连 SQLite (AiQuestionStore)，取消逐题重写 JSON。"""
 
-    def get(self, question: str) -> dict | None:
-        """返回 {'letters': [...]} / {'text': ...} / {'values': [...]}."""
-        record = self.items.get(cache_key(question))
-        if record is None:
-            record = self._loose.get(loose_key(question))
-        if record is None:
-            # 题干里的 ____ 有时候会被渲染成输入框, 导致正文对不上, 用相似度兜底
-            target = loose_key(question)
-            if len(target) >= 12:
-                best, best_ratio = None, 0.0
-                for key, candidate in self._loose.items():
-                    if abs(len(key) - len(target)) > max(20, int(len(target) * 0.3)):
-                        continue
-                    ratio = difflib.SequenceMatcher(None, target, key).ratio()
-                    if ratio > best_ratio:
-                        best, best_ratio = candidate, ratio
-                if best is not None and best_ratio >= 0.85:
-                    record = best
-        if record is None and self.store is not None:
-            stored = self.store.search_in_course("", question)
-            if stored:
-                record = stored.get("question_dict") or {}
-        if not record:
-            return None
+    def __init__(self, path: Path | str | None = None, store=None):
+        from modules.answer_store import AiQuestionStore
+
+        self.path = Path(path) if path is not None else None
+        if store is not None:
+            self.store = store
+        elif self.path is not None:
+            self.store = AiQuestionStore(
+                self.path.parent / "questions_bank.db",
+                data_root=self.path.parent,
+            )
+        else:
+            self.store = AiQuestionStore()
+        if self.path is not None and self.path.is_file():
+            self.store.migrate_mastery_file(self.path)
+        self.items: dict[str, dict] = {}
+
+    @staticmethod
+    def _normalize_record(record: dict | None, fallback_answer: str = "") -> dict | None:
+        if not isinstance(record, dict):
+            record = {}
         if record.get("letters"):
-            return {"letters": record["letters"]}
+            return {"letters": list(record["letters"])}
         if record.get("values"):
-            return {"values": record["values"]}
-        text = record.get("text") or ""
+            return {"values": list(record["values"])}
+        text = record.get("text") or fallback_answer or ""
         if text:
             # 旧数据里多选答案被存成 "A、B、C", 这里纠正成字母;
             # 只有纯大写 A-H 才当字母, 避免 "circular/linear" 这种文字答案被误判
-            cleaned = re.sub(r"[\s、，,;；/]+", "", text)
+            cleaned = re.sub(r"[\s、，,;；/]+", "", str(text))
             if re.fullmatch(r"[A-H]{1,8}", cleaned):
                 return {"letters": list(cleaned)}
-            return {"text": text}
+            return {"text": str(text)}
         return None
+
+    def get(self, question: str) -> dict | None:
+        """返回 {'letters': [...]} / {'text': ...} / {'values': [...]}."""
+        stored = self.store.search_in_course("", question)
+        if not stored:
+            return None
+        return self._normalize_record(
+            stored.get("question_dict"),
+            fallback_answer=str(stored.get("answer") or ""),
+        )
 
     def put(self, question: str, answer: dict, options: list[str] | None = None):
         if not answer or not (
@@ -168,31 +139,26 @@ class AnswerCache:
         if self.items.get(key) == record:
             return
         self.items[key] = record
-        self._loose.setdefault(loose_key(key), record)
-        if self.store is not None:
-            if answer.get("letters"):
-                flat = "".join(str(item) for item in answer["letters"])
-            elif answer.get("values"):
-                flat = "；".join(str(item) for item in answer["values"])
-            else:
-                flat = str(answer.get("text") or "")
-            self.store.upsert_ai_question(
-                "",
-                "",
-                key,
-                1,
-                question_plain=question,
-                question_raw=question,
-                answer=flat,
-                question_dict=record,
-            )
-        self.save()
+        if answer.get("letters"):
+            flat = "".join(str(item) for item in answer["letters"])
+        elif answer.get("values"):
+            flat = "；".join(str(item) for item in answer["values"])
+        else:
+            flat = str(answer.get("text") or "")
+        self.store.upsert_ai_question(
+            "",
+            "",
+            key,
+            1,
+            question_plain=question,
+            question_raw=question,
+            answer=flat,
+            question_dict=record,
+        )
 
     def save(self):
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.path.write_text(
-            json.dumps(self.items, ensure_ascii=False, indent=2), encoding="utf-8"
-        )
+        """保留空方法兼容旧调用方；所有写入已由 put() 直连 SQLite 持久化。"""
+        return None
 
 
 async def read_mastery(page: Page) -> int | None:

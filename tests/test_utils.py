@@ -4,7 +4,7 @@ import tempfile
 import unittest
 from unittest import mock
 
-from playwright._impl._errors import TargetClosedError
+from modules.quiz_dom import TargetClosedError
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 
 from modules import utils

@@ -5,7 +5,7 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
-from playwright._impl._errors import Error
+from playwright.async_api import Error
 from playwright.async_api import async_playwright
 
 from modules.popups import dismiss_course_popups, dismiss_popups

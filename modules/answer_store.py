@@ -24,6 +24,8 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
+from modules.text_utils import cache_key, loose_key, similarity
+
 SCHEMA_VERSION = 1
 BUSY_TIMEOUT_MS = 5000
 FUZZY_MIN_LENGTH = 12
@@ -85,21 +87,6 @@ CREATE INDEX IF NOT EXISTS idx_ai_plain
 CREATE INDEX IF NOT EXISTS idx_ai_cache_key ON ai_questions(course_id, cache_key);
 CREATE INDEX IF NOT EXISTS idx_ai_loose_key ON ai_questions(course_id, loose_key);
 """
-
-
-def cache_key(value: str | None) -> str:
-    """题干精确归一化键: 去空白, 统一全角括号, 去掉尾部空括号."""
-    text = re.sub(r"[\s\u3000]+", "", value or "")
-    text = text.replace("（", "(").replace("）", ")")
-    while text.endswith("()"):
-        text = text[:-2]
-    return text
-
-
-def loose_key(value: str | None) -> str:
-    """宽松键: 只保留中英文与数字并转小写, 供模糊匹配."""
-    text = re.sub(r"[^0-9A-Za-z\u4e00-\u9fff]+", "", value or "")
-    return text.lower()
 
 
 def _json_dumps(value) -> str:
@@ -915,6 +902,31 @@ class AiQuestionStore:
             )
         )
 
+    def upsert_ai_questions_batch(self, items: list[dict]) -> int:
+        if not items:
+            return 0
+
+        def action(conn):
+            count = 0
+            for item in items:
+                self._upsert_ai_question_conn(
+                    conn,
+                    item.get("course_id", ""),
+                    item.get("exam_id", ""),
+                    item.get("question_id", ""),
+                    item.get("version", 1),
+                    question_plain=item.get("question_plain", ""),
+                    question_raw=item.get("question_raw", ""),
+                    answer=item.get("answer", ""),
+                    answer_content=item.get("answer_content", ""),
+                    question_dict=item.get("question_dict") or {},
+                    course_name=item.get("course_name", ""),
+                )
+                count += 1
+            return count
+
+        return self._write(action)
+
     # -------------------------------------------------------------- ai: query
     def get_ai_question(
         self, course_id, exam_id, question_id, version: int = 1
@@ -1026,6 +1038,19 @@ class AiQuestionStore:
         if not force and self.get_meta(marker) == "1":
             return 0
         count = self._migrate_course_dir(course_id, directory) if directory.is_dir() else 0
+        self.set_meta(marker, "1")
+        return count
+
+    def migrate_mastery_file(
+        self, mastery_path: str | Path, *, force: bool = False
+    ) -> int:
+        path = Path(mastery_path)
+        if not path.is_file():
+            return 0
+        marker = f"legacy_mastery_file:{path.resolve()}"
+        if not force and self.get_meta(marker) == "1":
+            return 0
+        count = self._migrate_mastery(path)
         self.set_meta(marker, "1")
         return count
 
