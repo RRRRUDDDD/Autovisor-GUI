@@ -584,17 +584,19 @@ async def _try_zhidao_api(page, config, params: dict) -> dict:
     )
 
 
-async def auto_answer_homework(page, config=None) -> dict:
+async def auto_answer_homework(page, config=None, *, skip_api: bool = False) -> dict:
     """对当前智慧树作业/考试页作答; 接口明文优先, 视觉模型兜底。"""
     stats = {"ok": 0, "fill": 0, "fail": 0}
 
-    try:
-        from modules.zhidao_homework_api import parse_exam_page_url
+    params = {}
+    if not skip_api:
+        try:
+            from modules.zhidao_homework_api import parse_exam_page_url
 
-        params = parse_exam_page_url(getattr(page, "url", ""))
-    except Exception:
-        params = {}
-    if params and _api_enabled(config, params["kind"]):
+            params = parse_exam_page_url(getattr(page, "url", ""))
+        except Exception:
+            params = {}
+    if not skip_api and params and _api_enabled(config, params["kind"]):
         logger.info("检测到知到作业/考试页, 优先使用加密 API 明文作答 ...")
         logger.event("作业接口作答", 地址=getattr(page, "url", ""), 类型=params["kind"])
         try:

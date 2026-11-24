@@ -808,6 +808,164 @@ class HomeworkScanTests(unittest.TestCase):
         self.assertEqual(results[0]["homework_id"], "E1")
         self.assertEqual(results[0]["exam_name"], "作业")
 
+    def test_run_pending_uses_worker_recruit_and_school_and_skips_out_of_window(self):
+        from datetime import datetime
+
+        api = FakeHomeworkListApi(
+            {
+                0: {
+                    "rt": {
+                        "studentHomeworkList": [
+                            {
+                                "id": "S_OPEN",
+                                "examId": "E_OPEN",
+                                "courseId": 1000013343,
+                                "examName": "第一章单元测试",
+                                "startTime": "2026-10-19 00:00:00",
+                                "endDate": "2026-11-30 23:59:59",
+                            },
+                            {
+                                "id": "S_FUTURE",
+                                "examId": "E_FUTURE",
+                                "courseId": 1000013343,
+                                "examName": "未开放作业",
+                                "startTime": "2026-12-01 00:00:00",
+                                "endDate": "2026-12-10 23:59:59",
+                            },
+                            {
+                                "id": "S_OLD",
+                                "examId": "E_OLD",
+                                "courseId": 1000013343,
+                                "examName": "已截止作业",
+                                "startTime": "2026-09-01 00:00:00",
+                                "endDate": "2026-10-01 23:59:59",
+                            },
+                        ],
+                        "next": -1,
+                    }
+                }
+            }
+        )
+        worker = ZhidaoHomeworkWorker(
+            api,
+            course_id="1000013343",
+            recruit_id="458533",
+            school_id="1847",
+            store=self.store,
+            sleep=lambda _s: None,
+        )
+        worker.run = MagicMock(return_value={"answered": 5, "submitted": False})
+        results = worker.run_pending(now=datetime(2026, 11, 24, 9, 0, 0))
+        self.assertEqual(len(results), 3)
+        worker.run.assert_called_once_with(
+            recruit_id="458533",
+            course_id="1000013343",
+            homework_id="E_OPEN",
+            stu_exam_id="S_OPEN",
+            exam_id="E_OPEN",
+            school_id="1847",
+        )
+        self.assertEqual(results[1]["skipped"], True)
+        self.assertEqual(results[1]["reason"], "not_started")
+        self.assertEqual(results[2]["skipped"], True)
+        self.assertEqual(results[2]["reason"], "expired")
+
+    def test_open_homework_resets_when_do_homework_raises_submitted_error(self):
+        from modules.zhs_api import ZhsApiError
+
+        class ResetOnErrorApi(FakeHomeworkApi):
+            def __init__(self):
+                super().__init__(
+                    _payload(_dto("q1", 1, "1+1=?", ((1, "1"), (2, "2")))), [100]
+                )
+                self.attempts = 0
+
+            def do_homework(self, **kwargs):
+                self.attempts += 1
+                if self.attempts == 1:
+                    raise ZhsApiError("status=500 msg=试卷已提交,不能继续答题")
+                return super().do_homework(**kwargs)
+
+        api = ResetOnErrorApi()
+        worker = ZhidaoHomeworkWorker(
+            api,
+            course_id="C1",
+            recruit_id="R1",
+            store=self.store,
+            answerer=lambda _prompt: _ids(2),
+            auto_submit=False,
+            sleep=lambda _s: None,
+        )
+        stats = worker.run(
+            recruit_id="R1",
+            course_id="C1",
+            homework_id="E1",
+            stu_exam_id="S1",
+        )
+        self.assertEqual(api.attempts, 2)
+        self.assertEqual(api.tran_calls, 1)
+        self.assertEqual(stats["answered"], 1)
+
+    def test_should_redo_submitted_checks_score_attempts_and_deadline(self):
+        from datetime import datetime
+        from modules.zhidao_homework_worker import payload_max_redo, should_redo_submitted
+
+        now = datetime(2026, 11, 24, 9, 0, 0)
+        self.assertEqual(payload_max_redo({"rt": {"backNum": 3}}), 3)
+        self.assertTrue(
+            should_redo_submitted(
+                {
+                    "score": 12,
+                    "totalScore": "20",
+                    "isMarking": 1,
+                    "backNum": 3,
+                    "startTime": "2026-10-19 00:00:00",
+                    "endDate": "2026-11-30 23:59:59",
+                },
+                target_score=100,
+                now=now,
+            )
+        )
+        self.assertFalse(
+            should_redo_submitted(
+                {
+                    "score": 20,
+                    "totalScore": "20",
+                    "isMarking": 1,
+                    "backNum": 3,
+                    "endDate": "2026-11-30 23:59:59",
+                },
+                target_score=100,
+                now=now,
+            )
+        )
+        self.assertFalse(
+            should_redo_submitted(
+                {
+                    "score": 12,
+                    "totalScore": "20",
+                    "isMarking": 3,
+                    "backNum": 3,
+                    "endDate": "2026-11-30 23:59:59",
+                },
+                target_score=100,
+                now=now,
+            )
+        )
+        self.assertFalse(
+            should_redo_submitted(
+                {
+                    "score": 12,
+                    "totalScore": "20",
+                    "isMarking": 0,
+                    "backNum": 3,
+                    "endDate": "2026-11-01 00:00:00",
+                },
+                target_score=100,
+                now=now,
+            )
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

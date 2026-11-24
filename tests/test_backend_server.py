@@ -230,6 +230,35 @@ class TaskManagerUnitTests(unittest.TestCase):
                 self.assertEqual(snap["progressDesc"], "必学资源补齐 2/4")
                 self.assertAlmostEqual(snap["lessonProgress"], 50.0)
 
+                mgr.on_logger_event(
+                    "event",
+                    {"name": "知到作业", "fields": {"状态": "开始", "名称": "第一章单元测试", "序号": "1/3"}},
+                )
+                snap = mgr.snapshot()
+                self.assertEqual(snap["currentLesson"], "第一章单元测试")
+                self.assertEqual(snap["progressDesc"], "知到作业 1/3")
+                self.assertAlmostEqual(snap["lessonProgress"], 0.0)
+
+                mgr.on_logger_event(
+                    "event",
+                    {
+                        "name": "知到作业",
+                        "fields": {
+                            "状态": "完成",
+                            "名称": "第一章单元测试",
+                            "序号": "1/3",
+                            "得分": 20.0,
+                            "已交卷": True,
+                        },
+                    },
+                )
+                snap = mgr.snapshot()
+                self.assertEqual(snap["progressDesc"], "知到作业完成 1/3")
+                self.assertAlmostEqual(snap["lessonProgress"], 100.0 / 3, places=2)
+                self.assertTrue(
+                    any("第一章单元测试" in item["title"] for item in snap["completedLessons"])
+                )
+
                 # Deprecated modes must be rejected
                 with self.assertRaises(ValueError):
                     mgr.start_task("fetch_courses")

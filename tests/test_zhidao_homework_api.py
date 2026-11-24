@@ -380,6 +380,93 @@ class HomeworkApiTests(unittest.TestCase):
             },
         )
 
+    def test_query_course_uses_zhidao_strategy(self):
+        from modules.zhidao_homework_api import QUERY_COURSE
+
+        self.api.query_course("4e5d515d")
+        call = self._last()
+        self.assertEqual(call["strategy"], "zhidao")
+        self.assertEqual(call["url"], QUERY_COURSE)
+        self.assertEqual(call["data"], {"recruitAndCourseId": "4e5d515d"})
+        self.assertEqual(self.client.sso_calls, 0)
+
+
+class CourseMetaAndHelpersTests(unittest.TestCase):
+    def test_extract_course_meta_parses_query_course_response(self):
+        from modules.zhidao_homework_api import extract_course_meta
+
+        payload = {
+            "code": 0,
+            "data": {
+                "schoolId": 1847,
+                "recruitId": 458533,
+                "courseInfo": {
+                    "courseId": 1000013343,
+                    "name": "大学物理思维导引（下）",
+                    "courseMode": 2,
+                },
+            },
+        }
+        self.assertEqual(
+            extract_course_meta(payload),
+            {
+                "recruitId": "458533",
+                "courseId": "1000013343",
+                "schoolId": "1847",
+                "courseName": "大学物理思维导引（下）",
+                "courseMode": 2,
+            },
+        )
+        self.assertEqual(extract_course_meta(None), {})
+
+    def test_build_exam_page_url_and_time_window(self):
+        from datetime import datetime
+        from modules.zhidao_homework_api import build_exam_page_url, check_time_window
+
+        hw_url = build_exam_page_url(
+            "dohomework",
+            recruit_id="458533",
+            stu_exam_id="S1",
+            exam_id="E1",
+            course_id="1000013343",
+            school_id="1847",
+        )
+        self.assertEqual(
+            parse_exam_page_url(hw_url),
+            {
+                "kind": "dohomework",
+                "recruitId": "458533",
+                "stuExamId": "S1",
+                "examId": "E1",
+                "courseId": "1000013343",
+                "schoolId": "1847",
+            },
+        )
+        ex_url = build_exam_page_url(
+            "doexam",
+            recruit_id="458533",
+            stu_exam_id="S2",
+            exam_id="E2",
+            course_id="1000013343",
+            school_id="",
+        )
+        self.assertEqual(parse_exam_page_url(ex_url)["schoolId"], "0")
+        self.assertEqual(parse_exam_page_url(ex_url)["kind"], "doexam")
+
+        now = datetime(2026, 11, 24, 9, 0, 0)
+        self.assertEqual(
+            check_time_window("2026-10-19 00:00:00", "2026-11-30 23:59:59", now=now),
+            (True, ""),
+        )
+        self.assertEqual(
+            check_time_window("2026-12-01 00:00:00", "2026-12-04 23:59:59", now=now),
+            (False, "not_started"),
+        )
+        self.assertEqual(
+            check_time_window("2026-10-01 00:00:00", "2026-11-01 00:00:00", now=now),
+            (False, "expired"),
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

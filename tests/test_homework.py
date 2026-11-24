@@ -199,6 +199,21 @@ class HybridRoutingTests(unittest.IsolatedAsyncioTestCase):
         save_or_submit.assert_awaited_once()
         self.assertTrue(save_or_submit.await_args.args[1])
 
+    async def test_skip_api_goes_straight_to_vision_without_calling_api(self):
+        api_call = AsyncMock()
+        config = types.SimpleNamespace(
+            enableHomeworkApi=True, enableFormalExamApi=True, proxy=""
+        )
+        with (
+            patch.object(homework, "_try_api_with_captcha", api_call),
+            patch.object(homework.llm, "vision_enabled", return_value=False),
+        ):
+            stats = await homework.auto_answer_homework(
+                _FakePage(), config=config, skip_api=True
+            )
+        api_call.assert_not_awaited()
+        self.assertEqual(stats, {"ok": 0, "fill": 0, "fail": 0})
+
     async def test_settle_captcha_reloads_when_not_visible_and_exits_after_appear_timeout(self):
         class _Clock:
             def __init__(self):

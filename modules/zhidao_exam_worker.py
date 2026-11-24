@@ -13,6 +13,7 @@ from modules.zhidao_exam_api import (
     submit_succeeded,
 )
 from modules.zhidao_homework_api import (
+    check_time_window,
     extract_exam_questions,
     format_student_answer,
 )
@@ -60,28 +61,68 @@ class ZhidaoExamWorker(ZhidaoHomeworkWorker):
             raise CaptchaRequiredError(f"考试保存答案触发人机验证: {message}")
 
     # ------------------------------------------------------------------ run
-    def scan(self, flag: int = 1) -> list[dict]:
+    def scan(self, flag: int = 1, *, recruit_id="", course_id="") -> list[dict]:
         return extract_final_exams(
             self.api.get_student_final_exam(
-                course_id=self.course_id,
-                recruit_id=self._recruit_id,
+                course_id=str(course_id or self.course_id or ""),
+                recruit_id=str(recruit_id or self._recruit_id or ""),
                 flag=flag,
             )
         )
 
-    def run_pending(self, *, course_id="", school_id="") -> list[dict]:
+    def run_pending(
+        self, *, recruit_id="", course_id="", school_id="", now=None
+    ) -> list[dict]:
         """扫描未完成考试并逐场接管, 返回每场统计."""
+        effective_recruit = str(recruit_id or self._recruit_id or "")
+        if effective_recruit and not self._recruit_id:
+            self._recruit_id = effective_recruit
         results = []
-        for exam in self.scan(flag=1):
+        for exam in self.scan(
+            flag=1, recruit_id=effective_recruit, course_id=course_id
+        ):
             exam_id = exam.get("examId", "")
+            stu_exam_id = exam.get("studentExamId", "")
+            exam_name = exam.get("examName", "")
+            item_recruit = exam.get("recruitId") or effective_recruit
+            item_course = exam.get("courseId") or course_id or self.course_id
+            item_school = exam.get("schoolId") or school_id or self.school_id
+            raw = exam.get("raw") if isinstance(exam.get("raw"), dict) else {}
+            in_window, window_reason = check_time_window(
+                None,
+                exam.get("endDate") or raw.get("endDate"),
+                now=now,
+            )
+            if not in_window:
+                logger.info(f"考试「{exam_name or exam_id}」已截止, 跳过.")
+                results.append(
+                    {
+                        "exam_id": exam_id,
+                        "exam_name": exam_name,
+                        "student_exam_id": stu_exam_id,
+                        "recruit_id": item_recruit,
+                        "course_id": item_course,
+                        "school_id": str(item_school or ""),
+                        "skipped": True,
+                        "reason": window_reason,
+                        "answered": 0,
+                        "submitted": False,
+                    }
+                )
+                continue
             if not is_exam_started(exam):
                 logger.warn(
-                    f"考试「{exam.get('examName') or exam_id}」尚未开始, "
+                    f"考试「{exam_name or exam_id}」尚未开始, "
                     "请手动进入考试后再运行."
                 )
                 results.append(
                     {
                         "exam_id": exam_id,
+                        "exam_name": exam_name,
+                        "student_exam_id": stu_exam_id,
+                        "recruit_id": item_recruit,
+                        "course_id": item_course,
+                        "school_id": str(item_school or ""),
                         "skipped": True,
                         "reason": "not_started",
                         "answered": 0,
@@ -90,14 +131,19 @@ class ZhidaoExamWorker(ZhidaoHomeworkWorker):
                 )
                 continue
             stats = self.run(
-                recruit_id=exam.get("recruitId", ""),
-                course_id=exam.get("courseId") or course_id,
+                recruit_id=item_recruit,
+                course_id=item_course,
                 exam_id=exam_id,
-                student_exam_id=exam.get("studentExamId", ""),
-                school_id=exam.get("schoolId") or school_id,
-                exam_name=exam.get("examName", ""),
+                student_exam_id=stu_exam_id,
+                school_id=str(item_school or ""),
+                exam_name=exam_name,
             )
             stats["exam_id"] = exam_id
+            stats["exam_name"] = exam_name
+            stats["student_exam_id"] = stu_exam_id
+            stats["recruit_id"] = item_recruit
+            stats["course_id"] = item_course
+            stats["school_id"] = str(item_school or "")
             results.append(stats)
         return results
 

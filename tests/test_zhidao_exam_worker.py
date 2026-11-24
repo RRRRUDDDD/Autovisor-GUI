@@ -257,6 +257,52 @@ class ExamWorkerTests(unittest.TestCase):
         self.assertIsNotNone(self.store.get_by_eid("C9", "q1", "E9"))
         self.assertIsNone(self.store.get_by_eid("C1", "q1", "E9"))
 
+    def test_run_pending_uses_worker_recruit_and_skips_unstarted_progress_type_2(self):
+        from datetime import datetime
+
+        exams = [
+            {
+                "id": "S_FUTURE",
+                "examId": "E_FUTURE",
+                "courseId": 1000013343,
+                "examName": "未开放期末考试",
+                "state": 1,
+                "progressType": 2,
+                "studentStartTime": None,
+                "startTime": "2026-12-01 00:00:00",
+                "endDate": "2026-12-04 23:59:59",
+            },
+            {
+                "id": "S_LIVE",
+                "examId": "E_LIVE",
+                "courseId": 1000013343,
+                "examName": "进行中考试",
+                "state": 1,
+                "progressType": 2,
+                "studentStartTime": "2026-11-24 08:30:00",
+                "endDate": "2026-11-25 23:59:59",
+            },
+            {
+                "id": "S_EXP",
+                "examId": "E_EXP",
+                "courseId": 1000013343,
+                "examName": "已截止考试",
+                "studentStartTime": "2026-10-01 08:30:00",
+                "endDate": "2026-10-02 23:59:59",
+            },
+        ]
+        api = FakeExamApi(exams)
+        worker = self._worker(api, recruit_id="458533", school_id="1847")
+        results = worker.run_pending(now=datetime(2026, 11, 24, 9, 0, 0))
+
+        self.assertEqual(len(results), 3)
+        self.assertEqual(results[0]["reason"], "not_started")
+        self.assertEqual(results[1]["answered"], 1)
+        self.assertEqual(results[2]["reason"], "expired")
+        self.assertEqual(len(api.do_calls), 1)
+        self.assertEqual(api.do_calls[0]["recruit_id"], "458533")
+        self.assertEqual(api.do_calls[0]["school_id"], "1847")
+
     def test_bank_stats_logged_even_when_run_fails(self):
         class BoomApi(FakeExamApi):
             def get_save_answer_lock_result(self, **kwargs):
@@ -399,7 +445,18 @@ class ExamApiContractTests(unittest.TestCase):
         self.assertEqual(exams[1]["studentExamId"], "E2")
         self.assertTrue(is_exam_started(exams[0]))
         self.assertFalse(is_exam_started(exams[1]))
-        self.assertTrue(is_exam_started({"progressType": 2}))
+        # 真实接口中未开考考试 (state=1, studentStartTime=null) 也常带 progressType=2，绝不能误判为已开考
+        self.assertFalse(
+            is_exam_started(
+                {
+                    "state": 1,
+                    "studentStartTime": None,
+                    "progressType": 2,
+                    "startTime": "2026-12-01 00:00:00",
+                }
+            )
+        )
+        self.assertTrue(is_exam_started({"state": 2}))
         self.assertEqual(lock_state({"rt": {"state": "0"}}), 0)
         self.assertIsNone(lock_state({"rt": {}}))
         self.assertEqual(extract_school_id({"rt": {"schoolId": 9}}), "9")

@@ -43,6 +43,8 @@ def normalize_final_exam(item: dict) -> dict:
         "schoolId": _text(item.get("schoolId")),
         "examName": _text(item.get("examName") or item.get("name")),
         "studentStartTime": _text(item.get("studentStartTime")),
+        "startTime": _text(item.get("startTime")),
+        "endDate": _text(item.get("endDate")),
         "progressType": item.get("progressType"),
         "state": item.get("state"),
         "raw": item,
@@ -67,12 +69,14 @@ def extract_final_exams(payload) -> list[dict]:
 
 
 def is_exam_started(exam: dict) -> bool:
-    """已开始的判定: studentStartTime 非空, 或 progressType/state 为 2."""
+    """已开始的判定: studentStartTime 非空, 或 state 为 2.
+
+    注意: 真实接口中未到开放时间的考试 (state=1, studentStartTime=null) 也常带 progressType=2,
+    绝不能把 progressType==2 当成学生已开考, 否则会误触发限时正式考试的 doExam.
+    """
     if _text(exam.get("studentStartTime")):
         return True
-    return str(exam.get("progressType")).strip() == "2" or str(
-        exam.get("state")
-    ).strip() == "2"
+    return str(exam.get("state")).strip() == "2"
 
 
 def lock_state(payload) -> int | None:

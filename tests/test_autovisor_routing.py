@@ -358,5 +358,335 @@ class FormalExamRouteTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(summary["formal_exams"], formal_result)
 
 
+class ZhidaoSharedCourseAssessmentTests(unittest.IsolatedAsyncioTestCase):
+    def test_resolve_zhidao_course_meta_falls_back_to_school_info(self):
+        client = MagicMock()
+        with (
+            patch(
+                "modules.zhidao_homework_api.ZhidaoHomeworkApi.query_course",
+                return_value={
+                    "code": 0,
+                    "data": {
+                        "recruitId": 458533,
+                        "courseInfo": {"courseId": 1000013343, "name": "大学物理"},
+                    },
+                },
+            ),
+            patch(
+                "modules.zhidao_exam_api.ZhidaoExamApi.get_login_school_info",
+                return_value={"status": "200", "rt": {"schoolId": 1847}},
+            ),
+        ):
+            meta = Autovisor.resolve_zhidao_course_meta(client, "abc")
+        self.assertEqual(meta["recruitId"], "458533")
+        self.assertEqual(meta["courseId"], "1000013343")
+        self.assertEqual(meta["schoolId"], "1847")
+        self.assertEqual(meta["courseName"], "大学物理")
+
+    async def test_assessment_stage_runs_pending_homework_vision_fallback_and_skips_unstarted_exam(
+        self,
+    ):
+        logger = MagicMock()
+        page = MagicMock()
+        page.goto = AsyncMock()
+        page.wait_for_timeout = AsyncMock()
+        page.context = MagicMock()
+        page.context.cookies = AsyncMock(return_value=[])
+        client = MagicMock()
+        client.session = MagicMock()
+
+        hw_worker = MagicMock()
+        hw_worker.scan.side_effect = [
+            [
+                {
+                    "studentExamId": "S1",
+                    "examId": "E1",
+                    "examName": "第一章单元测试",
+                    "courseId": "1000013343",
+                    "startTime": "2020-01-01 00:00:00",
+                    "endDate": "2099-12-31 23:59:59",
+                },
+                {
+                    "studentExamId": "S2",
+                    "examId": "E2",
+                    "examName": "第二章图片题作业",
+                    "courseId": "1000013343",
+                    "startTime": "2020-01-01 00:00:00",
+                    "endDate": "2099-12-31 23:59:59",
+                },
+            ],
+            [
+                {
+                    "studentExamId": "S3",
+                    "examId": "E3",
+                    "examName": "已提交低分作业",
+                    "courseId": "1000013343",
+                    "score": 10,
+                    "totalScore": "20",
+                    "isMarking": 0,
+                    "backNum": 3,
+                    "startTime": "2020-01-01 00:00:00",
+                    "endDate": "2099-12-31 23:59:59",
+                },
+            ],
+        ]
+        hw_worker.run.side_effect = [
+            {"answered": 10, "submitted": True, "score": 20.0, "needs_vision": False},
+            {"answered": 4, "submitted": False, "score": None, "needs_vision": True},
+            {"answered": 8, "submitted": True, "score": 20.0, "needs_vision": False},
+        ]
+
+        exam_worker = MagicMock()
+        exam_worker.scan.return_value = [
+            {
+                "studentExamId": "EX0",
+                "examId": "E_FUTURE",
+                "examName": "教程考试",
+                "courseId": "1000013343",
+                "state": 1,
+                "progressType": 2,
+                "studentStartTime": "",
+                "startTime": "2099-12-01 00:00:00",
+                "endDate": "2099-12-04 23:59:59",
+            },
+            {
+                "studentExamId": "EX1",
+                "examId": "E_LIVE",
+                "examName": "进行中考试",
+                "courseId": "1000013343",
+                "state": 1,
+                "studentStartTime": "2026-11-24 08:00:00",
+                "endDate": "2099-12-04 23:59:59",
+            },
+        ]
+        exam_worker.run.return_value = {
+            "answered": 5,
+            "submitted": True,
+            "skipped": False,
+            "needs_vision": False,
+        }
+
+        vision_handler = AsyncMock(return_value={"ok": 2, "fill": 0, "fail": 0})
+        cfg = _config(
+            enableHomeworkApi=True,
+            enableFormalExamApi=True,
+            homeworkThreshold=100,
+            homeworkMaxRedo=3,
+        )
+        with (
+            patch.object(Autovisor, "build_page_zhs_client", AsyncMock(return_value=client)),
+            patch.object(
+                Autovisor,
+                "resolve_zhidao_course_meta",
+                return_value={
+                    "recruitId": "458533",
+                    "courseId": "1000013343",
+                    "schoolId": "1847",
+                    "courseName": "大学物理思维导引（下）",
+                },
+            ),
+            patch("modules.zhidao_homework_worker.ZhidaoHomeworkWorker", return_value=hw_worker),
+            patch("modules.zhidao_exam_worker.ZhidaoExamWorker", return_value=exam_worker),
+            patch.object(Autovisor.quiz_page.llm, "conf", return_value={"auto_submit": True}),
+            patch.object(Autovisor.quiz_page.llm, "enabled", return_value=True),
+            patch.object(Autovisor.quiz_page.llm, "vision_enabled", return_value=True),
+            patch.object(Autovisor.homework, "auto_answer_homework", vision_handler),
+        ):
+            summary = await Autovisor.run_zhidao_assessment_stage(
+                page,
+                CATALOG_URL,
+                {"kind": "course", "recruitAndCourseId": "abc"},
+                cfg,
+                logger,
+            )
+
+        self.assertEqual(summary["homework"]["found"], 3)
+        self.assertEqual(summary["homework"]["done"], 3)
+        self.assertEqual(summary["homework"]["failed"], 0)
+        self.assertEqual(hw_worker.run.call_count, 3)
+        # 图片题作业应打开直达页并跳过 API 直接走视觉模型
+        vision_handler.assert_awaited_once_with(page, config=cfg, skip_api=True)
+        page.goto.assert_awaited_once()
+        self.assertIn("/dohomework/458533/S2/E2/1000013343/1847/0", page.goto.await_args.args[0])
+
+        # 未开考的 progressType=2 考试应跳过，只接管进行中的考试
+        self.assertEqual(summary["exam"]["found"], 2)
+        self.assertEqual(summary["exam"]["skipped"], 1)
+        self.assertEqual(summary["exam"]["done"], 1)
+        exam_worker.run.assert_called_once()
+        self.assertEqual(exam_worker.run.call_args.kwargs["exam_id"], "E_LIVE")
+        self.assertEqual(exam_worker.run.call_args.kwargs["recruit_id"], "458533")
+
+    async def test_assessment_stage_does_not_scan_flag_2_when_auto_submit_false(self):
+        logger = MagicMock()
+        page = MagicMock()
+        client = MagicMock()
+        client.session = MagicMock()
+        hw_worker = MagicMock()
+        hw_worker.scan.return_value = []
+        cfg = _config(enableHomeworkApi=True, enableFormalExamApi=False)
+        with (
+            patch.object(Autovisor, "build_page_zhs_client", AsyncMock(return_value=client)),
+            patch.object(
+                Autovisor,
+                "resolve_zhidao_course_meta",
+                return_value={"recruitId": "R1", "courseId": "C1", "schoolId": "S1"},
+            ),
+            patch("modules.zhidao_homework_worker.ZhidaoHomeworkWorker", return_value=hw_worker),
+            patch.object(Autovisor.quiz_page.llm, "conf", return_value={"auto_submit": False}),
+            patch.object(Autovisor.quiz_page.llm, "enabled", return_value=True),
+        ):
+            summary = await Autovisor.run_zhidao_assessment_stage(
+                page,
+                CATALOG_URL,
+                {"kind": "course", "recruitAndCourseId": "abc"},
+                cfg,
+                logger,
+            )
+        # auto_submit=False 时不扫描 flag=2，避免重置已提交作业后未重交
+        hw_worker.scan.assert_called_once_with(1, recruit_id="R1", course_id="C1")
+        self.assertEqual(summary["homework"]["found"], 0)
+
+    async def test_assessment_stage_retries_once_after_captcha(self):
+        from modules.zhs_api import CaptchaRequiredError
+
+        logger = MagicMock()
+        page = MagicMock()
+        page.goto = AsyncMock()
+        page.context = MagicMock()
+        page.context.cookies = AsyncMock(return_value=[{"name": "CASLOGC", "value": "v2"}])
+        client = MagicMock()
+        client.session = MagicMock()
+
+        hw_worker = MagicMock()
+        hw_worker.scan.return_value = [
+            {
+                "studentExamId": "S1",
+                "examId": "E1",
+                "examName": "第一章单元测试",
+                "courseId": "C1",
+            }
+        ]
+        hw_worker.run.side_effect = [
+            CaptchaRequiredError("需要滑块"),
+            {"answered": 3, "submitted": False, "score": None, "needs_vision": False},
+        ]
+        settle = AsyncMock(return_value=True)
+        cfg = _config(enableHomeworkApi=True, enableFormalExamApi=False)
+        with (
+            patch.object(Autovisor, "build_page_zhs_client", AsyncMock(return_value=client)),
+            patch.object(
+                Autovisor,
+                "resolve_zhidao_course_meta",
+                return_value={"recruitId": "R1", "courseId": "C1", "schoolId": "SCH"},
+            ),
+            patch("modules.zhidao_homework_worker.ZhidaoHomeworkWorker", return_value=hw_worker),
+            patch.object(Autovisor.quiz_page.llm, "conf", return_value={"auto_submit": False}),
+            patch.object(Autovisor.quiz_page.llm, "enabled", return_value=True),
+            patch.object(Autovisor.homework, "_settle_captcha", settle),
+        ):
+            summary = await Autovisor.run_zhidao_assessment_stage(
+                page,
+                CATALOG_URL,
+                {"kind": "course", "recruitAndCourseId": "abc"},
+                cfg,
+                logger,
+            )
+        settle.assert_awaited_once_with(page, cfg)
+        client.session.cookies.set.assert_called_with("CASLOGC", "v2")
+        client.reset_exam_sso.assert_called_once()
+        self.assertEqual(summary["homework"]["done"], 1)
+        self.assertEqual(hw_worker.run.call_count, 2)
+
+    async def test_main_triggers_zhidao_assessment_after_catalog_completed(self):
+        from modules.course_runner import CourseOutcome
+
+        async def _run_main_with(outcome, *, review_mode=False):
+            page = MagicMock()
+            page.url = CATALOG_URL
+            page.goto = AsyncMock()
+            page.wait_for_timeout = AsyncMock()
+            locator = MagicMock()
+            locator.first = locator
+            locator.count = AsyncMock(return_value=0)
+            page.locator = MagicMock(return_value=locator)
+
+            context = MagicMock()
+            context.on = MagicMock()
+            context.cookies = AsyncMock(return_value=[])
+            session = MagicMock()
+            session.page = page
+            session.context = context
+            session.close = AsyncMock()
+
+            pw_cm = MagicMock()
+            pw_cm.__aenter__ = AsyncMock(return_value=MagicMock())
+            pw_cm.__aexit__ = AsyncMock(return_value=False)
+
+            async def _idle(*_a, **_kw):
+                await asyncio.sleep(60)
+
+            cfg = _config(
+                course_urls=[CATALOG_URL],
+                enableAutoCaptcha=False,
+                attach_existing_chrome=False,
+                enableZhidaoQuiz=False,
+                enableHideWindow=False,
+                enableHomeworkApi=True,
+                enableFormalExamApi=True,
+                reviewMode=review_mode,
+                username="",
+                password="",
+            )
+            assessment = AsyncMock(return_value={})
+            notifier = MagicMock()
+            notifier.notify_finish = AsyncMock()
+            notifier.notify_error = AsyncMock()
+            notifier.notify_verify = AsyncMock()
+            catalog = SimpleNamespace(name="legacy", course_title="")
+            from contextlib import ExitStack
+
+            patches = [
+                patch.object(Autovisor, "async_playwright", return_value=pw_cm),
+                patch.object(Autovisor, "load_cookies", return_value=[]),
+                patch.object(Autovisor, "maybe_qr_login", AsyncMock(return_value=[])),
+                patch.object(Autovisor, "create_browser_session", AsyncMock(return_value=session)),
+                patch.object(Autovisor, "ensure_login", AsyncMock(return_value=True)),
+                patch.object(Autovisor, "persist_login_cookies", AsyncMock()),
+                patch.object(Autovisor, "should_hide_window", return_value=False),
+                patch.object(Autovisor, "wait_for_verify", side_effect=_idle),
+                patch.object(Autovisor, "video_optimize", side_effect=_idle),
+                patch.object(Autovisor, "skip_questions", side_effect=_idle),
+                patch.object(Autovisor, "play_video", side_effect=_idle),
+                patch.object(Autovisor, "dismiss_popups", side_effect=_idle),
+                patch.object(Autovisor, "periodic_cookie_sync", side_effect=_idle),
+                patch.object(Autovisor, "task_monitor", side_effect=_idle),
+                patch.object(Autovisor, "detect_catalog_after_verification", AsyncMock(return_value=catalog)),
+                patch.object(Autovisor, "optimize_page", AsyncMock()),
+                patch.object(Autovisor, "run_course", AsyncMock(return_value=outcome)),
+                patch.object(Autovisor, "run_zhidao_assessment_stage", assessment),
+                patch.object(Autovisor.Notifier, "from_config", return_value=notifier),
+                patch.object(Autovisor.quiz_page.llm, "enabled", return_value=False),
+                patch.object(Autovisor.quiz_page.llm, "vision_enabled", return_value=False),
+            ]
+            with ExitStack() as stack:
+                for p in patches:
+                    stack.enter_context(p)
+                await Autovisor.main(cfg)
+            return assessment
+
+        called = await _run_main_with(CourseOutcome.COMPLETED, review_mode=False)
+        called.assert_awaited_once()
+
+        skipped_review = await _run_main_with(CourseOutcome.COMPLETED, review_mode=True)
+        skipped_review.assert_not_awaited()
+
+        skipped_limit = await _run_main_with(CourseOutcome.TIME_LIMIT, review_mode=False)
+        skipped_limit.assert_not_awaited()
+
+        skipped_fail = await _run_main_with(CourseOutcome.FAILED, review_mode=False)
+        skipped_fail.assert_not_awaited()
+
+
 if __name__ == "__main__":
     unittest.main()

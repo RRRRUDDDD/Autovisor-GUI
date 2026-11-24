@@ -6,10 +6,15 @@
 """
 from __future__ import annotations
 
+from datetime import datetime
 import json
 
 from modules.url_router import parse_exam_url
 
+STUDY_BASE = "https://studyservice-api.zhihuishu.com/gateway/t/v1"
+QUERY_COURSE = f"{STUDY_BASE}/learning/queryCourse"
+
+EXAM_WEB_BASE = "https://onlineexamh5new.zhihuishu.com/stuExamWeb.html"
 HOMEWORK_BASE = "https://studentexam-api.zhihuishu.com/studentExam/gateway/t/v1"
 
 GET_STUDENT_HOMEWORK = f"{HOMEWORK_BASE}/student/getStudentHomework"
@@ -21,6 +26,79 @@ LOOK_HOMEWORK = f"{HOMEWORK_BASE}/student/lookHomework"
 GET_STU_ANSWER_INFO = f"{HOMEWORK_BASE}/answer/getStuAnswerInfo"
 
 QUESTION_TYPE_NAMES = {1: "single", 2: "multiple", 3: "fill", 14: "judge"}
+
+_TIME_FORMATS = (
+    "%Y-%m-%d %H:%M:%S",
+    "%Y-%m-%d %H:%M",
+    "%Y/%m/%d %H:%M:%S",
+    "%Y/%m/%d %H:%M",
+)
+
+
+def parse_zhidao_time(raw) -> datetime | None:
+    """解析智慧树常见时间字符串 (如 '2026-11-30 23:59:59'); 无法解析返回 None."""
+    text = str(raw or "").strip()
+    if not text:
+        return None
+    for fmt in _TIME_FORMATS:
+        try:
+            return datetime.strptime(text, fmt)
+        except ValueError:
+            continue
+    return None
+
+
+def check_time_window(start_time, end_time, *, now: datetime | None = None) -> tuple[bool, str]:
+    """检查当前时间是否在 [start_time, end_time] 窗口内; 返回 (是否可作答, 跳过原因)."""
+    current = now or datetime.now()
+    start = parse_zhidao_time(start_time)
+    if start is not None and current < start:
+        return False, "not_started"
+    end = parse_zhidao_time(end_time)
+    if end is not None and current > end:
+        return False, "expired"
+    return True, ""
+
+
+def build_exam_page_url(
+    kind: str,
+    *,
+    recruit_id,
+    stu_exam_id,
+    exam_id,
+    course_id,
+    school_id="",
+) -> str:
+    """拼装知到作业/考试直达答题页 URL, 供视觉模型兜底或人机验证页导航."""
+    normalized_kind = "doexam" if str(kind or "").lower() == "doexam" else "dohomework"
+    school = str(school_id or "").strip() or "0"
+    return (
+        f"{EXAM_WEB_BASE}#/webExamList/{normalized_kind}/"
+        f"{recruit_id}/{stu_exam_id}/{exam_id}/{course_id}/{school}/0"
+    )
+
+
+def extract_course_meta(payload) -> dict:
+    """从 studyservice queryCourse 响应提取 recruitId / courseId / schoolId / courseName."""
+    if not isinstance(payload, dict):
+        return {}
+    data = payload.get("data")
+    if not isinstance(data, dict):
+        return {}
+    info = data.get("courseInfo")
+    if not isinstance(info, dict):
+        info = {}
+    recruit_id = data.get("recruitId")
+    course_id = info.get("courseId") if info.get("courseId") is not None else data.get("courseId")
+    school_id = data.get("schoolId") if data.get("schoolId") is not None else info.get("schoolId")
+    course_name = info.get("name") or info.get("courseName") or data.get("courseName") or ""
+    return {
+        "recruitId": "" if recruit_id is None else str(recruit_id).strip(),
+        "courseId": "" if course_id is None else str(course_id).strip(),
+        "schoolId": "" if school_id is None else str(school_id).strip(),
+        "courseName": str(course_name).strip(),
+        "courseMode": info.get("courseMode"),
+    }
 
 
 def _maybe_int(value, default: int = 0) -> int:
@@ -131,9 +209,15 @@ def extract_homework_list(payload) -> dict:
                     "examId": str(item.get("examId") or ""),
                     "recruitId": str(item.get("recruitId") or ""),
                     "courseId": str(item.get("courseId") or ""),
+                    "schoolId": str(item.get("schoolId") or ""),
                     "examName": str(item.get("examName") or ""),
                     "state": item.get("state"),
                     "isMarking": item.get("isMarking"),
+                    "backNum": item.get("backNum"),
+                    "score": item.get("score"),
+                    "totalScore": item.get("totalScore"),
+                    "startTime": str(item.get("startTime") or ""),
+                    "endDate": str(item.get("endDate") or ""),
                     "raw": item,
                 }
             )
@@ -283,6 +367,14 @@ class ZhidaoHomeworkApi:
     def _call(self, url: str, data: dict) -> dict:
         self.client.ensure_exam_sso()
         return self.client.query("homework", url, data)
+
+    def query_course(self, recruit_and_course_id: str) -> dict:
+        """用共享课链接里的 recruitAndCourseId 反查 recruitId / courseId / schoolId."""
+        return self.client.query(
+            "zhidao",
+            QUERY_COURSE,
+            {"recruitAndCourseId": str(recruit_and_course_id)},
+        )
 
     def get_student_homework(
         self,

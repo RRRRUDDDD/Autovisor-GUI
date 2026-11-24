@@ -39,6 +39,7 @@
 | `kg-ai-run.zhihuishu.com/run/gateway/t` | AI 课程试卷、资源、开考 | `ai_task` |
 | `kg-run-student.zhihuishu.com/student/gateway/t` | AI 课程任务列表 | `ai_task` |
 | `studentexam-api.zhihuishu.com/studentExam/gateway/t/v1` | 知到作业 / 考试保存答案 | `homework` |
+| `studyservice-api.zhihuishu.com/gateway/t/v1` | 共享课信息查询（`queryCourse`） | `zhidao` |
 | `taurusexam-api.zhihuishu.com` | 知到正式考试 | `zhidao_exam` |
 | `ai-course-assistant-api.zhihuishu.com` | 官方 AI 解析（明文 JSON/SSE） | 无（不加密） |
 | `onlineservice-api.zhihuishu.com` | 登录用户信息 | 无（CAS 票据） |

@@ -14,12 +14,14 @@ from modules.logger import Logger
 from modules.question_bank import QuestionBankClient
 from modules.zhidao_homework_api import (
     QUESTION_TYPE_NAMES,
+    check_time_window,
     correct_option_ids,
     extract_exam_questions,
     extract_homework_list,
     extract_score,
     format_student_answer,
 )
+from modules.zhs_api import ZhsApiError
 
 logger = Logger()
 
@@ -206,7 +208,7 @@ def payload_is_marking(payload) -> int | None:
 
 def payload_max_redo(payload) -> int | None:
     for source in _source_dict(payload):
-        for key in ("maxRedo", "maxRedoNum", "redoLimit"):
+        for key in ("maxRedo", "maxRedoNum", "redoLimit", "backNum"):
             raw = source.get(key)
             if raw is None:
                 continue
@@ -217,6 +219,68 @@ def payload_max_redo(payload) -> int | None:
             if value > 0:
                 return value
     return None
+
+
+def should_redo_submitted(
+    item: dict, *, target_score: float, now=None
+) -> bool:
+    """判断一份已提交作业 (flag=2) 是否未达标且仍允许重做."""
+    if not isinstance(item, dict) or target_score <= 0:
+        return False
+    raw = item.get("raw") if isinstance(item.get("raw"), dict) else {}
+    start_time = item.get("startTime") or raw.get("startTime")
+    end_date = item.get("endDate") or raw.get("endDate")
+    in_window, _ = check_time_window(start_time, end_date, now=now)
+    if not in_window:
+        return False
+
+    score_raw = item.get("score") if item.get("score") is not None else raw.get("score")
+    if score_raw is None:
+        return False
+    try:
+        score = float(score_raw)
+    except (TypeError, ValueError):
+        return False
+
+    total_raw = (
+        item.get("totalScore")
+        if item.get("totalScore") is not None
+        else raw.get("totalScore")
+    )
+    total = 0.0
+    if total_raw is not None:
+        try:
+            total = float(total_raw)
+        except (TypeError, ValueError):
+            total = 0.0
+    score_percent = (score / total * 100.0) if total > 0 else score
+    if score_percent >= target_score:
+        return False
+
+    limit_raw = item.get("backNum")
+    if limit_raw is None:
+        for key in ("backNum", "maxRedo", "maxRedoNum", "redoLimit"):
+            if raw.get(key) is not None:
+                limit_raw = raw.get(key)
+                break
+    marking_raw = item.get("isMarking")
+    if marking_raw is None:
+        marking_raw = raw.get("isMarking")
+    if limit_raw is not None:
+        try:
+            limit = int(limit_raw)
+        except (TypeError, ValueError):
+            limit = None
+        if limit is not None:
+            if limit <= 0:
+                return False
+            try:
+                marking = int(marking_raw or 0)
+            except (TypeError, ValueError):
+                marking = 0
+            if marking >= limit:
+                return False
+    return True
 
 
 def answer_info_by_question_id(payload) -> dict[str, dict]:
@@ -326,6 +390,8 @@ class ZhidaoHomeworkWorker:
         *,
         course_id,
         course_name="",
+        recruit_id="",
+        school_id="",
         store=None,
         answerer=None,
         analysis_api=None,
@@ -338,6 +404,7 @@ class ZhidaoHomeworkWorker:
         self.api = api
         self.course_id = str(course_id)
         self.course_name = str(course_name or "")
+        self.school_id = str(school_id or "")
         self.store = store or AiQuestionStore()
         self.answerer = answerer
         self.analysis_api = analysis_api
@@ -349,7 +416,7 @@ class ZhidaoHomeworkWorker:
         self.question_bank = question_bank
         self._question_bank_ready = question_bank is not None
         self._ai_user_id = None
-        self._recruit_id = ""
+        self._recruit_id = str(recruit_id or "")
         self._llm_disabled = False
         self._llm_warned = False
 
@@ -775,17 +842,21 @@ class ZhidaoHomeworkWorker:
         self,
         flag: int = 1,
         *,
+        recruit_id="",
+        course_id="",
         page_size: int = 100,
         max_pages: int = 20,
     ) -> list[dict]:
         """分页拉取作业列表, flag=1 未提交, flag=2 已提交未达标."""
+        effective_recruit = str(recruit_id or self._recruit_id or "")
+        effective_course = str(course_id or self.course_id or "")
         items: list[dict] = []
         seen: set[tuple[str, str]] = set()
         page_num = 0
         for _ in range(max_pages):
             payload = self.api.get_student_homework(
-                recruit_id=self._recruit_id,
-                course_id=self.course_id,
+                recruit_id=effective_recruit,
+                course_id=effective_course,
                 flag=flag,
                 page_size=page_size,
                 page_num=page_num,
@@ -803,21 +874,72 @@ class ZhidaoHomeworkWorker:
             page_num = next_page
         return items
 
-    def run_pending(self, *, course_id="", school_id="", flag: int = 1) -> list[dict]:
+    def run_pending(
+        self,
+        *,
+        recruit_id="",
+        course_id="",
+        school_id="",
+        flag: int = 1,
+        now=None,
+    ) -> list[dict]:
         """扫描指定状态的作业并逐份作答, 返回每份作业的统计."""
+        effective_recruit = str(recruit_id or self._recruit_id or "")
+        if effective_recruit and not self._recruit_id:
+            self._recruit_id = effective_recruit
         results = []
-        for item in self.scan(flag=flag):
+        for item in self.scan(
+            flag=flag, recruit_id=effective_recruit, course_id=course_id
+        ):
             exam_id = item.get("examId", "")
+            stu_exam_id = item.get("studentExamId", "")
+            exam_name = item.get("examName", "")
+            item_recruit = item.get("recruitId") or effective_recruit
+            item_course = item.get("courseId") or course_id or self.course_id
+            item_school = (
+                item.get("schoolId")
+                or (item.get("raw") or {}).get("schoolId")
+                or school_id
+                or self.school_id
+            )
+            raw = item.get("raw") if isinstance(item.get("raw"), dict) else {}
+            in_window, reason = check_time_window(
+                item.get("startTime") or raw.get("startTime"),
+                item.get("endDate") or raw.get("endDate"),
+                now=now,
+            )
+            if not in_window:
+                label = "尚未开放" if reason == "not_started" else "已截止"
+                logger.info(f"作业「{exam_name or exam_id}」{label}, 跳过.")
+                results.append(
+                    {
+                        "homework_id": exam_id,
+                        "exam_name": exam_name,
+                        "student_exam_id": stu_exam_id,
+                        "recruit_id": item_recruit,
+                        "course_id": item_course,
+                        "school_id": str(item_school or ""),
+                        "skipped": True,
+                        "reason": reason,
+                        "answered": 0,
+                        "submitted": False,
+                    }
+                )
+                continue
             stats = self.run(
-                recruit_id=item.get("recruitId") or self._recruit_id,
-                course_id=item.get("courseId") or course_id or self.course_id,
+                recruit_id=item_recruit,
+                course_id=item_course,
                 homework_id=exam_id,
-                stu_exam_id=item.get("studentExamId", ""),
+                stu_exam_id=stu_exam_id,
                 exam_id=exam_id,
-                school_id=(item.get("raw") or {}).get("schoolId") or school_id,
+                school_id=str(item_school or ""),
             )
             stats["homework_id"] = exam_id
-            stats["exam_name"] = item.get("examName", "")
+            stats["exam_name"] = exam_name
+            stats["student_exam_id"] = stu_exam_id
+            stats["recruit_id"] = item_recruit
+            stats["course_id"] = item_course
+            stats["school_id"] = str(item_school or "")
             results.append(stats)
         return results
 
@@ -854,13 +976,30 @@ class ZhidaoHomeworkWorker:
         school_id,
         allow_reset=True,
     ):
-        payload = self.api.do_homework(
-            recruit_id=recruit_id,
-            exam_id=exam_key,
-            student_exam_id=stu_exam_id,
-            school_id=school_id,
-            course_id=course_id,
-        )
+        try:
+            payload = self.api.do_homework(
+                recruit_id=recruit_id,
+                exam_id=exam_key,
+                student_exam_id=stu_exam_id,
+                school_id=school_id,
+                course_id=course_id,
+            )
+        except ZhsApiError as exc:
+            if not allow_reset or not any(hint in str(exc) for hint in _RESET_HINTS):
+                raise
+            logger.warn("作业已提交或不可继续作答, 先重置状态再重试...")
+            self.api.save_course_tran(
+                recruit_id=recruit_id,
+                exam_id=exam_key,
+                course_id=course_id,
+            )
+            return self.api.do_homework(
+                recruit_id=recruit_id,
+                exam_id=exam_key,
+                student_exam_id=stu_exam_id,
+                school_id=school_id,
+                course_id=course_id,
+            )
         if allow_reset and payload_needs_reset(payload):
             logger.warn("作业已提交或不可继续作答, 先重置状态再重试...")
             self.api.save_course_tran(

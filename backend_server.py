@@ -534,6 +534,54 @@ class TaskManager:
                                 0.0, min(100.0, ratio[0] / ratio[1] * 100.0)
                             )
                         changed = True
+                elif name in ("知到作业", "知到考试"):
+                    item_name = str(fields.get("名称") or "").strip()
+                    status_val = str(fields.get("状态") or "").strip()
+                    seq_text = str(fields.get("序号") or "").strip()
+                    if item_name:
+                        self._state["currentLesson"] = item_name
+                    if status_val == "开始":
+                        self._state["needsAttention"] = ""
+                        self._state["progressDesc"] = (
+                            f"{name} {seq_text}" if seq_text else name
+                        )
+                        ratio = _parse_ratio(seq_text)
+                        if ratio is not None:
+                            idx, total = ratio
+                            self._state["lessonProgress"] = max(
+                                0.0, min(100.0, (idx - 1) / total * 100.0)
+                            )
+                        else:
+                            self._state["lessonProgress"] = 0.0
+                        changed = True
+                    elif status_val == "完成":
+                        if item_name:
+                            score = fields.get("得分")
+                            submitted = fields.get("已交卷")
+                            if score is not None:
+                                suffix = f"得分 {score}"
+                            elif submitted:
+                                suffix = "已提交"
+                            else:
+                                suffix = "已保存"
+                            self._state["completedLessons"].append(
+                                {
+                                    "title": f"{item_name}（{name}·{suffix}）",
+                                    "time": _format_hms_local(),
+                                }
+                            )
+                        ratio = _parse_ratio(seq_text)
+                        if ratio is not None:
+                            idx, total = ratio
+                            self._state["lessonProgress"] = max(
+                                0.0, min(100.0, idx / total * 100.0)
+                            )
+                        else:
+                            self._state["lessonProgress"] = 100.0
+                        self._state["progressDesc"] = (
+                            f"{name}完成 {seq_text}" if seq_text else f"{name}完成"
+                        )
+                        changed = True
                 elif name == "达到课程时限":
                     self._state["status"] = "time_limit"
                     changed = True
@@ -818,6 +866,8 @@ class TaskManager:
                 视觉模型=llm.vision_label() if llm.vision_enabled() else "未配置",
                 智慧树AI答题=config.enableZhidaoQuiz,
                 接口考试=config.enableExamApi,
+                知到作业接口=config.enableHomeworkApi,
+                知到考试接口=config.enableFormalExamApi,
                 掌握度刷题=config.enableMastery,
                 复习考试接口=config.enableReviewExamApi,
                 目标掌握度=config.masteryTarget,
