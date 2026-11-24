@@ -44,6 +44,7 @@ class LogFileTestCase(unittest.TestCase):
         os.unlink(self.tmp_path)
 
     def lines(self):
+        self.logger.flush()
         with open(self.tmp_path, encoding="utf-8") as file:
             return file.read().splitlines()
 
@@ -221,11 +222,12 @@ class LogRotationTests(unittest.TestCase):
         logger = Logger()
         orig_log_dir = logger.log_dir
         orig_filename = logger.filename
-        orig_max = Logger.MAX_LOG_FILES
+        orig_max_in_dict = "MAX_LOG_FILES" in logger.__dict__
+        orig_max_val = logger.__dict__.get("MAX_LOG_FILES")
         try:
             with tempfile.TemporaryDirectory() as tmp:
                 logger.log_dir = tmp
-                Logger.MAX_LOG_FILES = 3
+                logger.configure(max_files=3)
 
                 # Create Log2.txt and Log5.txt (gap in numbering)
                 p2 = os.path.join(tmp, "Log2.txt")
@@ -248,7 +250,10 @@ class LogRotationTests(unittest.TestCase):
                 self.assertEqual(os.path.basename(p7), "Log7.txt")
                 self.assertEqual(sorted(os.listdir(tmp)), ["Log5.txt", "Log6.txt", "Log7.txt"])
         finally:
-            Logger.MAX_LOG_FILES = orig_max
+            if orig_max_in_dict:
+                logger.__dict__["MAX_LOG_FILES"] = orig_max_val
+            else:
+                logger.__dict__.pop("MAX_LOG_FILES", None)
             logger.log_dir = orig_log_dir
             logger.filename = orig_filename
 
@@ -343,9 +348,11 @@ class LogProductionTests(unittest.TestCase):
         self.addCleanup(self._restore)
 
     def _restore(self):
-        for name in self.added:
-            self.logger.__dict__.pop(name, None)
-        self.logger.__dict__.update(self.saved)
+        for name in self.ATTRS:
+            if name in self.saved:
+                self.logger.__dict__[name] = self.saved[name]
+            else:
+                self.logger.__dict__.pop(name, None)
         self.logger.log_dir = self.orig_dir
         self.logger.filename = self.orig_filename
         self._tmp.cleanup()
@@ -480,6 +487,7 @@ class LogProductionTests(unittest.TestCase):
         for secret in (
             "sk-abcdefgh12345678",
             "CASTGC=abc",
+            "CASLOGC=def",
             "secret-key",
             "user:pass@",
             "secret-token",
@@ -487,6 +495,10 @@ class LogProductionTests(unittest.TestCase):
         ):
             self.assertNotIn(secret, text)
         self.assertIn("REDACTED", text)
+        # Verify persistent handle uses block buffering (not line buffering=1)
+        self.logger.info("buffered-check")
+        self.assertIsNotNone(self.logger._file)
+        self.assertFalse(self.logger._file.line_buffering)
 
     def test_redact_sensitive_helper_masks_provider_keys(self):
         text = redact_sensitive(
@@ -512,11 +524,74 @@ class LogProductionTests(unittest.TestCase):
         for thread in threads:
             thread.join()
 
+        self.logger.flush()
         with open(self.logger.filename, encoding="utf-8") as file:
             content = file.read().splitlines()
         total = workers * lines_per_thread
         self.assertEqual(len(content), total)
         self.assertEqual(len(set(content)), total)
+
+    def test_all_channels_redact_sensitive_and_empty_exception_safe(self):
+        from modules.redaction import redact_argv, redact_notification
+
+        # 1. summarize_exception handles empty exception message without IndexError
+        self.assertEqual(Logger.summarize_exception(ValueError()), "ValueError")
+        self.assertEqual(Logger.summarize_exception(RuntimeError("")), "RuntimeError")
+
+        # 2. info / warn / error / debug / event / context redact BEFORE reaching event_sink (SSE)
+        emitted = []
+        prev_sink = self.logger._event_sink
+        prev_emit_debug = self.logger.emit_debug
+        try:
+            self.logger.emit_debug = True
+            self.logger.set_event_sink(lambda kind, payload: emitted.append((kind, payload)))
+            self.logger.info("proxy http://alice:supersecret@127.0.0.1:7890")
+            self.logger.warn("key=sk-1234567890abcdef")
+            self.logger.error("phone 13812345678", with_context=False)
+            self.logger.debug("Authorization: Bearer topsecretvalue")
+            self.logger.event("ev", url="https://example.com?token=mysecret")
+            self.logger.context(proxy="http://bob:pw1234@127.0.0.1:8080")
+        finally:
+            self.logger.set_event_sink(prev_sink)
+            self.logger.emit_debug = prev_emit_debug
+            self.logger.clear_context()
+
+        dumped = repr(emitted)
+        for leak in (
+            "alice:supersecret",
+            "sk-1234567890abcdef",
+            "13812345678",
+            "topsecretvalue",
+            "mysecret",
+            "bob:pw1234",
+        ):
+            self.assertNotIn(leak, dumped)
+
+        # 3. configure() mutates instance attributes, not Logger class constants
+        orig_class_max = Logger.MAX_LOG_FILES
+        self.logger.configure(max_files=77)
+        self.assertEqual(self.logger.MAX_LOG_FILES, 77)
+        self.assertEqual(Logger.MAX_LOG_FILES, orig_class_max)
+
+        # 4. Persistent handle reused across writes without reopening
+        self.logger.write_log("persist-1\n", level="INFO")
+        fh1 = self.logger._file
+        self.logger.write_log("persist-2\n", level="INFO")
+        fh2 = self.logger._file
+        self.assertIsNotNone(fh1)
+        self.assertIs(fh1, fh2)
+
+        # 5. redact_argv masks proxy password
+        argv_str = redact_argv(["--proxy", "http://u:secretpass@127.0.0.1:7890", "--debug"])
+        self.assertNotIn("secretpass", argv_str)
+        self.assertIn("--debug", argv_str)
+
+        # 6. Shared notifier redaction does NOT swallow subsequent lines after cookie/container
+        multi = "cookie: CASTGC=abc123\n第二行正常进度通知\ntoken: {\"a\": 1}\n第三行依然保留"
+        redacted_multi = redact_notification(multi)
+        self.assertNotIn("CASTGC=abc123", redacted_multi)
+        self.assertIn("第二行正常进度通知", redacted_multi)
+        self.assertIn("第三行依然保留", redacted_multi)
 
 
 if __name__ == "__main__":

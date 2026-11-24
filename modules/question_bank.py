@@ -16,6 +16,7 @@ except ImportError:  # pragma: no cover - 运行环境缺失 requests 时整体�
 
 from modules.logger import Logger
 from modules.http_utils import build_requests_proxies
+from modules.redaction import redact_sensitive, register_secret
 
 logger = Logger()
 
@@ -102,6 +103,8 @@ class QuestionBankClient:
         session=None,
     ):
         self.token = _clean(token)
+        if self.token:
+            register_secret(self.token)
         self.query_url = _clean(query_url) or DEFAULT_QUERY_URL
         self.info_url = _clean(info_url) or self._derive_info_url(self.query_url)
         self.proxy = _clean(proxy)
@@ -109,12 +112,35 @@ class QuestionBankClient:
             self.timeout = float(timeout)
         except (TypeError, ValueError):
             self.timeout = 8.0
+        self._owns_session = session is None
         self.session = session if session is not None else self._new_session()
         self._sanitize_session(self.session)
         self._remaining = None
         self._remaining_loaded = False
         self._hit_count = 0
         self._total_queries = 0
+
+    def close(self) -> None:
+        if self._owns_session and self.session is not None:
+            close_fn = getattr(self.session, "close", None)
+            if callable(close_fn):
+                try:
+                    close_fn()
+                except Exception:
+                    pass
+            self._owns_session = False
+
+    def __enter__(self) -> "QuestionBankClient":
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        self.close()
+
+    def _redact_for_log(self, value) -> str:
+        text = redact_sensitive(value)
+        if self.token:
+            text = text.replace(self.token, "***REDACTED***")
+        return text
 
     # ------------------------------------------------------------- session
     @staticmethod
@@ -159,26 +185,29 @@ class QuestionBankClient:
         if self.session is None:
             return None, "disabled"
         kwargs = {"params": params, "timeout": self.timeout}
+        safe_url = self._redact_for_log(url)
         try:
             proxies = build_requests_proxies(self.proxy)
         except ValueError as exc:
-            logger.debug(f"题库代理配置无效({self.proxy!r}): {exc}")
+            logger.debug(
+                f"题库代理配置无效({self._redact_for_log(self.proxy)!r}): {self._redact_for_log(exc)}"
+            )
             return None, "network"
         if proxies:
             kwargs["proxies"] = proxies
         try:
             response = self.session.get(url, **kwargs)
         except Exception as exc:
-            logger.debug(f"题库请求失败({url}): {exc}")
+            logger.debug(f"题库请求失败({safe_url}): {self._redact_for_log(exc)}")
             return None, "network"
         status = getattr(response, "status_code", 200)
         if isinstance(status, int) and status >= 400:
-            logger.debug(f"题库请求失败({url}): HTTP {status}")
+            logger.debug(f"题库请求失败({safe_url}): HTTP {status}")
             return None, "http"
         try:
             return response.json(), None
         except Exception as exc:
-            logger.debug(f"题库响应不是合法 JSON({url}): {exc}")
+            logger.debug(f"题库响应不是合法 JSON({safe_url}): {self._redact_for_log(exc)}")
             return None, "json"
 
     def _get_json(self, url: str, params: dict):

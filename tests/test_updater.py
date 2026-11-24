@@ -196,21 +196,67 @@ class CheckForUpdateTests(unittest.TestCase):
 
 
 class TrustedUrlTests(unittest.TestCase):
-    def test_accepts_github_hosts(self):
-        self.assertTrue(updater.is_trusted_url("https://github.com/a/b"))
-        self.assertTrue(updater.is_trusted_url("https://objects.githubusercontent.com/x"))
-        self.assertTrue(updater.is_trusted_url("https://api.github.com/repos/x"))
+    def test_accepts_only_repo_release_urls(self):
+        self.assertTrue(
+            updater.is_trusted_url(
+                f"https://github.com/{updater.REPO}/releases/latest"
+            )
+        )
+        self.assertTrue(
+            updater.is_trusted_url(
+                f"https://github.com/{updater.REPO}/releases/tag/v3.20.0"
+            )
+        )
+        self.assertTrue(
+            updater.is_trusted_url(
+                f"https://github.com/{updater.REPO}/releases/download/3.20.0/app.exe"
+            )
+        )
+        self.assertTrue(
+            updater.is_trusted_url(f"https://github.com/{updater.REPO}/releases")
+        )
+        # 大小写无关的仓库路径前缀
+        self.assertTrue(
+            updater.is_trusted_url(
+                f"https://github.com/{updater.REPO.lower()}/releases/latest"
+            )
+        )
 
-    def test_rejects_other_hosts_and_schemes(self):
+    def test_rejects_other_repos_hosts_traversal_and_schemes(self):
+        self.assertFalse(updater.is_trusted_url("https://github.com/a/b"))
+        self.assertFalse(
+            updater.is_trusted_url(
+                "https://github.com/attacker/malware/releases/download/v1/bad.exe"
+            )
+        )
+        self.assertFalse(
+            updater.is_trusted_url(
+                f"https://github.com/{updater.REPO}-evil/releases/latest"
+            )
+        )
+        self.assertFalse(
+            updater.is_trusted_url(
+                f"https://github.com/{updater.REPO}/releases/../../attacker/evil"
+            )
+        )
+        self.assertFalse(
+            updater.is_trusted_url(
+                f"https://github.com/{updater.REPO}/releases%2f..%2f..%2fattacker"
+            )
+        )
+        self.assertFalse(updater.is_trusted_url("https://objects.githubusercontent.com/x"))
+        self.assertFalse(updater.is_trusted_url("https://api.github.com/repos/x"))
         self.assertFalse(updater.is_trusted_url("https://example.com/dl.zip"))
         self.assertFalse(updater.is_trusted_url("https://evilgithub.com/dl.zip"))
-        self.assertFalse(updater.is_trusted_url("http://github.com/dl.zip"))
+        self.assertFalse(
+            updater.is_trusted_url(f"http://github.com/{updater.REPO}/releases/latest")
+        )
         self.assertFalse(updater.is_trusted_url(None))
         self.assertFalse(updater.is_trusted_url(""))
 
 
 class SslFallbackTests(unittest.TestCase):
-    def test_ssl_error_retries_without_verification(self):
+    def test_ssl_error_does_not_downgrade_tls_verification(self):
         logger = FakeLogger()
         session = RetrySession(
             FakeResponse(
@@ -228,21 +274,21 @@ class SslFallbackTests(unittest.TestCase):
             error=requests.exceptions.SSLError("certificate verify failed"),
         )
         url = updater.check_for_update(logger, current_version="3.18.1", session=session)
-        self.assertEqual(url, RELEASE_PAGE)
-        self.assertEqual(len(session.calls), 2)
+        self.assertIsNone(url)
+        # 绝不再以 verify=False 重试，仅发起一次校验请求
+        self.assertEqual(len(session.calls), 1)
         self.assertNotIn("verify", session.kwargs[0])
-        self.assertIs(session.kwargs[1]["verify"], False)
         self.assertIn("证书校验失败", logger.text("DEBUG"))
-        self.assertIn("3.19.0", logger.text("INFO"))
+        self.assertEqual(logger.text("INFO"), "")
 
-    def test_ssl_error_on_both_attempts_is_silent(self):
+    def test_ssl_error_is_silent_and_never_retries_insecurely(self):
         logger = FakeLogger()
         session = FakeSession(error=requests.exceptions.SSLError("certificate verify failed"))
         self.assertIsNone(
             updater.check_for_update(logger, current_version="3.18.1", session=session)
         )
-        self.assertEqual(len(session.calls), 2)
-        self.assertIn("检查更新失败", logger.text("DEBUG"))
+        self.assertEqual(len(session.calls), 1)
+        self.assertIn("证书校验失败", logger.text("DEBUG"))
         self.assertEqual(logger.text("INFO"), "")
 
     def test_untrusted_release_page_falls_back_to_official_page(self):
@@ -363,7 +409,7 @@ class CheckUpdateInfoTests(unittest.TestCase):
         if os.name == "nt":
             self.assertEqual(info["downloadUrl"], setup_url)
 
-    def test_check_update_info_ssl_fallback_and_errors(self):
+    def test_check_update_info_rejects_ssl_error_without_insecure_retry(self):
         payload = {
             "name": "Autovisor-3.18.4",
             "tag_name": "3.18.4",
@@ -376,10 +422,11 @@ class CheckUpdateInfoTests(unittest.TestCase):
             FakeResponse(payload),
             error=requests.exceptions.SSLError("cert failed"),
         )
-        info = updater.check_update_info(current_version="3.18.4", session=session)
-        self.assertFalse(info["hasUpdate"])
-        self.assertEqual(info["releaseUrl"], updater.RELEASE_PAGE_URL)
-        self.assertEqual(len(session.calls), 2)
+        with self.assertRaises(RuntimeError) as ctx:
+            updater.check_update_info(current_version="3.18.4", session=session)
+        self.assertIn("证书校验失败", str(ctx.exception))
+        self.assertEqual(len(session.calls), 1)
+        self.assertNotIn("verify", session.kwargs[0])
 
         fail_session = FakeSession(error=OSError("offline"))
         with self.assertRaises(RuntimeError):

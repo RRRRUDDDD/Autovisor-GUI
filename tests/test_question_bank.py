@@ -501,6 +501,40 @@ class HomeworkWorkerBankTests(unittest.TestCase):
         self.assertEqual(source, "AI")
         self.assertNotIn("第三方题库参考", prompts[0])
 
+    def test_context_manager_closes_owned_session_and_redacts_token_in_debug_log(self):
+        secret_tok = "enncy-secret-token-987654"
+        logged = []
+
+        class _BoomSession:
+            headers = {}
+
+            def get(self, url, **kwargs):
+                raise RuntimeError(f"GET {url}?token={secret_tok} failed with {secret_tok}")
+
+        with patch.object(qb.logger, "debug", side_effect=logged.append):
+            client = qb.QuestionBankClient(
+                token=secret_tok,
+                query_url=f"https://bank.example/query?token={secret_tok}",
+                session=_BoomSession(),
+            )
+            res = client.probe()
+        self.assertFalse(res["ok"])
+        self.assertTrue(logged)
+        for msg in logged:
+            self.assertNotIn(secret_tok, msg)
+            self.assertIn("***REDACTED***", msg)
+
+        closed = []
+        with qb.QuestionBankClient(token=secret_tok) as owned_client:
+            orig_close = owned_client.session.close
+
+            def _track_close():
+                closed.append(True)
+                orig_close()
+
+            owned_client.session.close = _track_close
+        self.assertEqual(closed, [True])
+
 
 if __name__ == "__main__":
     unittest.main()

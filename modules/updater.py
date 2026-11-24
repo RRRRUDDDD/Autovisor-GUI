@@ -3,8 +3,8 @@ import html
 import os
 import re
 import sys
+import threading
 import time
-import warnings
 import xml.etree.ElementTree as ET
 from urllib.parse import quote, unquote, urlparse
 
@@ -45,9 +45,11 @@ _API_RETRY_STATUSES = (500, 502, 503, 504)
 
 # 按代理维度记录 GitHub REST API 限流冷却截止时间，避免重复撞 403
 _API_RATE_LIMIT_UNTIL: dict[str, float] = {}
+_RATE_LIMIT_LOCK = threading.Lock()
 
-# 只展示 GitHub 官方域名的链接, 避免被中间人替换成其他下载地址
-_TRUSTED_HOSTS = ("github.com", "githubusercontent.com")
+# 只展示本仓库 GitHub Releases 官方 HTTPS 链接, 避免被中间人或恶意外链替换
+_TRUSTED_HOSTS = ("github.com",)
+_REPO_PATH_SEGMENTS = tuple(seg.lower() for seg in REPO.split("/") if seg)
 
 
 class _NoReleaseFoundError(RuntimeError):
@@ -80,11 +82,23 @@ def is_newer(latest, current):
 
 
 def is_trusted_url(url):
-    """链接是否为 GitHub 官方域名(https)。"""
+    """链接是否为本仓库 GitHub Releases 官方 HTTPS 地址（强校验 /{REPO}/releases/ 前缀）。"""
     parsed = urlparse(str(url or ""))
+    if parsed.scheme != "https":
+        return False
     host = (parsed.hostname or "").lower()
-    return parsed.scheme == "https" and any(
-        host == trusted or host.endswith("." + trusted) for trusted in _TRUSTED_HOSTS
+    if host not in _TRUSTED_HOSTS:
+        return False
+    raw_path = unquote(parsed.path or "")
+    segments = [seg for seg in raw_path.split("/") if seg]
+    if any(seg in (".", "..") for seg in segments):
+        return False
+    lowered = [seg.lower() for seg in segments]
+    prefix_len = len(_REPO_PATH_SEGMENTS)
+    return (
+        len(lowered) >= prefix_len + 1
+        and tuple(lowered[:prefix_len]) == _REPO_PATH_SEGMENTS
+        and lowered[prefix_len] == "releases"
     )
 
 
@@ -129,13 +143,8 @@ def pick_download_url(release, platform=None):
     return None
 
 
-def _session_get(client, url, *, timeout, headers, verify=True):
-    if verify:
-        return client.get(url, timeout=timeout, headers=headers)
-    # 关闭校验时 urllib3 会打印 InsecureRequestWarning, 这里静默处理
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore")
-        return client.get(url, timeout=timeout, headers=headers, verify=False)
+def _session_get(client, url, *, timeout, headers):
+    return client.get(url, timeout=timeout, headers=headers)
 
 
 def _proxy_cache_key(proxy) -> str:
@@ -144,13 +153,14 @@ def _proxy_cache_key(proxy) -> str:
 
 def _is_api_rate_limited(proxy) -> bool:
     key = _proxy_cache_key(proxy)
-    until = _API_RATE_LIMIT_UNTIL.get(key, 0.0)
-    if until <= 0:
-        return False
-    if time.time() >= until:
-        _API_RATE_LIMIT_UNTIL.pop(key, None)
-        return False
-    return True
+    with _RATE_LIMIT_LOCK:
+        until = _API_RATE_LIMIT_UNTIL.get(key, 0.0)
+        if until <= 0:
+            return False
+        if time.time() >= until:
+            _API_RATE_LIMIT_UNTIL.pop(key, None)
+            return False
+        return True
 
 
 def _record_api_rate_limit(proxy, response) -> int | None:
@@ -168,9 +178,10 @@ def _record_api_rate_limit(proxy, response) -> int | None:
             wait_seconds = None
 
     cooldown = max(wait_seconds or _DEFAULT_RATE_LIMIT_COOLDOWN, 60)
-    _API_RATE_LIMIT_UNTIL[_proxy_cache_key(proxy)] = now + min(
-        cooldown, _MAX_RATE_LIMIT_COOLDOWN
-    )
+    with _RATE_LIMIT_LOCK:
+        _API_RATE_LIMIT_UNTIL[_proxy_cache_key(proxy)] = now + min(
+            cooldown, _MAX_RATE_LIMIT_COOLDOWN
+        )
     return wait_seconds
 
 
@@ -256,14 +267,13 @@ def _parse_release_from_atom(raw_xml: str, tag_name: str) -> dict[str, str]:
     return {}
 
 
-def _fetch_latest_release_from_web(client, timeout=REQUEST_TIMEOUT, verify=True):
+def _fetch_latest_release_from_web(client, timeout=REQUEST_TIMEOUT):
     """通过 GitHub 网页端 releases/latest 获取最新版本（不受 api.github.com 60次/小时 限流影响）。"""
     response = _session_get(
         client,
         RELEASE_PAGE_URL,
         timeout=timeout,
         headers=WEB_JSON_HEADERS,
-        verify=verify,
     )
     response.raise_for_status()
 
@@ -307,7 +317,6 @@ def _fetch_latest_release_from_web(client, timeout=REQUEST_TIMEOUT, verify=True)
             assets_url,
             timeout=enrich_timeout,
             headers=WEB_PAGE_HEADERS,
-            verify=verify,
         )
         assets_resp.raise_for_status()
         release["assets"] = _parse_expanded_assets(getattr(assets_resp, "text", ""))
@@ -320,7 +329,6 @@ def _fetch_latest_release_from_web(client, timeout=REQUEST_TIMEOUT, verify=True)
             RELEASES_ATOM_URL,
             timeout=enrich_timeout,
             headers=WEB_PAGE_HEADERS,
-            verify=verify,
         )
         atom_resp.raise_for_status()
         atom_meta = _parse_release_from_atom(getattr(atom_resp, "text", ""), tag_name)
@@ -336,33 +344,26 @@ def _fetch_latest_release_from_web(client, timeout=REQUEST_TIMEOUT, verify=True)
     return release
 
 
-def _fetch_latest_release_with_ssl_fallback(timeout=REQUEST_TIMEOUT, session=None, proxy="", on_ssl_error=None):
-    try:
-        return fetch_latest_release(timeout=timeout, session=session, proxy=proxy)
-    except requests.exceptions.SSLError as exc:
-        if on_ssl_error:
-            on_ssl_error(exc)
-        return fetch_latest_release(
-            timeout=timeout, session=session, verify=False, proxy=proxy
-        )
-
-
 def check_update_info(
     current_version=__gui_version__, timeout=REQUEST_TIMEOUT, session=None, proxy=""
 ) -> dict:
     """查询 GitHub 最新 Release 并返回结构化更新信息（供桌面端 API 使用）。
 
-    网络、限流或返回数据不可解析时抛出可读异常。
+    网络、限流、证书校验失败或返回数据不可解析时抛出可读异常（不再降级关闭 TLS 校验）。
     """
     current = parse_version(current_version)
     try:
-        release = _fetch_latest_release_with_ssl_fallback(
+        release = fetch_latest_release(
             timeout=timeout, session=session, proxy=proxy
         )
     except _NoReleaseFoundError as exc:
         raise RuntimeError(str(exc)) from exc
     except _RateLimitFallbackError as exc:
         raise RuntimeError(str(exc)) from exc
+    except requests.exceptions.SSLError as exc:
+        raise RuntimeError(
+            f"检查更新证书校验失败，请检查系统时间、根证书或代理设置: {exc}"
+        ) from exc
     except requests.exceptions.HTTPError as exc:
         status = getattr(getattr(exc, "response", None), "status_code", None)
         if status in _RATE_LIMIT_STATUSES:
@@ -393,7 +394,7 @@ def check_update_info(
     }
 
 
-def fetch_latest_release(timeout=REQUEST_TIMEOUT, session=None, verify=True, proxy=""):
+def fetch_latest_release(timeout=REQUEST_TIMEOUT, session=None, proxy=""):
     own_session = session is None
     client = session or create_retry_session(
         proxy=proxy,
@@ -403,14 +404,13 @@ def fetch_latest_release(timeout=REQUEST_TIMEOUT, session=None, verify=True, pro
     )
     try:
         if own_session and _is_api_rate_limited(proxy):
-            return _fetch_latest_release_from_web(client, timeout=timeout, verify=verify)
+            return _fetch_latest_release_from_web(client, timeout=timeout)
 
         response = _session_get(
             client,
             LATEST_RELEASE_API,
             timeout=timeout,
             headers=REQUEST_HEADERS,
-            verify=verify,
         )
         try:
             response.raise_for_status()
@@ -425,9 +425,7 @@ def fetch_latest_release(timeout=REQUEST_TIMEOUT, session=None, verify=True, pro
                 else None
             )
             try:
-                return _fetch_latest_release_from_web(
-                    client, timeout=timeout, verify=verify
-                )
+                return _fetch_latest_release_from_web(client, timeout=timeout)
             except (_NoReleaseFoundError, requests.exceptions.SSLError):
                 raise
             except requests.exceptions.HTTPError as web_http_exc:
@@ -468,24 +466,16 @@ def check_for_update(
 
     3.18.1 起 tag 使用版本号; 旧版 release 的 tag 是日期(2026/9/15),
     因此优先解析 tag_name, 失败再回退到 release 名称。
-    部分网络(代理/加速工具)会替换 GitHub 证书且未安装对应根证书, 导致校验失败,
-    此时关闭校验重试一次; 版本查询不涉及敏感数据, 但下载链接只展示 GitHub 官方域名。
-    检查失败(断网、限流等)只记录 debug 日志, 不影响程序运行。
+    始终严格校验 TLS 证书，绝不静默降级关闭证书校验；下载链接仅展示本仓库 GitHub Releases 官方地址。
+    检查失败(断网、限流、证书错误等)只记录 debug 日志, 不影响程序运行。
     """
     current = parse_version(current_version)
     try:
         release = fetch_latest_release(timeout=timeout, session=session, proxy=proxy)
     except requests.exceptions.SSLError as exc:
-        logger.debug(f"证书校验失败: {logger.summarize_exception(exc)}, 关闭校验重试.")
-        logger.event("更新检查降级", 原因="证书校验失败", 错误=logger.summarize_exception(exc))
-        try:
-            release = fetch_latest_release(
-                timeout=timeout, session=session, verify=False, proxy=proxy
-            )
-        except Exception as retry_exc:
-            logger.debug(f"检查更新失败: {logger.summarize_exception(retry_exc)}")
-            logger.event("更新检查", 结果="失败", 错误=logger.summarize_exception(retry_exc))
-            return None
+        logger.debug(f"证书校验失败，已中止更新检查: {logger.summarize_exception(exc)}")
+        logger.event("更新检查", 结果="失败", 原因="证书校验失败", 错误=logger.summarize_exception(exc))
+        return None
     except Exception as exc:
         logger.debug(f"检查更新失败: {logger.summarize_exception(exc)}")
         logger.event("更新检查", 结果="失败", 错误=logger.summarize_exception(exc))

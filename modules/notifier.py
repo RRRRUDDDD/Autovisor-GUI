@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Mapping
 import configparser
+import os
 import re
 import subprocess
 import sys
@@ -25,90 +26,15 @@ from xml.sax.saxutils import escape
 import requests
 
 from modules.http_utils import build_requests_proxies
+from modules.redaction import (
+    mask_secret,
+    redact_notification as redact,
+    register_config,
+    register_secret,
+)
 
 NOTIFICATION_TIMEOUT = (5, 10)
-
-# 隐私脱敏
-_SECRETS_LIMIT = 512
-_secrets: dict[str, None] = {}
-_secrets_lock = threading.RLock()
-_SENSITIVE_FIELDS = (
-    r"(?:password|passwd|pwd|cookies?|set-cookie|authorization|api[_-]?key|key|"
-    r"tokens?|[a-z_]*token|secret|enc|aienc|username|account|_?uid|fid|cpi|"
-    r"clazzid|classid|courseid|tg_chat_id|chat_id)"
-)
-_SENSITIVE_RE = re.compile(_SENSITIVE_FIELDS, re.I)
-_ASSIGNMENT_RE = re.compile(
-    rf"""(?i)(["']?\b{_SENSITIVE_FIELDS}["']?\s*[:=]\s*)(?:"[^"]*"|'[^']*'|[^\s,;&}}\]]+)"""
-)
-_URL_RE = re.compile(r"""https?://[^\s<>"']+""", re.I)
-
-
-def register_secret(value) -> None:
-    if isinstance(value, (str, int)) and len(str(value)) >= 4:
-        with _secrets_lock:
-            _secrets[str(value)] = None
-            while len(_secrets) > _SECRETS_LIMIT:
-                del _secrets[next(iter(_secrets))]
-
-
-def register_config(config) -> None:
-    if isinstance(config, Mapping):
-        for key, value in config.items():
-            if _SENSITIVE_RE.fullmatch(str(key)) or str(key).lower() in {"url", "subscription"}:
-                register_secret(value)
-                if str(key).lower() == "tokens" and isinstance(value, str):
-                    for token in re.split(r"[,;\s]+", value):
-                        register_secret(token)
-            register_config(value)
-    elif isinstance(config, (list, tuple)):
-        for item in config:
-            register_config(item)
-
-
-def redact(value) -> str:
-    text = str(value)
-    with _secrets_lock:
-        secrets = sorted(_secrets, key=len, reverse=True)
-    for secret in secrets:
-        text = text.replace(secret, "[redacted]")
-    text = re.sub(r"<RequestsCookieJar\[.*?\]>", "[redacted cookies]", text, flags=re.S)
-    text = re.sub(r"""(?i)\bBearer\s+[^\s,;"']+""", "Bearer [redacted]", text)
-    text = re.sub(
-        r"""(?is)(["']?\b(?:set-cookie|cookies?)["']?\s*[:=]\s*).*""",
-        lambda m: m[1] + "[redacted cookies]",
-        text,
-    )
-    text = re.sub(
-        rf"""(?is)(["']?\b{_SENSITIVE_FIELDS}["']?\s*[:=]\s*)[{{\[].*""",
-        lambda m: m[1] + "[redacted container]",
-        text,
-    )
-    text = _ASSIGNMENT_RE.sub(lambda m: m[1] + "[redacted]", text)
-
-    def _hide_url(match):
-        try:
-            host = urlsplit(match[0]).hostname or "service"
-            return "https://" + host + "/[redacted]"
-        except ValueError:
-            return "[redacted URL]"
-
-    text = _URL_RE.sub(_hide_url, text)
-    return re.sub(r"(?<!\d)1[3-9]\d{9}(?!\d)", "[redacted account]", text)
-
-
-def mask_secret(value: str | None) -> str:
-    """脱敏 Token 或包含 Key 的推送 URL，避免敏感凭据写入日志。"""
-    text = str(value or "").strip()
-    if not text:
-        return ""
-    if "://" in text:
-        parsed = urlparse(text)
-        host = parsed.netloc or ""
-        return f"{parsed.scheme}://{host}/***"
-    if len(text) <= 8:
-        return "***"
-    return f"{text[:4]}***{text[-4:]}"
+_ORIGINAL_REQUESTS_POST = requests.post
 
 
 class NotificationService(ABC):
@@ -125,7 +51,27 @@ class NotificationService(ABC):
         self.proxy = str(proxy or "").strip()
         self._logger = logger
         self._session = session
+        self._owns_session = False
+        self._session_lock = threading.Lock()
         self.last_error = ""
+
+    def close(self) -> None:
+        with self._session_lock:
+            if self._owns_session and self._session is not None:
+                close_fn = getattr(self._session, "close", None)
+                if callable(close_fn):
+                    try:
+                        close_fn()
+                    except Exception:
+                        pass
+                self._session = None
+                self._owns_session = False
+
+    def __enter__(self) -> "NotificationService":
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        self.close()
 
     def _log_info(self, message: str) -> None:
         if self._logger is not None:
@@ -187,13 +133,20 @@ class NotificationService(ABC):
         """HTTP 通知服务共用的发送路径：POST 后校验状态码与 JSON 响应。"""
         req_kwargs = dict(kwargs)
         req_kwargs.setdefault("timeout", NOTIFICATION_TIMEOUT)
+        if self.proxy and "proxies" not in req_kwargs:
+            req_kwargs["proxies"] = build_requests_proxies(self.proxy)
         try:
-            if self._session is not None:
-                response = self._session.post(self.url, **req_kwargs)
-            else:
-                if self.proxy and "proxies" not in req_kwargs:
-                    req_kwargs["proxies"] = build_requests_proxies(self.proxy)
+            session = self._session
+            if session is None and requests.post is not _ORIGINAL_REQUESTS_POST:
                 response = requests.post(self.url, **req_kwargs)
+            else:
+                if session is None:
+                    with self._session_lock:
+                        if self._session is None:
+                            self._session = requests.Session()
+                            self._owns_session = True
+                        session = self._session
+                response = session.post(self.url, **req_kwargs)
             response.raise_for_status()
             result = response.json()
         except requests.RequestException as exc:
@@ -352,6 +305,21 @@ class Windows(NotificationService):
     PowerShell 7 (pwsh) 没有 WinRT 投影，无法加载 Toast 类型。
     """
 
+    _TOAST_SCRIPT = (
+        "[Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, "
+        "ContentType = WindowsRuntime] | Out-Null; "
+        "[Windows.Data.Xml.Dom.XmlDocument, Windows.Data.Xml.Dom.XmlDocument, "
+        "ContentType = WindowsRuntime] | Out-Null; "
+        "$xml = New-Object Windows.Data.Xml.Dom.XmlDocument; "
+        "$xml.LoadXml('<toast><visual><binding template=\"ToastGeneric\">"
+        "<text></text></binding></visual></toast>'); "
+        "$textNode = $xml.GetElementsByTagName('text').Item(0); "
+        "$textNode.AppendChild($xml.CreateTextNode($env:AUTOVISOR_TOAST_TEXT)) | Out-Null; "
+        "$toast = New-Object Windows.UI.Notifications.ToastNotification($xml); "
+        "[Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier("
+        "'Microsoft.Windows.Explorer').Show($toast)"
+    )
+
     def _init_service(self, *, probe: bool = True) -> None:
         if sys.platform != "win32":
             self.disabled = True
@@ -360,7 +328,7 @@ class Windows(NotificationService):
 
         if probe:
             # 预先探测 PowerShell 能否成功弹出 Toast（同时作为启用确认）
-            ok, err = self._run_powershell(self._build_script("Windows 系统通知已启用"))
+            ok, err = self._run_powershell(self._build_script(), "Windows 系统通知已启用")
             if not ok:
                 self.disabled = True
                 self.last_error = f"Windows系统通知不可用，已忽略该通知服务: {err}"
@@ -370,35 +338,17 @@ class Windows(NotificationService):
         self._log_info("已初始化Windows系统通知服务")
 
     @staticmethod
-    def _build_script(message: str) -> str:
-        """构造发送 Toast 通知的 PowerShell 脚本（调用方需保证已 XML 转义）。"""
-        # Neutralize PowerShell here-string terminators ('@ at line starts)
-        # so multi-line messages (e.g. tracebacks) don't prematurely close
-        # the template or allow command injection. Replace the leading quote
-        # with a space so '@... becomes  @... — no longer a terminator.
-        safe = re.sub(r"(?m)^[ \t]*'@", " ", message)
-        return (
-            "[Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, "
-            "ContentType = WindowsRuntime] | Out-Null; "
-            "[Windows.Data.Xml.Dom.XmlDocument, Windows.Data.Xml.Dom.XmlDocument, "
-            "ContentType = WindowsRuntime] | Out-Null; "
-            "$xmlText = @'\n"
-            '<toast><visual><binding template="ToastGeneric">'
-            f"<text>{safe}</text>"
-            "</binding></visual></toast>\n"
-            "'@; "
-            "$xml = New-Object Windows.Data.Xml.Dom.XmlDocument; "
-            "$xml.LoadXml($xmlText); "
-            "$toast = New-Object Windows.UI.Notifications.ToastNotification($xml); "
-            "[Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier("
-            "'Microsoft.Windows.Explorer').Show($toast)"
-        )
+    def _build_script(_message: str = "") -> str:
+        """返回静态 PowerShell Toast 脚本，消息正文统一经由环境变量传递，绝不拼接进脚本。"""
+        return Windows._TOAST_SCRIPT
 
     @staticmethod
-    def _run_powershell(script: str) -> tuple[bool, str]:
-        """执行 PowerShell 脚本，返回 (是否成功, 错误信息)。"""
+    def _run_powershell(script: str, message: str = "") -> tuple[bool, str]:
+        """执行 PowerShell 脚本，通过环境变量 AUTOVISOR_TOAST_TEXT 安全传参。"""
         try:
-            kwargs = {"capture_output": True, "timeout": 15}
+            env = dict(os.environ)
+            env["AUTOVISOR_TOAST_TEXT"] = str(message).replace("\x00", "")
+            kwargs = {"capture_output": True, "timeout": 15, "env": env}
             if hasattr(subprocess, "CREATE_NO_WINDOW"):
                 kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
             result = subprocess.run(
@@ -412,8 +362,7 @@ class Windows(NotificationService):
             return False, str(exc)
 
     def _send(self, message: str) -> bool:
-        # 消息需经过 XML 转义后再嵌入 Toast 模板
-        ok, err = self._run_powershell(self._build_script(escape(message)))
+        ok, err = self._run_powershell(self._build_script(), message)
         if ok:
             self._log_info("Windows系统通知发送成功")
         else:
@@ -477,6 +426,7 @@ class Notifier:
         self.logger = logger
         self._session = session
         self._service: Optional[NotificationService] = None
+        self._service_lock = threading.Lock()
 
         register_config(
             {
@@ -513,24 +463,25 @@ class Notifier:
         return [self.provider] if self.enabled else []
 
     def _build_service(self) -> NotificationService:
-        if self._service is not None:
-            return self._service
-        factory = Notification(proxy=self.proxy, logger=self.logger, session=self._session)
-        factory.config_set(
-            {
-                "provider": self.provider,
-                "url": self.url,
-                "tg_chat_id": self.tg_chat_id,
-            }
-        )
-        service = factory.get_notification_from_config()
-        if isinstance(service, Windows):
-            # 避免每次初始化都多弹一条“已启用”测试弹窗，由实际 send() 发送
-            service._init_service(probe=False)
-        else:
-            service.init_notification()
-        self._service = service
-        return service
+        with self._service_lock:
+            if self._service is not None:
+                return self._service
+            factory = Notification(proxy=self.proxy, logger=self.logger, session=self._session)
+            factory.config_set(
+                {
+                    "provider": self.provider,
+                    "url": self.url,
+                    "tg_chat_id": self.tg_chat_id,
+                }
+            )
+            service = factory.get_notification_from_config()
+            if isinstance(service, Windows):
+                # 避免每次初始化都多弹一条“已启用”测试弹窗，由实际 send() 发送
+                service._init_service(probe=False)
+            else:
+                service.init_notification()
+            self._service = service
+            return service
 
     @staticmethod
     def _compose_message(title: str, content: str) -> str:
@@ -580,6 +531,22 @@ class Notifier:
             return {}
         return await self.send_async("Autovisor GUI 运行异常", detail)
 
+    def close(self) -> None:
+        if self._service is not None:
+            close_fn = getattr(self._service, "close", None)
+            if callable(close_fn):
+                try:
+                    close_fn()
+                except Exception:
+                    pass
+            self._service = None
+
+    def __enter__(self) -> "Notifier":
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        self.close()
+
     def notify_error_sync(self, detail: str) -> dict:
         if not self.enabled or not self.notify_on_error:
             return {}
@@ -610,19 +577,19 @@ def test_notification_config(
         if normalized == "Telegram" and not chat_id_str:
             raise ValueError("使用 Telegram 通知时必须填写 Chat ID")
 
-    notifier = Notifier(
+    with Notifier(
         provider=normalized,
         url=url_str,
         tg_chat_id=chat_id_str,
         proxy=proxy_str,
-    )
-    if not notifier.enabled:
-        raise ValueError("当前环境不支持或未正确配置所选通知服务")
+    ) as notifier:
+        if not notifier.enabled:
+            raise ValueError("当前环境不支持或未正确配置所选通知服务")
 
-    results = notifier.send(
-        "Autovisor GUI 推送测试",
-        "这是一条来自 Autovisor GUI 桌面端的测试通知，推送通道工作正常。",
-    )
+        results = notifier.send(
+            "Autovisor GUI 推送测试",
+            "这是一条来自 Autovisor GUI 桌面端的测试通知，推送通道工作正常。",
+        )
     ok, detail = results.get(normalized, (False, "通知服务未确认送达"))
     label = PROVIDER_LABELS.get(normalized, normalized)
     if not ok:

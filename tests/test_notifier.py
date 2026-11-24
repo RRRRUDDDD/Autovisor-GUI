@@ -106,16 +106,38 @@ class NotificationServiceTests(unittest.TestCase):
 
 
 class WindowsToastHereStringTests(unittest.TestCase):
-    def test_leading_at_quote_terminator_is_neutralized(self):
-        script = Windows._build_script("line one\n'@evil\nline two")
-        inner = script.split("$xmlText = @'", 1)[1].split("'@;", 1)[0]
-        self.assertNotIn("'@\n", inner)
-        self.assertIn("evil", inner)
-        self.assertNotIn("'@", inner)
+    def test_static_script_never_interpolates_payload(self):
+        payloads = [
+            "line one\n'@evil\nline two",
+            "prefix\r'@; calc.exe; @'\nsuffix",
+            "xml chars <tag> & \"quote\" > 'single'",
+            "Traceback (most recent call last):\n  File \"a.py\", line 1\r'@; Start-Process calc\nValueError: boom",
+        ]
+        baseline = Windows._build_script()
+        self.assertIn("$env:AUTOVISOR_TOAST_TEXT", baseline)
+        self.assertIn("CreateTextNode", baseline)
+        for payload in payloads:
+            with self.subTest(payload=payload):
+                script = Windows._build_script(payload)
+                self.assertEqual(script, baseline)
+                self.assertNotIn("calc.exe", script)
+                self.assertNotIn("Start-Process", script)
+                self.assertNotIn("evil", script)
+                self.assertNotIn("<tag>", script)
 
-    def test_clean_multiline_message_is_preserved(self):
-        script = Windows._build_script("hello\nworld")
-        self.assertIn("hello\nworld", script)
+    def test_run_powershell_passes_message_via_env_without_script_interpolation(self):
+        payload = "err\r'@; calc.exe; @'\n<tag>&more"
+        fake_res = Mock(returncode=0, stderr=b"")
+        with patch("modules.notifier.subprocess.run", return_value=fake_res) as run_mock:
+            ok, err = Windows._run_powershell(Windows._build_script(), payload)
+        self.assertTrue(ok)
+        self.assertEqual(err, "")
+        cmd = run_mock.call_args.args[0]
+        script_arg = cmd[-1]
+        env_arg = run_mock.call_args.kwargs["env"]
+        self.assertNotIn("calc.exe", script_arg)
+        self.assertNotIn("<tag>", script_arg)
+        self.assertEqual(env_arg["AUTOVISOR_TOAST_TEXT"], payload)
 
 
 class TelegramContractTests(unittest.TestCase):
@@ -198,7 +220,9 @@ class NotifierWrapperTests(unittest.TestCase):
                 results = notifier.send("Autovisor", "任务已完成")
         self.assertTrue(results["Windows"][0])
         self.assertEqual(run_ps.call_count, 1)
-        self.assertIn("任务已完成", run_ps.call_args[0][0])
+        script_arg, msg_arg = run_ps.call_args[0]
+        self.assertNotIn("任务已完成", script_arg)
+        self.assertIn("任务已完成", msg_arg)
 
     def test_event_filters_respect_flags(self):
         session = _FakeSession()
@@ -230,6 +254,26 @@ class NotifierWrapperTests(unittest.TestCase):
             post.call_args.kwargs["proxies"],
             {"http": "http://127.0.0.1:7890", "https": "http://127.0.0.1:7890"},
         )
+
+    def test_proxy_persists_across_retries_and_multiple_sends_with_session(self):
+        fake_session = _FakeSession()
+        notifier = Notifier(
+            provider="ServerChan",
+            url="https://sctapi.ftqq.com/key.send",
+            proxy="http://127.0.0.1:7890",
+            session=fake_session,
+        )
+        r1 = notifier.send("标题1", "内容1")
+        r2 = notifier.send("标题2", "内容2")
+        self.assertTrue(r1["ServerChan"][0])
+        self.assertTrue(r2["ServerChan"][0])
+        self.assertEqual(len(fake_session.post_calls), 2)
+        expected_proxies = {
+            "http": "http://127.0.0.1:7890",
+            "https": "http://127.0.0.1:7890",
+        }
+        self.assertEqual(fake_session.post_calls[0][1]["proxies"], expected_proxies)
+        self.assertEqual(fake_session.post_calls[1][1]["proxies"], expected_proxies)
 
     def test_test_notification_config_validates_and_sends(self):
         from modules.notifier import test_notification_config
