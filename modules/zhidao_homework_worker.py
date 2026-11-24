@@ -613,24 +613,51 @@ class ZhidaoHomeworkWorker:
         return None
 
     def _find_row(self, question: dict, exam_key: str, course_id=None) -> dict | None:
-        """eid -> 选项哈希 -> 题干, 三级兜底查找已有缓存."""
+        """eid -> 选项哈希 -> 题干, 同卷优先并支持同课程跨测验题库兜底."""
         course = self._storage_course(course_id)
+        same_exam_row = None
         eid = question.get("eid")
         if eid:
-            row = self.store.get_by_eid(course, eid, exam_key)
-            if row:
-                return row
+            same_exam_row = self.store.get_by_eid(course, eid, exam_key)
         hashed = option_hash(question.get("options") or [])
-        if hashed:
-            row = self.store.find_by_hash(course, hashed, exam_key)
-            if row:
-                return row
+        if same_exam_row is None and hashed:
+            same_exam_row = self.store.find_by_hash(course, hashed, exam_key)
         content = _plain(question.get("content"))
-        if content:
-            row = self.store.find_by_content(course, content, exam_key)
-            if row:
-                return row
-        return None
+        if same_exam_row is None and content:
+            same_exam_row = self.store.find_by_content(course, content, exam_key)
+
+        if same_exam_row is not None and (
+            same_exam_row.get("correct_options") or same_exam_row.get("ai_analysis")
+        ):
+            return same_exam_row
+
+        cross_row = None
+        if hashed:
+            cand = self.store.find_by_hash(course, hashed, exam_id=None)
+            if cand and (cand.get("correct_options") or cand.get("ai_analysis")):
+                cross_row = cand
+        if cross_row is None and content:
+            cand = self.store.find_by_content(course, content, exam_id=None)
+            if cand and (cand.get("correct_options") or cand.get("ai_analysis")):
+                cross_row = cand
+
+        if cross_row is None:
+            return same_exam_row
+
+        # 跨测验兜底仅借用 correct_options 与 ai_analysis，不把旧测验的 wrong_options / question_id 混入当前卷
+        cross_hint = {
+            "correct_options": list(cross_row.get("correct_options") or []),
+            "ai_analysis": cross_row.get("ai_analysis") or "",
+            "wrong_options": [],
+        }
+        if same_exam_row is None:
+            return cross_hint
+        merged = dict(same_exam_row)
+        if not merged.get("correct_options") and cross_hint["correct_options"]:
+            merged["correct_options"] = cross_hint["correct_options"]
+        if not merged.get("ai_analysis") and cross_hint["ai_analysis"]:
+            merged["ai_analysis"] = cross_hint["ai_analysis"]
+        return merged
 
     def _save_answer(
         self,
@@ -1025,22 +1052,27 @@ class ZhidaoHomeworkWorker:
     def _merge_row(remembered: dict | None, existing: dict | None) -> dict | None:
         if remembered is None:
             return existing
-        if existing is None or remembered.get("id") == existing.get("id"):
+        if existing is None:
             return remembered
+        same_record = (
+            remembered.get("id") is not None
+            and remembered.get("id") == existing.get("id")
+        )
         merged = dict(remembered)
         if not merged.get("correct_options") and existing.get("correct_options"):
             merged["correct_options"] = list(existing["correct_options"])
         if not merged.get("ai_analysis") and existing.get("ai_analysis"):
             merged["ai_analysis"] = existing["ai_analysis"]
-        if not merged.get("question_id") and existing.get("question_id"):
-            merged["question_id"] = existing["question_id"]
-        existing_wrong = _wrong_combos(existing)
-        if existing_wrong:
-            combined = _wrong_combos(merged)
-            for combo in existing_wrong:
-                if combo not in combined:
-                    combined.append(combo)
-            merged["wrong_options"] = combined
+        if not same_record:
+            if not merged.get("question_id") and existing.get("question_id"):
+                merged["question_id"] = existing["question_id"]
+            existing_wrong = _wrong_combos(existing)
+            if existing_wrong:
+                combined = _wrong_combos(merged)
+                for combo in existing_wrong:
+                    if combo not in combined:
+                        combined.append(combo)
+                merged["wrong_options"] = combined
         return merged
 
     def _run(

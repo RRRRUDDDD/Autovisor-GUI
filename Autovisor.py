@@ -879,36 +879,59 @@ async def run_zhidao_assessment_stage(
                     answered += int(vision_stats.get("ok", 0) or 0) + int(
                         vision_stats.get("fill", 0) or 0
                     )
-                if answered == 0 and isinstance(vision_stats, dict) and vision_stats.get("skipped"):
-                    hw_summary["skipped"] += 1
-                    hw_summary["details"].append(
-                        {
-                            "name": exam_name,
-                            "skipped": True,
-                            "reason": vision_stats.get("reason", "no_vision_model"),
-                        }
-                    )
+                if answered == 0:
+                    if isinstance(vision_stats, dict) and vision_stats.get("skipped"):
+                        hw_summary["skipped"] += 1
+                        hw_summary["details"].append(
+                            {
+                                "name": exam_name,
+                                "skipped": True,
+                                "reason": vision_stats.get("reason", "no_vision_model"),
+                            }
+                        )
+                    elif int((vision_stats or {}).get("fail", 0) or 0) > 0:
+                        hw_summary["failed"] += 1
+                        hw_summary["details"].append(
+                            {
+                                "name": exam_name,
+                                "ok": False,
+                                "reason": "vision_failed",
+                            }
+                        )
+                        logger.warn(
+                            f"[{idx}/{total_hw}] 作业「{exam_name}」视觉补答失败 "
+                            f"(失败 {int((vision_stats or {}).get('fail', 0) or 0)} 题)."
+                        )
+                        logger.event(
+                            "知到作业",
+                            状态="失败",
+                            名称=exam_name,
+                            序号=f"{idx}/{total_hw}",
+                            原因="vision_failed",
+                        )
+                    else:
+                        hw_summary["skipped"] += 1
+                        hw_summary["details"].append(
+                            {"name": exam_name, "skipped": True, "reason": "no_questions"}
+                        )
                     continue
-                if answered == 0 and not stats.get("needs_vision"):
-                    hw_summary["skipped"] += 1
-                    hw_summary["details"].append(
-                        {"name": exam_name, "skipped": True, "reason": "no_questions"}
-                    )
-                    continue
+                submitted = bool(stats.get("submitted")) or bool(
+                    isinstance(vision_stats, dict) and vision_stats.get("submitted")
+                )
                 hw_summary["done"] += 1
                 hw_summary["details"].append(
                     {
                         "name": exam_name,
                         "ok": True,
                         "answered": answered,
-                        "submitted": bool(stats.get("submitted")),
+                        "submitted": submitted,
                         "score": stats.get("score"),
                         "needs_vision": bool(stats.get("needs_vision")),
                     }
                 )
                 logger.info(
                     f"[{idx}/{total_hw}] 作业「{exam_name}」完成: "
-                    f"作答 {answered} 题, 已提交={bool(stats.get('submitted'))}, "
+                    f"作答 {answered} 题, 已提交={submitted}, "
                     f"得分={stats.get('score')}"
                 )
                 logger.event(
@@ -917,7 +940,7 @@ async def run_zhidao_assessment_stage(
                     名称=exam_name,
                     序号=f"{idx}/{total_hw}",
                     作答=answered,
-                    已交卷=bool(stats.get("submitted")),
+                    已交卷=submitted,
                     得分=stats.get("score"),
                 )
         logger.event(
@@ -1051,35 +1074,58 @@ async def run_zhidao_assessment_stage(
                     answered += int(vision_stats.get("ok", 0) or 0) + int(
                         vision_stats.get("fill", 0) or 0
                     )
-                if answered == 0 and isinstance(vision_stats, dict) and vision_stats.get("skipped"):
-                    exam_summary["skipped"] += 1
-                    exam_summary["details"].append(
-                        {
-                            "name": exam_name,
-                            "skipped": True,
-                            "reason": vision_stats.get("reason", "no_vision_model"),
-                        }
-                    )
+                if answered == 0:
+                    if isinstance(vision_stats, dict) and vision_stats.get("skipped"):
+                        exam_summary["skipped"] += 1
+                        exam_summary["details"].append(
+                            {
+                                "name": exam_name,
+                                "skipped": True,
+                                "reason": vision_stats.get("reason", "no_vision_model"),
+                            }
+                        )
+                    elif int((vision_stats or {}).get("fail", 0) or 0) > 0:
+                        exam_summary["failed"] += 1
+                        exam_summary["details"].append(
+                            {
+                                "name": exam_name,
+                                "ok": False,
+                                "reason": "vision_failed",
+                            }
+                        )
+                        logger.warn(
+                            f"[{idx}/{total_ex}] 考试「{exam_name}」视觉补答失败 "
+                            f"(失败 {int((vision_stats or {}).get('fail', 0) or 0)} 题)."
+                        )
+                        logger.event(
+                            "知到考试",
+                            状态="失败",
+                            名称=exam_name,
+                            序号=f"{idx}/{total_ex}",
+                            原因="vision_failed",
+                        )
+                    else:
+                        exam_summary["skipped"] += 1
+                        exam_summary["details"].append(
+                            {"name": exam_name, "skipped": True, "reason": "no_questions"}
+                        )
                     continue
-                if answered == 0 and not stats.get("needs_vision"):
-                    exam_summary["skipped"] += 1
-                    exam_summary["details"].append(
-                        {"name": exam_name, "skipped": True, "reason": "no_questions"}
-                    )
-                    continue
+                submitted = bool(stats.get("submitted")) or bool(
+                    isinstance(vision_stats, dict) and vision_stats.get("submitted")
+                )
                 exam_summary["done"] += 1
                 exam_summary["details"].append(
                     {
                         "name": exam_name,
                         "ok": True,
                         "answered": answered,
-                        "submitted": bool(stats.get("submitted")),
+                        "submitted": submitted,
                         "needs_vision": bool(stats.get("needs_vision")),
                     }
                 )
                 logger.info(
                     f"[{idx}/{total_ex}] 考试「{exam_name}」完成: "
-                    f"作答 {answered} 题, 已交卷={bool(stats.get('submitted'))}"
+                    f"作答 {answered} 题, 已交卷={submitted}"
                 )
                 logger.event(
                     "知到考试",
@@ -1087,7 +1133,7 @@ async def run_zhidao_assessment_stage(
                     名称=exam_name,
                     序号=f"{idx}/{total_ex}",
                     作答=answered,
-                    已交卷=bool(stats.get("submitted")),
+                    已交卷=submitted,
                 )
         logger.event(
             "知到考试汇总",

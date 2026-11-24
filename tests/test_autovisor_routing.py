@@ -652,6 +652,97 @@ class ZhidaoSharedCourseAssessmentTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(summary["homework"]["done"], 1)
         self.assertEqual(hw_worker.run.call_count, 2)
 
+    async def test_assessment_stage_merges_vision_submitted_and_counts_vision_failures(self):
+        logger = MagicMock()
+        page = MagicMock()
+        page.url = CATALOG_URL
+        page.goto = AsyncMock()
+        page.reload = AsyncMock()
+        page.wait_for_timeout = AsyncMock()
+        client = MagicMock()
+        client.session = MagicMock()
+
+        hw_worker = MagicMock()
+        hw_worker.scan.side_effect = [
+            [
+                {"studentExamId": "S1", "examId": "E1", "examName": "图文提交作业", "courseId": "C1"},
+                {"studentExamId": "S2", "examId": "E2", "examName": "全失败图片作业", "courseId": "C1"},
+            ],
+            [],
+        ]
+        hw_worker.run.side_effect = [
+            {"answered": 1, "submitted": False, "score": None, "needs_vision": True},
+            {"answered": 0, "submitted": False, "score": None, "needs_vision": True},
+        ]
+
+        exam_worker = MagicMock()
+        exam_worker.scan.return_value = [
+            {
+                "studentExamId": "ES1",
+                "examId": "EE1",
+                "examName": "图文期末考",
+                "courseId": "C1",
+                "studentStartTime": "2026-11-24 08:00:00",
+            },
+            {
+                "studentExamId": "ES2",
+                "examId": "EE2",
+                "examName": "全失败期末考",
+                "courseId": "C1",
+                "studentStartTime": "2026-11-24 08:00:00",
+            },
+        ]
+        exam_worker.run.side_effect = [
+            {"answered": 2, "submitted": False, "skipped": False, "needs_vision": True},
+            {"answered": 0, "submitted": False, "skipped": False, "needs_vision": True},
+        ]
+
+        vision_returns = [
+            {"ok": 1, "fill": 0, "fail": 0, "submitted": True},
+            {"ok": 0, "fill": 0, "fail": 2, "submitted": False},
+            {"ok": 1, "fill": 0, "fail": 0, "submitted": True},
+            {"ok": 0, "fill": 0, "fail": 1, "submitted": False},
+        ]
+        vision_mock = AsyncMock(side_effect=vision_returns)
+        cfg = _config(enableHomeworkApi=True, enableFormalExamApi=True)
+        with (
+            patch.object(Autovisor, "build_page_zhs_client", AsyncMock(return_value=client)),
+            patch.object(
+                Autovisor,
+                "resolve_zhidao_course_meta",
+                return_value={"recruitId": "R1", "courseId": "C1", "schoolId": "SCH"},
+            ),
+            patch("modules.zhidao_homework_worker.ZhidaoHomeworkWorker", return_value=hw_worker),
+            patch("modules.zhidao_exam_worker.ZhidaoExamWorker", return_value=exam_worker),
+            patch.object(Autovisor.quiz_page.llm, "conf", return_value={"auto_submit": True}),
+            patch.object(Autovisor.quiz_page.llm, "enabled", return_value=True),
+            patch.object(Autovisor.quiz_page.llm, "vision_enabled", return_value=True),
+            patch.object(Autovisor.homework, "auto_answer_homework", vision_mock),
+        ):
+            summary = await Autovisor.run_zhidao_assessment_stage(
+                page,
+                CATALOG_URL,
+                {"kind": "course", "recruitAndCourseId": "abc"},
+                cfg,
+                logger,
+            )
+
+        self.assertEqual(summary["homework"]["done"], 1)
+        self.assertEqual(summary["homework"]["failed"], 1)
+        self.assertEqual(summary["homework"]["skipped"], 0)
+        self.assertTrue(summary["homework"]["details"][0]["submitted"])
+        self.assertEqual(summary["homework"]["details"][0]["answered"], 2)
+        self.assertFalse(summary["homework"]["details"][1]["ok"])
+        self.assertEqual(summary["homework"]["details"][1]["reason"], "vision_failed")
+
+        self.assertEqual(summary["exam"]["done"], 1)
+        self.assertEqual(summary["exam"]["failed"], 1)
+        self.assertEqual(summary["exam"]["skipped"], 0)
+        self.assertTrue(summary["exam"]["details"][0]["submitted"])
+        self.assertEqual(summary["exam"]["details"][0]["answered"], 3)
+        self.assertFalse(summary["exam"]["details"][1]["ok"])
+        self.assertEqual(summary["exam"]["details"][1]["reason"], "vision_failed")
+
     async def test_main_triggers_zhidao_assessment_after_catalog_completed(self):
         from modules.course_runner import CourseOutcome
 

@@ -101,7 +101,7 @@ class HybridRoutingTests(unittest.IsolatedAsyncioTestCase):
         ):
             with patch.object(homework.llm, "vision_enabled", return_value=False):
                 stats = await homework.auto_answer_homework(_FakePage(), config=None)
-        self.assertEqual(stats, {"ok": 0, "fill": 0, "fail": 0})
+        self.assertEqual(stats, {"ok": 0, "fill": 0, "fail": 0, "submitted": False})
 
     async def test_disabled_api_flag_skips_encrypted_route(self):
         config = types.SimpleNamespace(
@@ -113,7 +113,7 @@ class HybridRoutingTests(unittest.IsolatedAsyncioTestCase):
             with patch.object(homework.llm, "vision_enabled", return_value=False):
                 stats = await homework.auto_answer_homework(_FakePage(), config=config)
         api_call.assert_not_awaited()
-        self.assertEqual(stats, {"ok": 0, "fill": 0, "fail": 0})
+        self.assertEqual(stats, {"ok": 0, "fill": 0, "fail": 0, "submitted": False})
 
     async def test_captcha_settles_then_retries_api(self):
         from modules.zhs_api import CaptchaRequiredError
@@ -194,10 +194,48 @@ class HybridRoutingTests(unittest.IsolatedAsyncioTestCase):
         ):
             stats = await homework.auto_answer_homework(_VisualPage(), config=config)
 
-        self.assertEqual(stats, {"ok": 0, "fill": 0, "fail": 0})
+        self.assertEqual(stats, {"ok": 0, "fill": 0, "fail": 0, "submitted": True})
         # seen 已计满 total=2，不应误判 stuck=True 而取消自动提交
         save_or_submit.assert_awaited_once()
         self.assertTrue(save_or_submit.await_args.args[1])
+
+    async def test_visual_loop_sets_submitted_false_when_stuck(self):
+        class _DummyQuestion:
+            def __init__(self, sig, answered):
+                self.sig = sig
+                self.answered = answered
+
+        class _VisualPage:
+            url = (
+                "https://onlineexamh5new.zhihuishu.com/stuExamWeb.html"
+                "#/webExamList/dohomework/458533/tok1/tok2/1000013343/1847/0"
+            )
+
+            async def wait_for_load_state(self, *_args, **_kwargs):
+                return None
+
+        q1 = _DummyQuestion("sig-1", True)
+        save_or_submit = AsyncMock()
+        config = types.SimpleNamespace(
+            enableHomeworkApi=False, enableFormalExamApi=False, proxy=""
+        )
+        with (
+            patch.object(homework.llm, "vision_enabled", return_value=True),
+            patch.object(homework.llm, "vision_label", return_value="test-vl"),
+            patch.object(homework.llm, "conf", return_value={"auto_submit": True}),
+            patch.object(homework, "_wait_question", new=AsyncMock(return_value=q1)),
+            patch.object(homework, "_visible_question", new=AsyncMock(return_value=q1)),
+            patch.object(homework, "_signature", new=AsyncMock(return_value="sig-1")),
+            patch.object(homework, "_has_answer", new=AsyncMock(return_value=True)),
+            patch.object(homework, "_question_total", new=AsyncMock(return_value=5)),
+            patch.object(homework, "_goto_next", new=AsyncMock(return_value=(False, True))),
+            patch.object(homework, "_save_or_submit", new=save_or_submit),
+        ):
+            stats = await homework.auto_answer_homework(_VisualPage(), config=config)
+
+        self.assertEqual(stats, {"ok": 0, "fill": 0, "fail": 0, "submitted": False})
+        save_or_submit.assert_awaited_once()
+        self.assertFalse(save_or_submit.await_args.args[1])
 
     async def test_skip_api_goes_straight_to_vision_without_calling_api(self):
         api_call = AsyncMock()
@@ -212,7 +250,7 @@ class HybridRoutingTests(unittest.IsolatedAsyncioTestCase):
                 _FakePage(), config=config, skip_api=True
             )
         api_call.assert_not_awaited()
-        self.assertEqual(stats, {"ok": 0, "fill": 0, "fail": 0})
+        self.assertEqual(stats, {"ok": 0, "fill": 0, "fail": 0, "submitted": False})
 
     async def test_settle_captcha_reloads_when_not_visible_and_exits_after_appear_timeout(self):
         class _Clock:

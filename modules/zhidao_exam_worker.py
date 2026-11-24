@@ -217,14 +217,24 @@ class ZhidaoExamWorker(ZhidaoHomeworkWorker):
         if not questions:
             logger.warn(f"考试「{exam_name or exam_id}」未获取到题目, 跳过.")
             return stats
-        if any(question_has_image(question) for question in questions):
-            logger.warn("考试含图片题, 回退视觉模型逐题作答.")
+
+        text_questions = [q for q in questions if not question_has_image(q)]
+        if len(text_questions) < len(questions):
             stats["needs_vision"] = True
+            stats["image_questions"] = len(questions) - len(text_questions)
+            logger.warn(
+                f"考试含 {stats['image_questions']} 道图片题, 先接口保存其余 "
+                f"{len(text_questions)} 道纯文本题, 图片题回退视觉模型."
+            )
+            questions = text_questions
+        if not questions:
             return stats
 
         exam_key = str(exam_id)
         for question in questions:
-            row = self._remember_question(question, exam_key, course_id=course_id)
+            existing = self._find_row(question, exam_key, course_id=course_id)
+            remembered = self._remember_question(question, exam_key, course_id=course_id)
+            row = self._merge_row(remembered, existing)
             values, source = self._answer_question(question, row)
             if source in ("题库", "随机", "排除法"):
                 self.sleep(random.uniform(1.5, 3.0))
@@ -245,6 +255,9 @@ class ZhidaoExamWorker(ZhidaoHomeworkWorker):
 
         if not self.auto_submit:
             logger.info("考试答案已保存, 请手动交卷 (data/llm.json 中 auto_submit=true 可自动交卷).")
+            return stats
+        if stats["needs_vision"]:
+            logger.info("存在图片题, 本次不自动交卷; 等待视觉流程补答后再处理.")
             return stats
 
         result = self.api.submit(

@@ -216,8 +216,98 @@ class ExamWorkerTests(unittest.TestCase):
             school_id="9",
         )
         self.assertTrue(stats["needs_vision"])
+        self.assertEqual(stats["image_questions"], 1)
         self.assertEqual(api.saved, [])
         self.assertEqual(api.submit_calls, [])
+
+    def test_mixed_text_and_image_questions_saves_text_and_skips_submit(self):
+        api = FakeExamApi(
+            [],
+            questions=[
+                _question(eid="q_txt1", content="1+1=?", options=((11, "1"), (12, "2"))),
+                _question(eid="q_img", content='<img src="https://cdn.example/fig.png">'),
+                _question(eid="q_txt2", content="2+2=?", options=((21, "3"), (22, "4"))),
+            ],
+        )
+        prompts = []
+
+        def fake_answerer(prompt):
+            prompts.append(prompt)
+            if "1+1=?" in prompt:
+                return _ids(12)
+            return _ids(22)
+
+        worker = self._worker(api, answerer=fake_answerer, auto_submit=True)
+        stats = worker.run(
+            recruit_id="R1",
+            course_id="C1",
+            exam_id="E_MIX",
+            student_exam_id="S_MIX",
+            school_id="9",
+        )
+        self.assertTrue(stats["needs_vision"])
+        self.assertEqual(stats["image_questions"], 1)
+        self.assertEqual(stats["answered"], 2)
+        self.assertFalse(stats["submitted"])
+        self.assertEqual([item["eid"] for item in api.saved], ["q_txt1", "q_txt2"])
+        self.assertEqual([item["answer"] for item in api.saved], ["12", "22"])
+        self.assertEqual(api.submit_calls, [])
+        self.assertEqual(len(prompts), 2)
+
+    def test_cross_exam_course_bank_hit_skips_llm(self):
+        # 章节作业 hw-1 已入库两道题的正确答案（分别演示选项哈希命中与题干命中）
+        self.store.save_options_by_id(
+            "C1",
+            "hw-1",
+            "hw_q1",
+            [{"id": "101", "content": "甲"}, {"id": "102", "content": "乙"}],
+            question_type="1",
+            content="旧作业题干A",
+        )
+        self.store.mark_correct("C1", "hw-1", question_id="hw_q1", correct_options=["102"])
+
+        self.store.save_options_by_id(
+            "C1",
+            "hw-1",
+            "hw_q2",
+            [],
+            question_type="3",
+            content="光在真空中的速度符号是？",
+        )
+        self.store.mark_correct("C1", "hw-1", question_id="hw_q2", correct_options=["c"])
+
+        api = FakeExamApi(
+            [],
+            questions=[
+                _question(
+                    eid="final_eid_1",
+                    content="期末略有改写但选项ID相同",
+                    options=((101, "甲"), (102, "乙")),
+                ),
+                {
+                    "eid": "final_eid_2",
+                    "id": "final_eid_2",
+                    "name": "光在真空中的速度符号是？",
+                    "questionType": {"id": 3},
+                    "questionOptions": [],
+                },
+            ],
+        )
+
+        def boom(_prompt):
+            raise AssertionError("跨测验命中同课程题库时不应重复请求 LLM")
+
+        worker = self._worker(api, answerer=boom, auto_submit=True)
+        stats = worker.run(
+            recruit_id="R1",
+            course_id="C1",
+            exam_id="final-1",
+            student_exam_id="S_FINAL",
+            school_id="9",
+        )
+        self.assertEqual(stats["answered"], 2)
+        self.assertTrue(stats["submitted"])
+        self.assertEqual([item["answer"] for item in api.saved], ["102", "c"])
 
     def test_captcha_message_raises_captcha_required(self):
         from modules.zhs_api import CaptchaRequiredError

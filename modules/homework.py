@@ -623,7 +623,7 @@ async def _try_zhidao_api(page, config, params: dict) -> dict:
 
 async def auto_answer_homework(page, config=None, *, skip_api: bool = False) -> dict:
     """对当前智慧树作业/考试页作答; 接口明文优先, 视觉模型兜底。"""
-    stats = {"ok": 0, "fill": 0, "fail": 0}
+    stats = {"ok": 0, "fill": 0, "fail": 0, "submitted": False}
 
     params = {}
     if not skip_api:
@@ -796,9 +796,11 @@ async def auto_answer_homework(page, config=None, *, skip_api: bool = False) -> 
     if stuck and auto_submit:
         logger.warn("检测到翻页停滞, 为避免误提交, 本次只暂存答案, 请人工检查后手动提交.")
         await _save_or_submit(page, False)
+        stats["submitted"] = False
     else:
         await _save_or_submit(page, auto_submit)
-    logger.event("作业答题汇总", **stats, 自动提交=auto_submit, 已提交=auto_submit and not stuck)
+        stats["submitted"] = bool(auto_submit and not stuck)
+    logger.event("作业答题汇总", **stats, 自动提交=auto_submit, 已提交=stats["submitted"])
     return stats
 
 

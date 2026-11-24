@@ -966,6 +966,39 @@ class HomeworkScanTests(unittest.TestCase):
             )
         )
 
+    def test_cross_exam_fallback_reuses_analysis_without_leaking_wrong_options(self):
+        # hw-old 记录了 wrong_options=["999"] 与 ai_analysis，但未记录 correct_options
+        self.store.save_options_by_id(
+            "C1",
+            "hw-old",
+            "old_q1",
+            [{"id": "999", "content": "旧A"}, {"id": "998", "content": "旧B"}],
+            question_type="1",
+            content="同课程跨卷复用题干",
+        )
+        self.store.record_wrong("C1", "hw-old", question_id="old_q1", wrong_options=["999"])
+        self.store.mark_correct(
+            "C1",
+            "hw-old",
+            question_id="old_q1",
+            correct_options=[],
+            ai_analysis="选第二项因为能量守恒",
+            auto_clear_wrong=False,
+        )
+
+        # 新测验中选项 ID 不同（11/12），只应复用 ai_analysis，不应混入旧 wrong_options=["999"]
+        new_q = _normalized("new_eid", 1, "同课程跨卷复用题干", ((11, "新A"), (12, "新B")))
+        worker = ZhidaoHomeworkWorker(
+            FakeHomeworkApi(_payload(), [100]),
+            course_id="C1",
+            store=self.store,
+            sleep=lambda _: None,
+        )
+        found = worker._find_row(new_q, "hw-new", "C1")
+        self.assertIsNotNone(found)
+        self.assertEqual(found.get("ai_analysis"), "选第二项因为能量守恒")
+        self.assertEqual(found.get("wrong_options"), [])
+
 
 if __name__ == "__main__":
     unittest.main()
