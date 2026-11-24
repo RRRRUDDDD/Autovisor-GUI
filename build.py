@@ -76,6 +76,12 @@ shutil.copyfile(
     os.path.join(ROOT, "resources", "stealth.min.js"),
     os.path.join(dist_resources, "stealth.min.js"),
 )
+llm_providers_src = os.path.join(ROOT, "resources", "llm_providers.json")
+if os.path.isfile(llm_providers_src):
+    shutil.copyfile(
+        llm_providers_src,
+        os.path.join(dist_resources, "llm_providers.json"),
+    )
 src_scripts = os.path.join(ROOT, "resources", "scripts")
 if os.path.isdir(src_scripts):
     shutil.copytree(src_scripts, os.path.join(dist_resources, "scripts"), dirs_exist_ok=True)

@@ -262,10 +262,75 @@ class ConfigTests(unittest.TestCase):
                 new_mtime = (config._config_mtime or 0.0) + 5.0
                 os.utime(config_path, (new_mtime, new_mtime))
 
+                # Within 2s throttle window, hot-path property reads skip stat()
+                self.assertEqual(config.limitSpeed, 1.2)
+                self.assertEqual(spy.call_count, 0)
+
+                # Once >= 2s elapsed, _reload_if_changed stats and reloads once
+                config._last_reload_check -= config._reload_check_interval + 0.1
                 self.assertEqual(config.limitSpeed, 1.5)
                 self.assertEqual(config.limitMaxTime, 45.0)
                 self.assertEqual(config.masteryTarget, 80.0)
                 self.assertEqual(spy.call_count, 1)
+
+    def test_bool_parsing_log_int_types_and_template_alignment(self):
+        from modules.configs import CONFIG_TEMPLATE
+        from modules.course_fetcher import classify_course_url
+        from modules.llm import infer_provider, SUPPORTED_API_FORMATS
+
+        with tempfile.TemporaryDirectory() as directory:
+            config_path = os.path.join(directory, "config.ini")
+            mirrors_path = os.path.join(directory, "mirrors.json")
+            with open(mirrors_path, "w", encoding="utf-8") as file:
+                file.write('{"primary":"https://mirror.example/simple"}')
+            with open(config_path, "w", encoding="utf-8") as file:
+                file.write(
+                    "[user-account]\nusername=\npassword=\nqrLogin=1\nqrTerminal=yes\n"
+                    "[browser-option]\ndriver=chrome\nEXE_PATH=\n"
+                    "[script-option]\nenableAutoCaptcha=yes\nenableHideWindow=0\n"
+                    "enableDebugLog=1\nlog_max_size_mb=12\nlog_retention_days=0\n"
+                    "log_max_files=150\nlog_compress_after_days=0\n"
+                    "[course-option]\nsoundOff=no\nreviewMode=1\n"
+                    "homeworkThreshold=120\nhomeworkMaxRedo=-5\n"
+                    "[course-url]\nURL1=\n"
+                )
+            cfg = Config(config_path, mirrors_path)
+            self.assertTrue(cfg.qr_login)
+            self.assertTrue(cfg.qr_terminal)
+            self.assertTrue(cfg.enableAutoCaptcha)
+            self.assertFalse(cfg.enableHideWindow)
+            self.assertTrue(cfg.enableDebugLog)
+            self.assertFalse(cfg.soundOff)
+            self.assertTrue(cfg.reviewMode)
+            self.assertIs(type(cfg.log_max_size_mb), int)
+            self.assertIs(type(cfg.log_retention_days), int)
+            self.assertIs(type(cfg.log_max_files), int)
+            self.assertIs(type(cfg.log_compress_after_days), int)
+            self.assertEqual(cfg.log_max_size_mb, 12)
+            self.assertEqual(cfg.log_retention_days, 0)
+            self.assertEqual(cfg.log_max_files, 150)
+            self.assertEqual(cfg.log_compress_after_days, 0)
+            self.assertEqual(cfg.homeworkThreshold, 100.0)
+            self.assertEqual(cfg.homeworkMaxRedo, 3)
+
+        self.assertIn("attachExistingChrome = False", CONFIG_TEMPLATE)
+        self.assertIn("cdpUrl = http://127.0.0.1:9222", CONFIG_TEMPLATE)
+        self.assertIn("enableDebugLog = False", CONFIG_TEMPLATE)
+        self.assertEqual(
+            classify_course_url("https://zhihuishu.com/#/dohomework/1/2/3/4/5"),
+            "知到作业",
+        )
+        self.assertEqual(
+            classify_course_url("https://zhihuishu.com/#/doexam/1/2/3/4/5"),
+            "知到考试",
+        )
+        self.assertEqual(
+            classify_course_url("https://ai-smart-course-student-pro.zhihuishu.com/testDetail/1/2/3/4"),
+            "AI 测试详情",
+        )
+        self.assertIn("openai-responses", SUPPORTED_API_FORMATS)
+        self.assertEqual(infer_provider("https://api.deepseek.com", "openai"), "deepseek")
+        self.assertEqual(infer_provider("https://custom.relay.example", "anthropic"), "anthropic")
 
 
 

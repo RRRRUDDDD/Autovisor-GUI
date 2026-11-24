@@ -68,6 +68,7 @@ def main():
     os.makedirs(res_dir, exist_ok=True)
     bundled_files = (
         (os.path.join(ROOT, "resources", "stealth.min.js"), os.path.join(res_dir, "stealth.min.js")),
+        (os.path.join(ROOT, "resources", "llm_providers.json"), os.path.join(res_dir, "llm_providers.json")),
         (os.path.join(ROOT, "data", "mirrors.json"), os.path.join(res_dir, "mirrors.json")),
         (os.path.join(ROOT, "config.ini.example"), os.path.join(res_dir, "config.ini.example")),
     )

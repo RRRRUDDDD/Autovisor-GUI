@@ -4,9 +4,14 @@ import json
 import os
 import re
 import sys
+import time
 
 
 from modules.http_utils import normalize_proxy_url
+from modules.paths import (
+    find_bundled_resource_file as _paths_find_bundled_resource_file,
+    get_runtime_root as _paths_get_runtime_root,
+)
 
 
 class ConfigError(Exception):
@@ -14,9 +19,13 @@ class ConfigError(Exception):
 
 
 class Config:
+    _RELOAD_CHECK_INTERVAL = 2.0
+
     def __init__(self, config_path=None, mirrors_path=None):
         self.config_path = config_path
         self._config_mtime: float | None = None
+        self._last_reload_check: float = 0.0
+        self._reload_check_interval: float = self._RELOAD_CHECK_INTERVAL
         self._override_limit_max_time = None
         self._override_limit_speed = None
         self.proxy = ""
@@ -58,11 +67,11 @@ class Config:
             self.enableHideWindow = self.get_bool_field('script-option', 'enableHideWindow', fallback=True)
             self.shutdownOnComplete = self.get_bool_field('script-option', 'shutdownOnComplete', fallback=False)
             self.enableDebugLog = self.get_bool_field('script-option', 'enableDebugLog', fallback=False)
-            # 日志生产化选项(体积轮转/保留期/文件数/压缩归档)
-            self.log_max_size_mb = self._safe_get_float('script-option', 'log_max_size_mb', 10.0)
-            self.log_retention_days = self._safe_get_float('script-option', 'log_retention_days', 14.0)
-            self.log_max_files = int(self._safe_get_float('script-option', 'log_max_files', 200.0))
-            self.log_compress_after_days = self._safe_get_float('script-option', 'log_compress_after_days', 3.0)
+            # 日志生产化选项(体积轮转/保留期/文件数/压缩归档, 与 Rust config_ini.rs 保持整数类型与边界一致)
+            self.log_max_size_mb = self._safe_get_int('script-option', 'log_max_size_mb', 10, min_value=1)
+            self.log_retention_days = self._safe_get_int('script-option', 'log_retention_days', 14, min_value=0)
+            self.log_max_files = self._safe_get_int('script-option', 'log_max_files', 200, min_value=1)
+            self.log_compress_after_days = self._safe_get_int('script-option', 'log_compress_after_days', 3, min_value=0)
             # 远程消息推送选项(可选配置段；未显式配置时默认启用 Windows 系统通知)
             has_provider_option = self._config.has_option('notification', 'provider')
             raw_provider = self._config.get('notification', 'provider', raw=True, fallback='').strip()
@@ -102,8 +111,11 @@ class Config:
             # 答题时遇到已有保存答案的题目是否强制重新作答 (默认关闭)
             self.forceRedoAnswered = self.get_bool_field('course-option', 'forceRedoAnswered', fallback=False)
             # 知到作业: 达标得分率与单份最大重做次数 (0=使用默认轮次)
-            self.homeworkThreshold = self._safe_get_float('course-option', 'homeworkThreshold', 100.0)
-            self.homeworkMaxRedo = int(self._safe_get_float('course-option', 'homeworkMaxRedo', 3.0))
+            self.homeworkThreshold = min(
+                max(self._safe_get_float('course-option', 'homeworkThreshold', 100.0), 0.0),
+                100.0,
+            )
+            self.homeworkMaxRedo = self._safe_get_int('course-option', 'homeworkMaxRedo', 3, min_value=0)
             self.course_match_rule = re.compile("https://[-A-Za-z0-9+&@#/%?=~_|!:,.;]+[-A-Za-z0-9+&@#/%=~_|]")
             self.course_urls = self.get_course_urls()
         # 登录
@@ -141,10 +153,19 @@ class Config:
             self._config_mtime = os.path.getmtime(self.config_path)
         except OSError:
             self._config_mtime = None
+        self._last_reload_check = time.monotonic()
 
     def _reload_if_changed(self) -> None:
         if not self.config_path:
             return
+        now = time.monotonic()
+        if (
+            self._reload_check_interval > 0
+            and self._last_reload_check > 0
+            and (now - self._last_reload_check) < self._reload_check_interval
+        ):
+            return
+        self._last_reload_check = now
         try:
             current_mtime = os.path.getmtime(self.config_path)
         except OSError:
@@ -183,11 +204,12 @@ class Config:
         return driver.lower()
 
     def get_bool_field(self, section: str, option: str, fallback: bool = False) -> bool:
-        field = self._config.get(section, option, raw=True, fallback=str(fallback)).strip().lower()
-        if field == "true":
+        field = self._config.get(section, option, raw=True, fallback="").strip().lower()
+        if field in ("true", "1", "yes"):
             return True
-        else:
+        if field in ("false", "0", "no"):
             return False
+        return bool(fallback)
 
     def get_course_urls(self) -> list:
         course_urls = []
@@ -213,6 +235,25 @@ class Config:
             if not value:
                 return default
             return float(value)
+        except (ValueError, configparser.Error):
+            return default
+
+    def _safe_get_int(
+        self,
+        section: str,
+        option: str,
+        default: int = 0,
+        *,
+        min_value: int | None = None,
+    ) -> int:
+        try:
+            value = self._config.get(section, option, raw=True, fallback='').strip()
+            if not value:
+                return default
+            num = int(float(value))
+            if min_value is not None and num < min_value:
+                return default
+            return num
         except (ValueError, configparser.Error):
             return default
 
@@ -302,6 +343,9 @@ driver = Edge
 EXE_PATH =
 ;可选: 配置代理服务器(支持 http:// / https:// / socks5://, 留空直连)
 proxy =
+;可选: 复用已开启远程调试端口的本机浏览器(默认:False)
+attachExistingChrome = False
+cdpUrl = http://127.0.0.1:9222
 
 [script-option]
 ;是否自动过验证码(登录滑块[易盾/腾讯] / 课中点选, 默认:True)
@@ -310,6 +354,8 @@ enableAutoCaptcha = True
 enableHideWindow = True
 ;刷课任务完成后自动关机(默认:False, 仅正常完成或达到课程时限时倒计时60秒关机, 手动停止/出错不关机)
 shutdownOnComplete = False
+;是否在桌面端实时输出 DEBUG 调试日志(默认:False)
+enableDebugLog = False
 ;单份日志体积上限/MB, 超限自动切换到下一个日志文件 (默认:10)
 log_max_size_mb = 10
 ;日志保留天数, 启动时清理超期文件 (默认:14, 0=不按天清理)
@@ -407,28 +453,11 @@ DEFAULT_MIRRORS = {
 
 
 def _runtime_root():
-    override = os.environ.get("AUTOVISOR_DATA_DIR", "").strip()
-    if override:
-        return os.path.abspath(override)
-    if getattr(sys, "frozen", False):
-        return os.path.dirname(sys.executable)
-    return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    return _paths_get_runtime_root()
 
 
 def _bundled_resource_file(filename: str) -> str | None:
-    res_override = os.environ.get("AUTOVISOR_RESOURCES_DIR", "").strip()
-    candidates = []
-    if res_override:
-        base = os.path.abspath(res_override)
-        candidates.append(os.path.join(base, filename))
-        candidates.append(os.path.join(base, "resources", filename))
-    if getattr(sys, "frozen", False):
-        exe_dir = os.path.dirname(sys.executable)
-        candidates.append(os.path.join(exe_dir, "resources", filename))
-    for path in candidates:
-        if os.path.isfile(path):
-            return path
-    return None
+    return _paths_find_bundled_resource_file(filename)
 
 
 def ensure_config_files(config_path: str) -> list:

@@ -87,6 +87,40 @@ fn default_log_compress_after_days() -> i64 {
     3
 }
 
+const LLM_PROVIDERS_JSON: &str = include_str!("../../../resources/llm_providers.json");
+
+#[derive(Debug, Deserialize)]
+struct LlmFormatMeta {
+    id: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LlmProviderMeta {
+    id: String,
+    #[serde(default)]
+    match_hosts: Vec<String>,
+    #[serde(default)]
+    match_formats: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LlmProviderCatalog {
+    #[serde(default)]
+    api_formats: Vec<LlmFormatMeta>,
+    #[serde(default)]
+    providers: Vec<LlmProviderMeta>,
+}
+
+fn llm_provider_catalog() -> &'static LlmProviderCatalog {
+    static CATALOG: std::sync::OnceLock<LlmProviderCatalog> = std::sync::OnceLock::new();
+    CATALOG.get_or_init(|| {
+        serde_json::from_str::<LlmProviderCatalog>(LLM_PROVIDERS_JSON)
+            .expect("embedded resources/llm_providers.json must be valid JSON")
+    })
+}
+
 pub fn infer_llm_api_format(api_base: &str, provider: &str) -> String {
     let prov = provider.trim().to_ascii_lowercase();
     match prov.as_str() {
@@ -117,52 +151,26 @@ pub fn infer_llm_api_format(api_base: &str, provider: &str) -> String {
 pub fn infer_llm_provider(api_base: &str, api_format: &str) -> String {
     let base = api_base.trim().to_ascii_lowercase();
     let fmt = api_format.trim().to_ascii_lowercase();
-    if base.contains("api.deepseek.com") {
-        "deepseek"
-    } else if base.contains("api.openai.com") {
-        "openai"
-    } else if base.contains("anthropic.com") || fmt == "anthropic" {
-        "anthropic"
-    } else if base.contains("generativelanguage.googleapis.com") || fmt == "gemini" {
-        "gemini"
-    } else if base.contains("dashscope.aliyuncs.com") {
-        "qwen"
-    } else if base.contains("open.bigmodel.cn") {
-        "zhipu"
-    } else if base.contains("api.moonshot.cn") || base.contains("api.moonshot.ai") {
-        "moonshot"
-    } else if base.contains("volces.com") {
-        "doubao"
-    } else if base.contains("siliconflow.cn") || base.contains("siliconflow.com") {
-        "siliconflow"
-    } else if base.contains("hunyuan.cloud.tencent.com") {
-        "hunyuan"
-    } else if base.contains("spark-api-open.xf-yun.com") {
-        "spark"
-    } else if base.contains("qianfan.baidubce.com") {
-        "qianfan"
-    } else if base.contains("minimax.chat") || base.contains("minimaxi.com") {
-        "minimax"
-    } else if base.contains("lingyiwanwu.com") {
-        "yi"
-    } else if base.contains("api.x.ai") {
-        "xai"
-    } else if base.contains("api.groq.com") {
-        "groq"
-    } else if base.contains("api.mistral.ai") {
-        "mistral"
-    } else if base.contains("openrouter.ai") {
-        "openrouter"
-    } else if base.contains(".openai.azure.com") || fmt == "azure" {
-        "azure"
-    } else if fmt == "ollama" || base.contains(":11434") {
-        "ollama"
-    } else if base.contains(":1234") {
-        "lmstudio"
-    } else {
-        "custom"
+    let catalog = llm_provider_catalog();
+    for prov in &catalog.providers {
+        if prov
+            .match_hosts
+            .iter()
+            .any(|h| base.contains(&h.to_ascii_lowercase()))
+        {
+            return prov.id.clone();
+        }
     }
-    .to_string()
+    for prov in &catalog.providers {
+        if prov
+            .match_formats
+            .iter()
+            .any(|f| fmt == f.to_ascii_lowercase())
+        {
+            return prov.id.clone();
+        }
+    }
+    "custom".to_string()
 }
 
 fn normalize_positive(value: f64, fallback: f64) -> f64 {
@@ -184,9 +192,14 @@ fn normalize_question_bank_url(raw: &str) -> String {
 
 fn normalize_llm_api_format(raw: &str, api_base: &str, provider: &str) -> String {
     let fmt = raw.trim().to_ascii_lowercase();
-    match fmt.as_str() {
-        "openai" | "openai-responses" | "anthropic" | "gemini" | "azure" | "ollama" => fmt,
-        _ => infer_llm_api_format(api_base, provider),
+    if llm_provider_catalog()
+        .api_formats
+        .iter()
+        .any(|f| f.id.eq_ignore_ascii_case(&fmt))
+    {
+        fmt
+    } else {
+        infer_llm_api_format(api_base, provider)
     }
 }
 
@@ -195,27 +208,27 @@ fn normalize_llm_api_format(raw: &str, api_base: &str, provider: &str) -> String
 pub struct LlmConfig {
     #[serde(default)]
     pub provider: String,
-    #[serde(default)]
+    #[serde(default, alias = "api_format")]
     pub api_format: String,
-    #[serde(default)]
+    #[serde(default, alias = "api_key")]
     pub api_key: String,
-    #[serde(default = "default_llm_api_base")]
+    #[serde(default = "default_llm_api_base", alias = "api_base")]
     pub api_base: String,
     #[serde(default = "default_llm_model")]
     pub model: String,
-    #[serde(default)]
+    #[serde(default, alias = "vision_model")]
     pub vision_model: String,
-    #[serde(default)]
+    #[serde(default, alias = "api_version")]
     pub api_version: String,
-    #[serde(default)]
+    #[serde(default, alias = "auto_submit")]
     pub auto_submit: bool,
-    #[serde(default = "default_stream_timeout")]
+    #[serde(default = "default_stream_timeout", alias = "stream_timeout")]
     pub stream_timeout: f64,
-    #[serde(default = "default_stream_idle_timeout")]
+    #[serde(default = "default_stream_idle_timeout", alias = "stream_idle_timeout")]
     pub stream_idle_timeout: f64,
-    #[serde(default)]
+    #[serde(default, alias = "question_bank_token")]
     pub question_bank_token: String,
-    #[serde(default = "default_question_bank_url")]
+    #[serde(default = "default_question_bank_url", alias = "question_bank_url")]
     pub question_bank_url: String,
 }
 
@@ -238,115 +251,63 @@ impl Default for LlmConfig {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct LlmDiskConfig {
-    #[serde(default)]
-    provider: String,
-    #[serde(default)]
-    api_format: String,
-    #[serde(default)]
-    api_key: String,
-    #[serde(default = "default_llm_api_base")]
-    api_base: String,
-    #[serde(default = "default_llm_model")]
-    model: String,
-    #[serde(default)]
-    vision_model: String,
-    #[serde(default)]
-    api_version: String,
-    #[serde(default)]
-    auto_submit: bool,
-    #[serde(default = "default_stream_timeout")]
-    stream_timeout: f64,
-    #[serde(default = "default_stream_idle_timeout")]
-    stream_idle_timeout: f64,
-    #[serde(default)]
-    question_bank_token: String,
-    #[serde(default = "default_question_bank_url")]
-    question_bank_url: String,
-}
-
-impl From<&LlmConfig> for LlmDiskConfig {
-    fn from(v: &LlmConfig) -> Self {
-        let base_trim = v.api_base.trim();
+impl LlmConfig {
+    pub fn normalized(&self) -> Self {
+        let base_trim = self.api_base.trim();
         let api_base = if base_trim.is_empty() {
             default_llm_api_base()
         } else {
             base_trim.to_string()
         };
-        let model_trim = v.model.trim();
+        let model_trim = self.model.trim();
         let model = if model_trim.is_empty() {
             default_llm_model()
         } else {
             model_trim.to_string()
         };
-        let raw_provider = v.provider.trim().to_ascii_lowercase();
-        let api_format = normalize_llm_api_format(&v.api_format, &api_base, &raw_provider);
+        let raw_provider = self.provider.trim().to_ascii_lowercase();
+        let api_format = normalize_llm_api_format(&self.api_format, &api_base, &raw_provider);
         let provider = if raw_provider.is_empty() {
             infer_llm_provider(&api_base, &api_format)
         } else {
             raw_provider
         };
+        let stream_timeout = normalize_positive(self.stream_timeout, default_stream_timeout());
+        let stream_idle_timeout =
+            normalize_positive(self.stream_idle_timeout, default_stream_idle_timeout())
+                .min(stream_timeout);
         Self {
             provider,
             api_format,
-            api_key: v.api_key.trim().to_string(),
+            api_key: self.api_key.trim().to_string(),
             api_base,
             model,
-            vision_model: v.vision_model.trim().to_string(),
-            api_version: v.api_version.trim().to_string(),
-            auto_submit: v.auto_submit,
-            stream_timeout: normalize_positive(v.stream_timeout, default_stream_timeout()),
-            stream_idle_timeout: normalize_positive(
-                v.stream_idle_timeout,
-                default_stream_idle_timeout(),
-            )
-            .min(normalize_positive(v.stream_timeout, default_stream_timeout())),
-            question_bank_token: v.question_bank_token.trim().to_string(),
-            question_bank_url: normalize_question_bank_url(&v.question_bank_url),
+            vision_model: self.vision_model.trim().to_string(),
+            api_version: self.api_version.trim().to_string(),
+            auto_submit: self.auto_submit,
+            stream_timeout,
+            stream_idle_timeout,
+            question_bank_token: self.question_bank_token.trim().to_string(),
+            question_bank_url: normalize_question_bank_url(&self.question_bank_url),
         }
     }
-}
 
-impl From<LlmDiskConfig> for LlmConfig {
-    fn from(v: LlmDiskConfig) -> Self {
-        let base_trim = v.api_base.trim();
-        let api_base = if base_trim.is_empty() {
-            default_llm_api_base()
-        } else {
-            base_trim.to_string()
-        };
-        let model_trim = v.model.trim();
-        let model = if model_trim.is_empty() {
-            default_llm_model()
-        } else {
-            model_trim.to_string()
-        };
-        let raw_provider = v.provider.trim().to_ascii_lowercase();
-        let api_format = normalize_llm_api_format(&v.api_format, &api_base, &raw_provider);
-        let provider = if raw_provider.is_empty() {
-            infer_llm_provider(&api_base, &api_format)
-        } else {
-            raw_provider
-        };
-        Self {
-            provider,
-            api_format,
-            api_key: v.api_key.trim().to_string(),
-            api_base,
-            model,
-            vision_model: v.vision_model.trim().to_string(),
-            api_version: v.api_version.trim().to_string(),
-            auto_submit: v.auto_submit,
-            stream_timeout: normalize_positive(v.stream_timeout, default_stream_timeout()),
-            stream_idle_timeout: normalize_positive(
-                v.stream_idle_timeout,
-                default_stream_idle_timeout(),
-            )
-            .min(normalize_positive(v.stream_timeout, default_stream_timeout())),
-            question_bank_token: v.question_bank_token.trim().to_string(),
-            question_bank_url: normalize_question_bank_url(&v.question_bank_url),
-        }
+    pub fn to_disk_value(&self) -> serde_json::Value {
+        let norm = self.normalized();
+        serde_json::json!({
+            "provider": norm.provider,
+            "api_format": norm.api_format,
+            "api_key": norm.api_key,
+            "api_base": norm.api_base,
+            "model": norm.model,
+            "vision_model": norm.vision_model,
+            "api_version": norm.api_version,
+            "auto_submit": norm.auto_submit,
+            "stream_timeout": norm.stream_timeout,
+            "stream_idle_timeout": norm.stream_idle_timeout,
+            "question_bank_token": norm.question_bank_token,
+            "question_bank_url": norm.question_bank_url,
+        })
     }
 }
 
@@ -531,7 +492,13 @@ fn is_https_url(raw: &str) -> bool {
 
 fn infer_title(url: &str, idx: usize) -> String {
     let lower = url.to_ascii_lowercase();
-    let kind = if lower.contains("ai-smart-course-student-pro.zhihuishu.com") {
+    let kind = if lower.contains("/dohomework/") {
+        "知到作业"
+    } else if lower.contains("/doexam/") {
+        "知到考试"
+    } else if lower.contains("/testdetail/") {
+        "AI 测试详情"
+    } else if lower.contains("ai-smart-course-student-pro.zhihuishu.com") {
         "AI 智慧课"
     } else if lower.contains("wisdom-mooc.zhihuishu.com") {
         "AI 慕课"
@@ -545,6 +512,18 @@ fn infer_title(url: &str, idx: usize) -> String {
         "智慧树课程"
     };
     format!("{kind} {idx}")
+}
+
+fn sanitize_ini_value(raw: &str, should_trim: bool) -> String {
+    let cleaned: String = raw
+        .chars()
+        .filter(|&c| !matches!(c, '\r' | '\n' | '\0'))
+        .collect();
+    if should_trim {
+        cleaned.trim().to_string()
+    } else {
+        cleaned
+    }
 }
 
 fn format_bool(v: bool) -> &'static str {
@@ -566,7 +545,8 @@ pub fn parse_ini_str(content: &str) -> (AutovisorConfig, Vec<String>) {
     let mut has_notification_provider = false;
 
     for raw_line in content.trim_start_matches('\u{feff}').lines() {
-        let line = raw_line.trim();
+        let raw_no_cr = raw_line.trim_end_matches('\r');
+        let line = raw_no_cr.trim();
         if line.is_empty() || line.starts_with(';') || line.starts_with('#') {
             continue;
         }
@@ -574,16 +554,20 @@ pub fn parse_ini_str(content: &str) -> (AutovisorConfig, Vec<String>) {
             section = line[1..line.len() - 1].trim().to_ascii_lowercase();
             continue;
         }
-        let Some((k, v)) = line.split_once('=') else {
+        let Some((k, raw_v)) = raw_no_cr.split_once('=') else {
             continue;
         };
         let key = k.trim().to_ascii_lowercase();
-        let val = v.trim().to_string();
+        let val = raw_v.trim().to_string();
 
         match section.as_str() {
             "user-account" => match key.as_str() {
                 "username" => cfg.username = val,
-                "password" => cfg.password = val,
+                "password" => {
+                    // 保留密码可能包含的前导/尾随空格，仅剥离等号后单个标准分隔空格
+                    let preserved = raw_v.strip_prefix(' ').unwrap_or(raw_v);
+                    cfg.password = sanitize_ini_value(preserved, false);
+                }
                 "qrlogin" => cfg.qr_login = parse_bool(&val, false),
                 "qrterminal" => cfg.qr_terminal = parse_bool(&val, false),
                 "qrunicode" => cfg.qr_unicode = parse_bool(&val, false),
@@ -730,34 +714,35 @@ pub fn parse_ini_str(content: &str) -> (AutovisorConfig, Vec<String>) {
 }
 
 pub fn render_ini_str(cfg: &AutovisorConfig) -> String {
+    let cdp_clean = sanitize_ini_value(&cfg.cdp_url, true);
     let mut lines = vec![
         "[user-account]".to_string(),
         ";配置账号密码，留空则打开网页后需手动登录".to_string(),
-        format!("username = {}", cfg.username.trim()),
-        format!("password = {}", cfg.password.trim()),
+        format!("username = {}", sanitize_ini_value(&cfg.username, true)),
+        format!("password = {}", sanitize_ini_value(&cfg.password, false)),
         ";可选: 启用终端二维码登录(默认:False)".to_string(),
         format!("qrLogin = {}", format_bool(cfg.qr_login)),
         format!("qrTerminal = {}", format_bool(cfg.qr_terminal)),
         format!("qrUnicode = {}", format_bool(cfg.qr_unicode)),
-        format!("qrSaveDir = {}", cfg.qr_save_dir.trim()),
+        format!("qrSaveDir = {}", sanitize_ini_value(&cfg.qr_save_dir, true)),
         String::new(),
         "[browser-option]".to_string(),
         ";配置浏览器,可选 Edge 或 Chrome".to_string(),
         format!("driver = {}", normalize_driver(&cfg.driver)),
         ";指定浏览器所在路径,不填则使用默认路径".to_string(),
-        format!("EXE_PATH = {}", cfg.exe_path.trim()),
+        format!("EXE_PATH = {}", sanitize_ini_value(&cfg.exe_path, true)),
         ";可选: 代理服务器地址 (支持 http:// / https:// / socks5://)".to_string(),
-        format!("proxy = {}", cfg.proxy.trim()),
+        format!("proxy = {}", sanitize_ini_value(&cfg.proxy, true)),
         format!(
             "attachExistingChrome = {}",
             format_bool(cfg.attach_existing_chrome)
         ),
         format!(
             "cdpUrl = {}",
-            if cfg.cdp_url.trim().is_empty() {
-                "http://127.0.0.1:9222"
+            if cdp_clean.is_empty() {
+                "http://127.0.0.1:9222".to_string()
             } else {
-                cfg.cdp_url.trim()
+                cdp_clean
             }
         ),
         String::new(),
@@ -789,8 +774,11 @@ pub fn render_ini_str(cfg: &AutovisorConfig) -> String {
             "provider = {}",
             normalize_notification_provider(&cfg.notification_provider)
         ),
-        format!("url = {}", cfg.notification_url.trim()),
-        format!("tg_chat_id = {}", cfg.notification_tg_chat_id.trim()),
+        format!("url = {}", sanitize_ini_value(&cfg.notification_url, true)),
+        format!(
+            "tg_chat_id = {}",
+            sanitize_ini_value(&cfg.notification_tg_chat_id, true)
+        ),
         format!("notifyOnVerify = {}", format_bool(cfg.notify_on_verify)),
         format!("notifyOnFinish = {}", format_bool(cfg.notify_on_finish)),
         format!("notifyOnError = {}", format_bool(cfg.notify_on_error)),
@@ -858,11 +846,12 @@ pub fn render_ini_str(cfg: &AutovisorConfig) -> String {
         ";配置要学习的课程链接,支持智慧共享课、翻转课、融合共享课、AI慕课(wisdom-mooc)、AI智慧课".to_string(),
     ];
 
-    let enabled_urls: Vec<&str> = cfg
+    let enabled_urls: Vec<String> = cfg
         .courses
         .iter()
         .filter(|c| c.enabled && is_https_url(&c.url))
-        .map(|c| c.url.trim())
+        .map(|c| sanitize_ini_value(&c.url, true))
+        .filter(|u| !u.is_empty())
         .collect();
 
     if enabled_urls.is_empty() {
@@ -967,9 +956,9 @@ pub fn load_config_from_dir(base_dir: &Path) -> Result<AutovisorConfig, String> 
     match fs::read_to_string(&llm_path) {
         Ok(raw) => {
             let parsed =
-                serde_json::from_str::<LlmDiskConfig>(raw.trim_start_matches('\u{feff}'))
+                serde_json::from_str::<LlmConfig>(raw.trim_start_matches('\u{feff}'))
                     .map_err(|e| format!("解析 llm.json 失败: {e}"))?;
-            cfg.llm = LlmConfig::from(parsed);
+            cfg.llm = parsed.normalized();
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => return Err(format!("读取 llm.json 失败: {e}")),
@@ -1006,6 +995,8 @@ fn is_generic_title(title: &str) -> bool {
                 | "去学习"
                 | "立即学习"
                 | "查看详情"
+                | "进入课程"
+                | "开始上课"
         )
 }
 
@@ -1122,7 +1113,8 @@ pub fn save_config_to_dir(base_dir: &Path, cfg: &AutovisorConfig) -> Result<Auto
     }
 
     let llm_path = data_dir.join("llm.json");
-    let llm_disk = LlmDiskConfig::from(&cfg.llm);
+    let llm_norm = cfg.llm.normalized();
+    let llm_disk = llm_norm.to_disk_value();
     let llm_json = serde_json::to_string_pretty(&llm_disk)
         .map_err(|e| format!("序列化大模型配置失败: {e}"))?;
     let llm_text = format!("{llm_json}\n");
@@ -1145,7 +1137,7 @@ pub fn save_config_to_dir(base_dir: &Path, cfg: &AutovisorConfig) -> Result<Auto
     if !cfg.mirrors.is_empty() {
         normalized.mirrors = cfg.mirrors.clone();
     }
-    normalized.llm = LlmConfig::from(llm_disk);
+    normalized.llm = llm_norm;
     Ok(normalized)
 }
 
@@ -1269,13 +1261,50 @@ mod tests {
         assert_eq!(parsed.log_retention_days, 0);
         assert_eq!(parsed.log_compress_after_days, 0);
 
-        let disk: LlmDiskConfig = serde_json::from_value(serde_json::json!({
+        let disk: LlmConfig = serde_json::from_value(serde_json::json!({
             "stream_timeout": 5.0,
             "stream_idle_timeout": 60.0,
         }))
         .unwrap();
-        let llm = LlmConfig::from(disk);
+        let llm = disk.normalized();
         assert!((llm.stream_idle_timeout - 5.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn render_ini_sanitizes_newlines_and_preserves_password_spaces() {
+        let mut cfg = AutovisorConfig::default();
+        cfg.username = "user\r\n[script-option]\nenableAutoCaptcha = False".to_string();
+        cfg.password = "  pass word  ".to_string();
+        cfg.proxy = "http://127.0.0.1:7890\n[course-option]\nlimitSpeed = 9.9".to_string();
+        let rendered = render_ini_str(&cfg);
+        assert!(!rendered.lines().any(|l| l.trim() == "limitSpeed = 9.9"));
+        assert!(!rendered.lines().any(|l| l.trim() == "enableAutoCaptcha = False"));
+        let (parsed, _) = parse_ini_str(&rendered);
+        assert_eq!(parsed.password, "  pass word  ");
+        assert!(parsed.enable_auto_captcha);
+        assert!((parsed.limit_speed - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn infers_homework_exam_testdetail_titles_and_shared_llm_providers() {
+        assert_eq!(
+            infer_title("https://zhihuishu.com/#/dohomework/1/2/3/4/5", 1),
+            "知到作业 1"
+        );
+        assert_eq!(
+            infer_title("https://zhihuishu.com/#/doexam/1/2/3/4/5", 2),
+            "知到考试 2"
+        );
+        assert_eq!(
+            infer_title("https://ai-smart-course-student-pro.zhihuishu.com/testDetail/1/2/3/4", 3),
+            "AI 测试详情 3"
+        );
+        assert!(is_generic_title("进入课程"));
+        assert!(is_generic_title("开始上课"));
+        assert_eq!(infer_llm_provider("https://api.deepseek.com", "openai"), "deepseek");
+        assert_eq!(infer_llm_provider("https://api.moonshot.ai/v1", "openai"), "moonshot");
+        assert_eq!(infer_llm_provider("https://custom.relay.example", "anthropic"), "anthropic");
+        assert_eq!(infer_llm_provider("http://127.0.0.1:11434", ""), "ollama");
     }
 
     #[test]

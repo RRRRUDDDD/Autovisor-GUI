@@ -5,7 +5,7 @@ import sys
 import tempfile
 from playwright.async_api import Page, Locator
 from playwright.async_api import TimeoutError
-from playwright._impl._errors import TargetClosedError
+from modules.quiz_dom import TargetClosedError
 from modules.configs import Config
 from modules.lesson_navigation import (
     CatalogSelectors,
@@ -14,6 +14,7 @@ from modules.lesson_navigation import (
 )
 import time
 from modules.logger import Logger
+from modules.paths import get_resource_path as _get_resource_path
 from modules.popups import dismiss_course_popups
 from modules.video_state import COURSE_VIDEO_SELECTOR
 from modules.window_control import (
@@ -46,24 +47,7 @@ def get_runtime_path(*parts):
 
 def get_resource_path(*parts):
     """定位只读内置资源（如 stealth.min.js），支持数据目录与程序目录分离。"""
-    res_override = os.environ.get("AUTOVISOR_RESOURCES_DIR", "").strip()
-    if res_override:
-        candidate = os.path.join(os.path.abspath(res_override), *parts)
-        if os.path.exists(candidate):
-            return candidate
-        # 若 AUTOVISOR_RESOURCES_DIR 指向 resources 目录本身，则去掉前缀 resources 再查一次
-        if parts and parts[0] == "resources":
-            candidate = os.path.join(os.path.abspath(res_override), *parts[1:])
-            if os.path.exists(candidate):
-                return candidate
-    if getattr(sys, "frozen", False):
-        exe_candidate = os.path.join(os.path.dirname(sys.executable), *parts)
-        if os.path.exists(exe_candidate):
-            return exe_candidate
-    repo_candidate = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), *parts)
-    if os.path.exists(repo_candidate):
-        return repo_candidate
-    return get_runtime_path(*parts)
+    return _get_resource_path(*parts)
 
 def save_cookies(cookies, filename="cookies.json"):
     """保存登录Cookies到文件"""

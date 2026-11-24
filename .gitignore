@@ -7,6 +7,7 @@ resources/*
 !data/mirrors.json
 !resources/stealth.min.js
 !resources/zhs.ico
+!resources/llm_providers.json
 !resources/scripts/
 .obsidian/
 .idea/

@@ -8,6 +8,7 @@ import threading
 import time
 import traceback
 
+from modules.paths import get_runtime_root as _resolve_runtime_root
 from modules.redaction import redact_sensitive, redact_value
 
 # 用于在记录日志来源时跳过日志系统自身的栈帧
@@ -301,12 +302,7 @@ class Logger:
 
     @staticmethod
     def get_runtime_root():
-        override = os.environ.get("AUTOVISOR_DATA_DIR", "").strip()
-        if override:
-            return os.path.abspath(override)
-        if getattr(sys, "frozen", False):
-            return os.path.dirname(sys.executable)
-        return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        return _resolve_runtime_root()
 
     @staticmethod
     def summarize_exception(exc):
