@@ -1199,12 +1199,9 @@ def _consume_openai_stream(
     finally:
         stop_event.set()
         # 优先给 reader 极短窗口在自身线程优雅关闭连接，避免跨线程同时操作底层 socket；
-        # 若 reader 仍阻塞在 recv() 上则由主线程兜底强关。
+        # 若 reader 仍阻塞在 recv() 上则由主线程兜底强关（_close_once 幂等）。
         reader.join(timeout=0.05)
-        if reader.is_alive():
-            _close_once()
-        else:
-            _close_once()
+        _close_once()
 
     return _strip_think_tags("".join(parts))
 

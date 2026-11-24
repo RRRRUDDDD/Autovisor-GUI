@@ -466,15 +466,17 @@ async fn export_question_cache(
         .get("data")
         .cloned()
         .ok_or_else(|| "导出题库缓存返回格式异常".to_string())?;
+    let Some(handle) = rfd::AsyncFileDialog::new()
+        .set_title("导出 SQLite 题库缓存")
+        .add_filter("JSON 文件", &["json"])
+        .set_file_name("autovisor-question-bank.json")
+        .save_file()
+        .await
+    else {
+        return Ok(None);
+    };
+    let path = handle.path().to_path_buf();
     tauri::async_runtime::spawn_blocking(move || -> Result<Option<String>, String> {
-        let Some(path) = rfd::FileDialog::new()
-            .set_title("导出 SQLite 题库缓存")
-            .add_filter("JSON 文件", &["json"])
-            .set_file_name("autovisor-question-bank.json")
-            .save_file()
-        else {
-            return Ok(None);
-        };
         let text = serde_json::to_string_pretty(&data)
             .map_err(|e| format!("序列化题库缓存失败: {e}"))?;
         fs::write(&path, text).map_err(|e| format!("写入题库缓存失败: {e}"))?;
@@ -489,14 +491,16 @@ async fn import_question_cache(
     app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<Option<serde_json::Value>, String> {
-    let body = tauri::async_runtime::spawn_blocking(move || -> Result<Option<serde_json::Value>, String> {
-        let Some(path) = rfd::FileDialog::new()
-            .set_title("导入 SQLite 题库缓存")
-            .add_filter("JSON 文件", &["json"])
-            .pick_file()
-        else {
-            return Ok(None);
-        };
+    let Some(handle) = rfd::AsyncFileDialog::new()
+        .set_title("导入 SQLite 题库缓存")
+        .add_filter("JSON 文件", &["json"])
+        .pick_file()
+        .await
+    else {
+        return Ok(None);
+    };
+    let path = handle.path().to_path_buf();
+    let body = tauri::async_runtime::spawn_blocking(move || -> Result<serde_json::Value, String> {
         let raw = fs::read_to_string(&path).map_err(|e| format!("读取题库缓存失败: {e}"))?;
         let parsed: serde_json::Value = serde_json::from_str(raw.trim_start_matches('\u{feff}'))
             .map_err(|e| format!("解析题库缓存失败: {e}"))?;
@@ -505,13 +509,10 @@ async fn import_question_cache(
         } else {
             serde_json::json!({ "data": parsed })
         };
-        Ok(Some(body))
+        Ok(body)
     })
     .await
     .map_err(|e| format!("读取题库缓存文件异常: {e}"))??;
-    let Some(body) = body else {
-        return Ok(None);
-    };
     let backend = Arc::clone(&state.backend);
     let resp = tauri::async_runtime::spawn_blocking(move || {
         backend.post_json(Some(&app), "/api/cache/import", &body, 60)

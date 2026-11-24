@@ -68,7 +68,12 @@ export function applyRunStatePayload(prev, payload) {
     if (incRunId > 0 && prevRunId > 0 && incRunId < prevRunId) {
       return prev;
     }
-    const existingLogs = Array.isArray(base.logs) ? base.logs : [];
+    const runAdvanced = incRunId > 0 && prevRunId > 0 && incRunId > prevRunId;
+    const existingLogs = runAdvanced
+      ? []
+      : Array.isArray(base.logs)
+        ? base.logs
+        : [];
     let lastSeq = lastLogSeq(existingLogs);
     const toAppend = [];
     for (const entry of incoming) {
@@ -77,10 +82,14 @@ export function applyRunStatePayload(prev, payload) {
         toAppend.push(entry);
       }
     }
-    const nextTruncated = Boolean(base.logsTruncated || payload.logsTruncated);
+    const prevTruncated = runAdvanced ? false : Boolean(base.logsTruncated);
+    const nextTruncated = Boolean(prevTruncated || payload.logsTruncated);
     const nextRunId = incRunId > prevRunId ? incRunId : prevRunId;
-    const nextRevision = Math.max(Number(base.revision || 0), Number(payload.revision || 0));
+    const nextRevision = runAdvanced
+      ? Number(payload.revision || 0)
+      : Math.max(Number(base.revision || 0), Number(payload.revision || 0));
     if (
+      !runAdvanced &&
       toAppend.length === 0 &&
       nextTruncated === Boolean(base.logsTruncated) &&
       nextRunId === prevRunId &&
@@ -116,18 +125,23 @@ export function applyRunStatePayload(prev, payload) {
         return prev;
       }
     }
+    const runAdvanced = incRunId > 0 && prevRunId > 0 && incRunId > prevRunId;
     const nextShutdown = sameShutdown(base.shutdown ?? null, patch.shutdown ?? null)
       ? (base.shutdown ?? null)
       : (patch.shutdown ?? null);
-    const nextRevision = Math.max(Number(base.revision || 0), Number(patch.revision || 0));
+    const nextRevision = runAdvanced
+      ? Number(patch.revision || 0)
+      : Math.max(Number(base.revision || 0), Number(patch.revision || 0));
     return {
       ...base,
       ...patch,
       ...(nextRevision > 0 ? { revision: nextRevision } : {}),
       shutdown: nextShutdown,
-      // 保留既有 logs 引用，避免进度刷新导致 memo(ExecutionLog) 失效
-      logs: Array.isArray(base.logs) ? base.logs : [],
-      logsTruncated: Boolean(base.logsTruncated || patch.logsTruncated),
+      // 保留既有 logs 引用，避免进度刷新导致 memo(ExecutionLog) 失效；新 run 提前到达时清空旧日志
+      logs: runAdvanced ? [] : Array.isArray(base.logs) ? base.logs : [],
+      logsTruncated: runAdvanced
+        ? Boolean(patch.logsTruncated)
+        : Boolean(base.logsTruncated || patch.logsTruncated),
     };
   }
 

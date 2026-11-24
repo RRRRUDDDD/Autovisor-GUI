@@ -974,11 +974,19 @@ fn apply_sse_event(
             if delta.run_id > 0 && state.run_id > 0 && delta.run_id < state.run_id {
                 return None;
             }
-            if delta.run_id > state.run_id {
+            let run_advanced = delta.run_id > 0 && state.run_id > 0 && delta.run_id > state.run_id;
+            if run_advanced {
                 state.run_id = delta.run_id;
-            }
-            if delta.revision > state.revision {
                 state.revision = delta.revision;
+                state.logs.clear();
+                state.logs_truncated = false;
+            } else {
+                if delta.run_id > state.run_id {
+                    state.run_id = delta.run_id;
+                }
+                if delta.revision > state.revision {
+                    state.revision = delta.revision;
+                }
             }
             let prev_truncated = state.logs_truncated;
             let mut last_seq = state.logs.last().map(|e| e.seq).unwrap_or(0);
@@ -999,7 +1007,7 @@ fn apply_sse_event(
                 state.logs_truncated = state.logs_truncated || trunc;
             }
             let became_truncated = state.logs_truncated && !prev_truncated;
-            if appended.is_empty() && !became_truncated {
+            if !run_advanced && appended.is_empty() && !became_truncated {
                 return None;
             }
             Some(serde_json::json!({
@@ -1023,11 +1031,21 @@ fn apply_sse_event(
                     return None;
                 }
             }
-            if delta.run_id > 0 {
+            let run_advanced = delta.run_id > 0 && state.run_id > 0 && delta.run_id > state.run_id;
+            if run_advanced {
                 state.run_id = delta.run_id;
-            }
-            if delta.revision > state.revision {
                 state.revision = delta.revision;
+                if delta.logs.is_none() {
+                    state.logs.clear();
+                    state.logs_truncated = false;
+                }
+            } else {
+                if delta.run_id > 0 {
+                    state.run_id = delta.run_id;
+                }
+                if delta.revision > state.revision {
+                    state.revision = delta.revision;
+                }
             }
             state.status = delta.status;
             state.mode = delta.mode;
@@ -1537,6 +1555,23 @@ mod tests {
         next_run.run_id = 4;
         next_run.revision = 6;
         assert!(!is_stale_state_snapshot(&current, &next_run));
+
+        // If a newer run's log delta arrives before its snapshot, old logs and revision must reset
+        let next_run_log = serde_json::json!({
+            "runId": 4,
+            "revision": 1,
+            "entries": [{ "seq": 1, "timestamp": 200.0, "level": "info", "message": "new run boot" }],
+            "logsTruncated": false
+        })
+        .to_string();
+        let rolled = apply_sse_event(&mut current, "log", &next_run_log)
+            .expect("new run log delta should reset logs and emit");
+        assert_eq!(current.run_id, 4);
+        assert_eq!(current.revision, 1);
+        assert_eq!(current.logs.len(), 1);
+        assert_eq!(current.logs[0].seq, 1);
+        assert_eq!(current.logs[0].message, "new run boot");
+        assert_eq!(rolled["entries"].as_array().unwrap().len(), 1);
     }
 
     #[test]

@@ -334,7 +334,7 @@ class Logger:
         module = frame.f_globals.get("__name__", "?")
         return f"{module}.{frame.f_code.co_name}:{frame.f_lineno}"
 
-    def write_log(self, msg, level=None, raw=False):
+    def write_log(self, msg, level=None, raw=False, *, redacted=False):
         """写入一条日志: [时间] [级别] [调用位置] 内容; 复用持久句柄与增量字节计数。"""
         if raw:
             record = msg
@@ -345,7 +345,8 @@ class Logger:
             )
         else:
             record = f"[{self._timestamp()}] [{self._source_location()}] {msg}"
-        record = redact_sensitive(record)
+        if not redacted:
+            record = redact_sensitive(record)
         record_bytes = len(record.encode("utf-8"))
         with self._write_lock:
             if not self._filename:
@@ -397,7 +398,7 @@ class Logger:
 
     def debug(self, msg):
         safe = redact_sensitive(msg)
-        self.write_log(f"{safe}\n", level="DEBUG")
+        self.write_log(f"{safe}\n", level="DEBUG", redacted=True)
         if getattr(self, "console_debug", False):
             print(f"[DEBUG] {safe}", flush=True)
         if getattr(self, "emit_debug", False):
@@ -415,8 +416,8 @@ class Logger:
     def section(self, title):
         """写入阶段标题, 把日志按运行阶段分段, 便于定位问题发生的位置。"""
         safe_title = redact_sensitive(title)
-        self.write_log("\n", raw=True)
-        self.write_log(f"===== {safe_title} =====\n")
+        self.write_log("\n", raw=True, redacted=True)
+        self.write_log(f"===== {safe_title} =====\n", redacted=True)
         print(f"\n===== {safe_title} =====")
         self._emit("section", title=safe_title)
 
@@ -483,7 +484,7 @@ class Logger:
         else:
             text = f"\r\033[32m[INFO]\033[0m {safe}"
         print(text.ljust(50))
-        self.write_log(f"{safe}\n", level="INFO")
+        self.write_log(f"{safe}\n", level="INFO", redacted=True)
         self._emit("log", level="info", message=safe)
 
     def warn(self, msg, shift=False):
@@ -493,7 +494,7 @@ class Logger:
         else:
             text = f"\r\033[33m[WARN]\033[0m {safe}"
         print(text.ljust(50))
-        self.write_log(f"{safe}\n", level="WARN")
+        self.write_log(f"{safe}\n", level="WARN", redacted=True)
         self._emit("log", level="warning", message=safe)
 
     def error(self, msg, shift=False, with_context=True):
@@ -503,7 +504,7 @@ class Logger:
         else:
             text = f"\r\033[31m[ERROR]\033[0m {safe}"
         print(text.ljust(50))
-        self.write_log(f"{safe}\n", level="ERROR")
+        self.write_log(f"{safe}\n", level="ERROR", redacted=True)
         if with_context:
             state = self.context_text()
             if state:

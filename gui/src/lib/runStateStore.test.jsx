@@ -103,6 +103,47 @@ describe('T2.3 runStateStore delta protocol compatibility', () => {
     expect(afterStaleHttp.status).toBe('completed');
     expect(afterStaleHttp.logs).toHaveLength(2);
   });
+
+  it('resets previous run logs and revision if a newer runId delta arrives before its snapshot', () => {
+    const run2 = applyRunStatePayload(null, {
+      runId: 2,
+      revision: 8,
+      status: 'completed',
+      mode: 'study',
+      logs: [
+        { seq: 1, timestamp: 100, level: 'info', message: 'old-1' },
+        { seq: 5, timestamp: 105, level: 'info', message: 'old-5' },
+      ],
+      logsTruncated: true,
+    });
+
+    const run3Log = applyRunStatePayload(run2, {
+      __delta: 'log',
+      runId: 3,
+      revision: 1,
+      entries: [{ seq: 1, timestamp: 200, level: 'info', message: 'new-run-start' }],
+      logsTruncated: false,
+    });
+    expect(run3Log.runId).toBe(3);
+    expect(run3Log.revision).toBe(1);
+    expect(run3Log.logsTruncated).toBe(false);
+    expect(run3Log.logs).toEqual([
+      { seq: 1, timestamp: 200, level: 'info', message: 'new-run-start' },
+    ]);
+
+    const run4State = applyRunStatePayload(run3Log, {
+      __delta: 'state',
+      runId: 4,
+      revision: 1,
+      status: 'running',
+      mode: 'study',
+      stage: '初始化',
+      logsTruncated: false,
+    });
+    expect(run4State.runId).toBe(4);
+    expect(run4State.revision).toBe(1);
+    expect(run4State.logs).toEqual([]);
+  });
 });
 
 describe('T2.3 App SSE transitions and cookie import deduplication', () => {
