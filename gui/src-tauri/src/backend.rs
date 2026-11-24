@@ -1,3 +1,4 @@
+use crate::error::AppError;
 use crate::process_tree::{configure_hidden_command, prepare_process_tree_command, Job};
 use crate::runtime::{resolve_app_paths, BackendLaunchSpec};
 use serde::{Deserialize, Serialize};
@@ -166,6 +167,7 @@ pub struct BackendManager {
     ready_cvar: Arc<Condvar>,
     lifecycle_lock: Mutex<()>,
     api_client: reqwest::blocking::Client,
+    async_api_client: reqwest::Client,
     sse_client: reqwest::blocking::Client,
 }
 
@@ -177,6 +179,13 @@ impl BackendManager {
             .timeout(Duration::from_secs(15))
             .build()
             .expect("failed to build loopback api client");
+
+        let async_api_client = reqwest::Client::builder()
+            .no_proxy()
+            .connect_timeout(Duration::from_secs(3))
+            .timeout(Duration::from_secs(15))
+            .build()
+            .expect("failed to build async loopback api client");
 
         let sse_client = reqwest::blocking::Client::builder()
             .no_proxy()
@@ -202,6 +211,7 @@ impl BackendManager {
             ready_cvar: Arc::new(Condvar::new()),
             lifecycle_lock: Mutex::new(()),
             api_client,
+            async_api_client,
             sse_client,
         }
     }
@@ -573,6 +583,29 @@ impl BackendManager {
         }
     }
 
+    async fn ensure_ready_async(
+        self: &Arc<Self>,
+        app: Option<&AppHandle>,
+    ) -> Result<(u16, String), AppError> {
+        {
+            let guard = lock_unpoisoned(&self.inner);
+            if guard.shutting_down {
+                return Err(AppError::backend("程序正在退出"));
+            }
+            if guard.phase == "ready" {
+                if let Some(p) = guard.port {
+                    return Ok((p, guard.token.clone()));
+                }
+            }
+        }
+        let this = Arc::clone(self);
+        let app_owned = app.cloned();
+        tauri::async_runtime::spawn_blocking(move || this.ensure_ready(app_owned.as_ref()))
+            .await
+            .map_err(|e| AppError::backend(format!("等待内置学习引擎异常: {e}")))?
+            .map_err(AppError::backend)
+    }
+
     pub fn post_json(
         &self,
         app: Option<&AppHandle>,
@@ -608,16 +641,53 @@ impl BackendManager {
         parsed.ok_or_else(|| "内置学习引擎返回了非 JSON 响应".to_string())
     }
 
-    pub fn start_task(
-        &self,
+    pub async fn post_json_async(
+        self: &Arc<Self>,
+        app: Option<&AppHandle>,
+        path: &str,
+        payload: &serde_json::Value,
+        timeout_secs: u64,
+    ) -> Result<serde_json::Value, AppError> {
+        let (port, token) = self.ensure_ready_async(app).await?;
+        let url = format!("http://127.0.0.1:{port}{path}");
+        let resp = self
+            .async_api_client
+            .post(&url)
+            .header("X-Autovisor-Token", &token)
+            .timeout(Duration::from_secs(timeout_secs))
+            .json(payload)
+            .send()
+            .await
+            .map_err(|e| AppError::backend(format!("连接内置学习引擎失败: {e}")))?;
+
+        let status_code = resp.status();
+        let body_text = resp
+            .text()
+            .await
+            .map_err(|e| AppError::backend(format!("读取内置学习引擎响应失败: {e}")))?;
+        let parsed = serde_json::from_str::<serde_json::Value>(&body_text).ok();
+
+        if !status_code.is_success() {
+            let msg = parsed
+                .as_ref()
+                .and_then(|v| v.get("error").and_then(|e| e.as_str()).map(String::from))
+                .unwrap_or_else(|| format!("请求失败（HTTP {status_code}）"));
+            return Err(AppError::backend(msg));
+        }
+
+        parsed.ok_or_else(|| AppError::backend("内置学习引擎返回了非 JSON 响应"))
+    }
+
+    pub async fn start_task_async(
+        self: &Arc<Self>,
         app: AppHandle,
         mode: &str,
         target: &str,
-    ) -> Result<RunState, String> {
-        let (port, token) = self.ensure_ready(Some(&app))?;
+    ) -> Result<RunState, AppError> {
+        let (port, token) = self.ensure_ready_async(Some(&app)).await?;
         let url = format!("http://127.0.0.1:{port}/api/tasks/start");
         let resp = self
-            .api_client
+            .async_api_client
             .post(&url)
             .header("X-Autovisor-Token", &token)
             .json(&serde_json::json!({
@@ -625,23 +695,25 @@ impl BackendManager {
                 "target": target,
             }))
             .send()
-            .map_err(|e| format!("连接内置学习引擎失败: {e}"))?;
+            .await
+            .map_err(|e| AppError::backend(format!("连接内置学习引擎失败: {e}")))?;
 
         let status_code = resp.status();
         let body_text = resp
             .text()
-            .map_err(|e| format!("读取内置学习引擎响应失败: {e}"))?;
+            .await
+            .map_err(|e| AppError::backend(format!("读取内置学习引擎响应失败: {e}")))?;
 
         if !status_code.is_success() {
             let msg = serde_json::from_str::<serde_json::Value>(&body_text)
                 .ok()
                 .and_then(|v| v.get("error").and_then(|e| e.as_str()).map(String::from))
                 .unwrap_or_else(|| format!("启动任务失败（HTTP {status_code}）"));
-            return Err(msg);
+            return Err(AppError::backend(msg));
         }
 
         let state: RunState = serde_json::from_str(&body_text)
-            .map_err(|e| format!("解析任务状态失败: {e}"))?;
+            .map_err(|e| AppError::backend(format!("解析任务状态失败: {e}")))?;
         let (final_state, should_emit) = {
             let mut guard = lock_unpoisoned(&self.inner);
             if is_stale_state_snapshot(&guard.last_state, &state) {
@@ -657,7 +729,7 @@ impl BackendManager {
         Ok(final_state)
     }
 
-    pub fn stop_task(&self, app: Option<&AppHandle>) -> RunState {
+    pub async fn stop_task_async(self: &Arc<Self>, app: Option<&AppHandle>) -> RunState {
         let target = {
             let guard = lock_unpoisoned(&self.inner);
             if guard.phase == "ready" {
@@ -670,14 +742,15 @@ impl BackendManager {
         if let Some((port, token)) = target {
             let url = format!("http://127.0.0.1:{port}/api/tasks/stop");
             if let Ok(resp) = self
-                .api_client
+                .async_api_client
                 .post(&url)
                 .header("X-Autovisor-Token", &token)
                 .json(&serde_json::json!({}))
                 .send()
+                .await
             {
                 if resp.status().is_success() {
-                    if let Ok(state) = resp.json::<RunState>() {
+                    if let Ok(state) = resp.json::<RunState>().await {
                         {
                             let mut guard = lock_unpoisoned(&self.inner);
                             guard.last_state = state.clone();
@@ -689,8 +762,12 @@ impl BackendManager {
             }
         }
 
-        // 兜底：若 HTTP 停止失败，则强制终止当前后端进程树，下一次任务会自动拉起新实例
-        self.terminate_current_process(false);
+        // 兜底：若 HTTP 停止失败，则在阻塞池中强制终止当前后端进程树，下一次任务会自动拉起新实例
+        let this = Arc::clone(self);
+        let _ = tauri::async_runtime::spawn_blocking(move || {
+            this.terminate_current_process(false);
+        })
+        .await;
         let snapshot = {
             let mut guard = lock_unpoisoned(&self.inner);
             if guard.last_state.status == "running" || guard.last_state.status == "stopping" {
@@ -705,32 +782,37 @@ impl BackendManager {
         snapshot
     }
 
-    pub fn cancel_shutdown(&self, app: Option<&AppHandle>) -> Result<RunState, String> {
-        let (port, token) = self.ensure_ready(app)?;
+    pub async fn cancel_shutdown_async(
+        self: &Arc<Self>,
+        app: Option<&AppHandle>,
+    ) -> Result<RunState, AppError> {
+        let (port, token) = self.ensure_ready_async(app).await?;
         let url = format!("http://127.0.0.1:{port}/api/tasks/cancel-shutdown");
         let resp = self
-            .api_client
+            .async_api_client
             .post(&url)
             .header("X-Autovisor-Token", &token)
             .json(&serde_json::json!({}))
             .send()
-            .map_err(|e| format!("连接内置学习引擎失败: {e}"))?;
+            .await
+            .map_err(|e| AppError::backend(format!("连接内置学习引擎失败: {e}")))?;
 
         let status_code = resp.status();
         let body_text = resp
             .text()
-            .map_err(|e| format!("读取内置学习引擎响应失败: {e}"))?;
+            .await
+            .map_err(|e| AppError::backend(format!("读取内置学习引擎响应失败: {e}")))?;
 
         if !status_code.is_success() {
             let msg = serde_json::from_str::<serde_json::Value>(&body_text)
                 .ok()
                 .and_then(|v| v.get("error").and_then(|e| e.as_str()).map(String::from))
                 .unwrap_or_else(|| format!("取消关机失败（HTTP {status_code}）"));
-            return Err(msg);
+            return Err(AppError::backend(msg));
         }
 
         let state: RunState = serde_json::from_str(&body_text)
-            .map_err(|e| format!("解析任务状态失败: {e}"))?;
+            .map_err(|e| AppError::backend(format!("解析任务状态失败: {e}")))?;
         {
             let mut guard = lock_unpoisoned(&self.inner);
             guard.last_state = state.clone();
@@ -1519,25 +1601,29 @@ mod tests {
 
     #[test]
     fn stale_start_snapshot_does_not_overwrite_newer_sse_state_or_logs() {
-        let mut current = RunState::default();
-        current.run_id = 3;
-        current.revision = 5;
-        current.status = "running".to_string();
-        current.started_at = Some(100.0);
-        current.logs = vec![
-            LogEntry { seq: 1, timestamp: 100.0, level: "info".to_string(), message: "boot".to_string() },
-            LogEntry { seq: 2, timestamp: 101.0, level: "info".to_string(), message: "course".to_string() },
-        ];
+        let mut current = RunState {
+            run_id: 3,
+            revision: 5,
+            status: "running".to_string(),
+            started_at: Some(100.0),
+            logs: vec![
+                LogEntry { seq: 1, timestamp: 100.0, level: "info".to_string(), message: "boot".to_string() },
+                LogEntry { seq: 2, timestamp: 101.0, level: "info".to_string(), message: "course".to_string() },
+            ],
+            ..Default::default()
+        };
 
         // Stale HTTP start_task response (same run_id, lower revision & seq=1) must be ignored
-        let mut stale = RunState::default();
-        stale.run_id = 3;
-        stale.revision = 1;
-        stale.status = "running".to_string();
-        stale.started_at = Some(100.0);
-        stale.logs = vec![
-            LogEntry { seq: 1, timestamp: 100.0, level: "info".to_string(), message: "boot".to_string() },
-        ];
+        let stale = RunState {
+            run_id: 3,
+            revision: 1,
+            status: "running".to_string(),
+            started_at: Some(100.0),
+            logs: vec![
+                LogEntry { seq: 1, timestamp: 100.0, level: "info".to_string(), message: "boot".to_string() },
+            ],
+            ..Default::default()
+        };
         assert!(is_stale_state_snapshot(&current, &stale));
 
         // Duplicate log delta without new truncation must not emit an empty frame

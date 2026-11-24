@@ -2,7 +2,7 @@ use crate::backend::BackendStatusSnapshot;
 use crate::browser_detect::{
     detect_installed_browsers, refresh_installed_browsers, DetectedBrowser,
 };
-use crate::config_ini::{save_config_to_dir, write_file_atomic, AutovisorConfig};
+use crate::config::{save_config_to_dir, write_file_atomic, AutovisorConfig};
 use crate::window_close::CloseAction;
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -606,32 +606,10 @@ fn format_size(bytes: u64) -> String {
     }
 }
 
-fn format_system_time(st: SystemTime) -> (u64, String) {
-    let secs = st
-        .duration_since(UNIX_EPOCH)
+fn system_time_epoch(st: SystemTime) -> u64 {
+    st.duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
-        .unwrap_or(0);
-    let local_secs = secs + 8 * 3600;
-    let days = local_secs / 86400;
-    let rem = local_secs % 86400;
-    let h = rem / 3600;
-    let m = (rem % 3600) / 60;
-    let (year, month, day) = civil_from_days(days as i64);
-    (secs, format!("{year:04}-{month:02}-{day:02} {h:02}:{m:02}"))
-}
-
-fn civil_from_days(z: i64) -> (i64, u32, u32) {
-    let z = z + 719468;
-    let era = if z >= 0 { z } else { z - 146096 } / 146097;
-    let doe = (z - era * 146097) as u64;
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
-    let y = yoe as i64 + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    let y = if m <= 2 { y + 1 } else { y };
-    (y, m as u32, d as u32)
+        .unwrap_or(0)
 }
 
 pub fn list_log_files(base_dir: &Path) -> Vec<LogFileItem> {
@@ -649,16 +627,16 @@ pub fn list_log_files(base_dir: &Path) -> Vec<LogFileItem> {
             let name = entry.file_name().to_string_lossy().to_string();
             let meta = entry.metadata().ok()?;
             let size_bytes = meta.len();
-            let (modified_epoch, modified_at) = meta
+            let modified_epoch = meta
                 .modified()
-                .map(format_system_time)
-                .unwrap_or((0, "--".to_string()));
+                .map(system_time_epoch)
+                .unwrap_or(0);
             Some(LogFileItem {
                 name,
                 path: path.to_string_lossy().to_string(),
                 size_bytes,
                 size_label: format_size(size_bytes),
-                modified_at,
+                modified_at: String::new(),
                 modified_epoch,
             })
         })
@@ -674,8 +652,9 @@ pub fn read_log_tail(path: &Path, max_bytes: u64) -> Result<String, String> {
         .metadata()
         .map_err(|e| format!("读取文件信息失败: {e}"))?
         .len();
+    let truncated = len > max_bytes;
     let mut prefix = String::new();
-    if len > max_bytes {
+    if truncated {
         file.seek(SeekFrom::Start(len - max_bytes))
             .map_err(|e| format!("定位日志失败: {e}"))?;
         prefix = format!(
@@ -687,7 +666,18 @@ pub fn read_log_tail(path: &Path, max_bytes: u64) -> Result<String, String> {
     let mut buf = Vec::new();
     file.read_to_end(&mut buf)
         .map_err(|e| format!("读取日志失败: {e}"))?;
-    let content = String::from_utf8_lossy(&buf);
+    // 截断起点可能落在多字节 UTF-8 字符中间，跳过最多 3 个前导 continuation bytes (10xxxxxx)
+    let slice = if truncated {
+        let skip = buf
+            .iter()
+            .take(3)
+            .take_while(|&&b| (b & 0b1100_0000) == 0b1000_0000)
+            .count();
+        &buf[skip..]
+    } else {
+        &buf[..]
+    };
+    let content = String::from_utf8_lossy(slice);
     Ok(format!("{prefix}{content}"))
 }
 
@@ -939,6 +929,19 @@ mod tests {
             .collect();
         assert_eq!(backups.len(), 1);
 
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn read_log_tail_skips_split_utf8_continuation_bytes() {
+        let root = make_temp_dir("utf8_tail");
+        let log_path = root.join("utf8.log");
+        // Each Chinese char is 3 bytes in UTF-8: "甲乙丙丁戊" = 15 bytes
+        fs::write(&log_path, "甲乙丙丁戊").unwrap();
+        // Read last 7 bytes: lands in the middle of "丙" (2 trailing bytes) + "丁戊" (6 bytes) -> Wait: 15 - 7 = 8 (byte 8 is 3rd byte of 丙)
+        let tail = read_log_tail(&log_path, 7).unwrap();
+        assert!(!tail.contains('\u{FFFD}'));
+        assert!(tail.ends_with("丁戊"));
         let _ = fs::remove_dir_all(&root);
     }
 }

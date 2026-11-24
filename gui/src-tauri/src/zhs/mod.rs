@@ -1,45 +1,43 @@
+pub mod cdp;
+pub mod cookies;
+pub mod schools;
+
+pub use schools::{search_schools_async, SchoolItem};
+
 use crate::backend::{lock_unpoisoned, BackendManager};
 use crate::browser_detect::{detect_installed_browsers, resolve_browser_choice};
-use crate::config_ini::{
-    load_config_from_dir, merge_discovered_courses, save_config_to_dir, write_file_atomic,
-    AutovisorConfig, CourseItem,
+use crate::config::{
+    load_config_from_dir, merge_discovered_courses, save_config_to_dir, AutovisorConfig, CourseItem,
 };
+use crate::process_tree::Job;
 use crate::runtime::{update_prefs, SavedLoginInfo, SessionProfile};
-use crate::process_tree::{configure_hidden_command, prepare_process_tree_command, Job};
+use cdp::{
+    find_free_port, launch_cdp_browser, wait_for_cdp_ws_url, CdpClient, TempProfileGuard,
+};
+use cookies::{
+    is_login_url, load_saved_cookies, merge_cookies, now_epoch_secs, save_cookies_atomic,
+    PlaywrightCookie,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashMap;
-use std::fs;
-use std::net::{TcpListener, TcpStream};
-use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::path::Path;
+use std::process::Child;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter};
-use tungstenite::stream::MaybeTlsStream;
-use tungstenite::{Message, WebSocket};
 
 const LOGIN_ENTRY_URL: &str =
     "https://passport.zhihuishu.com/login?service=https%3A%2F%2Fonlineweb.zhihuishu.com%2Fonlinestuh5";
 const NEW_LOGIN_ENTRY_URL: &str =
     "https://login.zhihuishu.com/?origin=zhs&service=https%3A%2F%2Fonlineweb.zhihuishu.com%2Fonlinestuh5";
 const STUDENT_HOME_URL: &str = "https://onlineweb.zhihuishu.com/onlinestuh5";
-const ZHS_TAB_SWITCH_JS: &str = include_str!("../../../resources/scripts/zhs_tab_switch.js");
-const ZHS_DOM_EXTRACT_JS: &str = include_str!("../../../resources/scripts/zhs_dom_extract.js");
-
-const SCHOOL_LIST_URL: &str = "https://passport.zhihuishu.com/user/getAllSchool";
-
-static SCHOOL_CACHE: OnceLock<Mutex<Option<Vec<SchoolItem>>>> = OnceLock::new();
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct SchoolItem {
-    pub school_id: String,
-    pub name: String,
-    pub letter: String,
-}
+const ZHS_TAB_SWITCH_JS: &str = include_str!("../../../../resources/scripts/zhs_tab_switch.js");
+const ZHS_DOM_EXTRACT_JS: &str = include_str!("../../../../resources/scripts/zhs_dom_extract.js");
+const ZHS_LOGIN_AUTOFILL_JS: &str =
+    include_str!("../../../../resources/scripts/zhs_login_autofill.js");
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -66,7 +64,7 @@ pub struct LoginRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LoginStatusEvent {
-    pub phase: String, // "launching" | "waiting_user" | "fetching_courses" | "done" | "error"
+    pub phase: String,
     pub message: String,
     pub needs_action: bool,
 }
@@ -79,23 +77,6 @@ pub struct SessionResult {
     pub cookie_count: usize,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct PlaywrightCookie {
-    name: String,
-    value: String,
-    domain: String,
-    path: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    expires: Option<f64>,
-    #[serde(default)]
-    http_only: bool,
-    #[serde(default)]
-    secure: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    same_site: Option<String>,
-}
-
 struct ActiveSession {
     id: u64,
     job: Option<Arc<Job>>,
@@ -105,6 +86,12 @@ struct ActiveSession {
 pub struct ZhsSessionManager {
     active_session: Mutex<Option<ActiveSession>>,
     next_session_id: AtomicU64,
+}
+
+impl Default for ZhsSessionManager {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl ZhsSessionManager {
@@ -128,8 +115,6 @@ impl ZhsSessionManager {
         }
     }
 
-    /// 开启一次新的登录尝试，返回专属的 (session_id, cancel_flag)。
-    /// 若存在尚未结束的旧登录会话，仅标记旧会话取消并终止其进程树，不会清掉旧会话的取消状态。
     fn start_attempt(&self) -> (u64, Arc<AtomicBool>) {
         let sid = self.next_session_id.fetch_add(1, Ordering::SeqCst) + 1;
         let cancel_flag = Arc::new(AtomicBool::new(false));
@@ -150,7 +135,7 @@ impl ZhsSessionManager {
         (sid, cancel_flag)
     }
 
-    fn attach_job(&self, session_id: u64, job: Arc<Job>) -> bool {
+    pub(crate) fn attach_job(&self, session_id: u64, job: Arc<Job>) -> bool {
         let mut guard = lock_unpoisoned(&self.active_session);
         if let Some(ref mut sess) = *guard {
             if sess.id == session_id && !sess.cancel_flag.load(Ordering::SeqCst) {
@@ -196,13 +181,6 @@ impl ZhsSessionManager {
     }
 }
 
-fn now_epoch_secs() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
-}
-
 fn emit_status(app: &AppHandle, phase: &str, message: &str, needs_action: bool) {
     let _ = app.emit(
         "autovisor-login-status",
@@ -214,524 +192,10 @@ fn emit_status(app: &AppHandle, phase: &str, message: &str, needs_action: bool) 
     );
 }
 
-/// Fetches (and caches) Zhihuishu's school list for Student ID login autocomplete.
-pub fn search_schools(query: &str, proxy: &str) -> Result<Vec<SchoolItem>, String> {
-    let cache_mutex = SCHOOL_CACHE.get_or_init(|| Mutex::new(None));
-    let schools: Vec<SchoolItem> = {
-        let guard = lock_unpoisoned(cache_mutex);
-        if let Some(ref list) = *guard {
-            list.clone()
-        } else {
-            drop(guard);
-            let mut builder = reqwest::blocking::Client::builder()
-                .timeout(Duration::from_secs(12))
-                .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36");
-            let trimmed_proxy = proxy.trim();
-            if !trimmed_proxy.is_empty() {
-                if let Ok(p) = reqwest::Proxy::all(trimmed_proxy) {
-                    builder = builder.proxy(p);
-                }
-            }
-            let client = builder
-                .build()
-                .map_err(|e| format!("初始化 HTTP 客户端失败: {e}"))?;
-            let resp = client
-                .post(SCHOOL_LIST_URL)
-                .header("Referer", "https://passport.zhihuishu.com/login")
-                .send()
-                .map_err(|e| format!("获取智慧树学校列表失败: {e}"))?;
-            let body: Value = resp
-                .json()
-                .map_err(|e| format!("解析智慧树学校列表失败: {e}"))?;
-            let mut parsed = Vec::new();
-            if let Some(arr) = body.get("listSchool").and_then(|v| v.as_array()) {
-                for item in arr {
-                    let name = item
-                        .get("name")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .trim()
-                        .to_string();
-                    let school_id = match item.get("schoolId") {
-                        Some(Value::Number(n)) => n.to_string(),
-                        Some(Value::String(s)) => s.trim().to_string(),
-                        _ => String::new(),
-                    };
-                    let letter = item
-                        .get("letter")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .trim()
-                        .to_lowercase();
-                    if !name.is_empty() && !school_id.is_empty() {
-                        parsed.push(SchoolItem {
-                            school_id,
-                            name,
-                            letter,
-                        });
-                    }
-                }
-            }
-            if parsed.is_empty() {
-                return Err("智慧树学校列表为空，请稍后重试".to_string());
-            }
-            let mut guard = lock_unpoisoned(cache_mutex);
-            *guard = Some(parsed.clone());
-            parsed
-        }
-    };
-
-    let q = query.trim().to_lowercase();
-    if q.is_empty() {
-        return Ok(schools.into_iter().take(25).collect());
-    }
-
-    let mut exact = Vec::new();
-    let mut prefix = Vec::new();
-    let mut contains = Vec::new();
-    for s in schools {
-        let name_lower = s.name.to_lowercase();
-        if name_lower == q {
-            exact.push(s);
-        } else if name_lower.starts_with(&q) || s.letter == q {
-            prefix.push(s);
-        } else if name_lower.contains(&q) {
-            contains.push(s);
-        }
-    }
-    let mut out = Vec::with_capacity(30);
-    for bucket in [exact, prefix, contains] {
-        for item in bucket {
-            if out.len() >= 30 {
-                break;
-            }
-            out.push(item);
-        }
-        if out.len() >= 30 {
-            break;
-        }
-    }
-    Ok(out)
-}
-
-struct TempProfileGuard {
-    dir: PathBuf,
-}
-
-impl TempProfileGuard {
-    fn create() -> Result<Self, String> {
-        let stamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_millis())
-            .unwrap_or(0);
-        let dir = std::env::temp_dir().join(format!(
-            "autovisor-gui-cdp-{}-{}",
-            std::process::id(),
-            stamp
-        ));
-        fs::create_dir_all(&dir).map_err(|e| format!("创建临时浏览器配置目录失败: {e}"))?;
-        Ok(Self { dir })
-    }
-}
-
-impl Drop for TempProfileGuard {
-    fn drop(&mut self) {
-        for _ in 0..5 {
-            if fs::remove_dir_all(&self.dir).is_ok() || !self.dir.exists() {
-                break;
-            }
-            thread::sleep(Duration::from_millis(120));
-        }
-    }
-}
-
-fn find_free_port() -> Result<u16, String> {
-    let listener =
-        TcpListener::bind("127.0.0.1:0").map_err(|e| format!("分配本地调试端口失败: {e}"))?;
-    let port = listener
-        .local_addr()
-        .map_err(|e| format!("获取本地调试端口失败: {e}"))?
-        .port();
-    drop(listener);
-    Ok(port)
-}
-
-#[derive(Debug, Clone)]
-struct CapturedResponse {
-    url: String,
-    finished: bool,
-    parsed: bool,
-}
-
-fn is_static_asset_url(url_lower: &str) -> bool {
-    let path = url_lower.split('?').next().unwrap_or(url_lower);
-    [
-        ".js", ".css", ".png", ".jpg", ".jpeg", ".gif", ".svg", ".webp", ".ico", ".woff",
-        ".woff2", ".ttf", ".eot", ".mp4", ".m3u8", ".ts", ".map",
-    ]
-    .iter()
-    .any(|ext| path.ends_with(ext))
-}
-
-fn decode_base64_utf8(input: &str) -> Option<String> {
-    fn val(b: u8) -> Option<u8> {
-        match b {
-            b'A'..=b'Z' => Some(b - b'A'),
-            b'a'..=b'z' => Some(b - b'a' + 26),
-            b'0'..=b'9' => Some(b - b'0' + 52),
-            b'+' | b'-' => Some(62),
-            b'/' | b'_' => Some(63),
-            _ => None,
-        }
-    }
-    let mut out = Vec::with_capacity(input.len() * 3 / 4);
-    let mut buf: u32 = 0;
-    let mut bits: u8 = 0;
-    for b in input.bytes() {
-        if b.is_ascii_whitespace() || b == b'=' {
-            continue;
-        }
-        let v = val(b)?;
-        buf = (buf << 6) | u32::from(v);
-        bits += 6;
-        if bits >= 8 {
-            bits -= 8;
-            out.push(((buf >> bits) & 0xff) as u8);
-        }
-    }
-    String::from_utf8(out).ok()
-}
-
-struct CdpClient {
-    ws: WebSocket<MaybeTlsStream<TcpStream>>,
-    next_id: u64,
-    responses: HashMap<String, CapturedResponse>,
-}
-
-impl CdpClient {
-    fn connect(ws_url: &str) -> Result<Self, String> {
-        let (ws, _) =
-            tungstenite::connect(ws_url).map_err(|e| format!("连接浏览器调试通道失败: {e}"))?;
-        if let MaybeTlsStream::Plain(ref stream) = *ws.get_ref() {
-            let _ = stream.set_read_timeout(Some(Duration::from_millis(250)));
-            let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
-        }
-        Ok(Self {
-            ws,
-            next_id: 1,
-            responses: HashMap::new(),
-        })
-    }
-
-    fn handle_event(&mut self, msg: &Value) {
-        let Some(method) = msg.get("method").and_then(|v| v.as_str()) else {
-            return;
-        };
-        let Some(params) = msg.get("params") else {
-            return;
-        };
-        match method {
-            "Network.responseReceived" => {
-                let req_id = params
-                    .get("requestId")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
-                let resource_type = params
-                    .get("type")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
-                let resp = params.get("response");
-                let url = resp
-                    .and_then(|r| r.get("url"))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
-                let url_lower = url.to_ascii_lowercase();
-                let mime = resp
-                    .and_then(|r| r.get("mimeType"))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_ascii_lowercase();
-                let status = resp
-                    .and_then(|r| r.get("status"))
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(0);
-                if !req_id.is_empty()
-                    && status >= 200
-                    && status < 300
-                    && url_lower.contains("zhihuishu.com")
-                    && !is_static_asset_url(&url_lower)
-                    && (mime.contains("json")
-                        || mime.contains("text/plain")
-                        || matches!(resource_type, "XHR" | "Fetch")
-                        || url_lower.contains("course")
-                        || url_lower.contains("userinfo")
-                        || url_lower.contains("student"))
-                {
-                    self.responses.insert(
-                        req_id.to_string(),
-                        CapturedResponse {
-                            url: url.to_string(),
-                            finished: false,
-                            parsed: false,
-                        },
-                    );
-                }
-            }
-            "Network.loadingFinished" => {
-                if let Some(req_id) = params.get("requestId").and_then(|v| v.as_str()) {
-                    if let Some(entry) = self.responses.get_mut(req_id) {
-                        entry.finished = true;
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-
-    fn send(&mut self, method: &str, params: Value) -> Result<Value, String> {
-        let id = self.next_id;
-        self.next_id += 1;
-        let payload = json!({
-            "id": id,
-            "method": method,
-            "params": params,
-        });
-        self.ws
-            .send(Message::Text(payload.to_string()))
-            .map_err(|e| format!("CDP 发送 {method} 失败: {e}"))?;
-
-        let deadline = Instant::now() + Duration::from_secs(15);
-        while Instant::now() < deadline {
-            match self.ws.read() {
-                Ok(Message::Text(text)) => {
-                    if let Ok(val) = serde_json::from_str::<Value>(&text) {
-                        if val.get("id").and_then(|v| v.as_u64()) == Some(id) {
-                            if let Some(err) = val.get("error") {
-                                return Err(format!("CDP {method} 返回错误: {err}"));
-                            }
-                            return Ok(val.get("result").cloned().unwrap_or(Value::Null));
-                        }
-                        self.handle_event(&val);
-                    }
-                }
-                Ok(Message::Ping(data)) => {
-                    let _ = self.ws.send(Message::Pong(data));
-                }
-                Ok(Message::Close(_)) => {
-                    return Err("浏览器调试连接已关闭".to_string());
-                }
-                Ok(_) => {}
-                Err(tungstenite::Error::Io(ref io_err))
-                    if io_err.kind() == std::io::ErrorKind::WouldBlock
-                        || io_err.kind() == std::io::ErrorKind::TimedOut =>
-                {
-                    continue;
-                }
-                Err(e) => return Err(format!("读取浏览器调试通道失败: {e}")),
-            }
-        }
-        Err(format!("等待 CDP {method} 响应超时"))
-    }
-
-    fn drain_events(&mut self, duration: Duration) {
-        let deadline = Instant::now() + duration;
-        while Instant::now() < deadline {
-            match self.ws.read() {
-                Ok(Message::Text(text)) => {
-                    if let Ok(val) = serde_json::from_str::<Value>(&text) {
-                        self.handle_event(&val);
-                    }
-                }
-                Ok(Message::Ping(data)) => {
-                    let _ = self.ws.send(Message::Pong(data));
-                }
-                Ok(Message::Close(_)) => break,
-                Ok(_) => {}
-                Err(tungstenite::Error::Io(ref io_err))
-                    if io_err.kind() == std::io::ErrorKind::WouldBlock
-                        || io_err.kind() == std::io::ErrorKind::TimedOut =>
-                {
-                    thread::sleep(Duration::from_millis(40));
-                }
-                Err(_) => break,
-            }
-        }
-    }
-
-    fn eval_js(&mut self, expression: &str) -> Result<Value, String> {
-        let res = self.send(
-            "Runtime.evaluate",
-            json!({
-                "expression": expression,
-                "returnByValue": true,
-                "awaitPromise": true,
-            }),
-        )?;
-        Ok(res
-            .get("result")
-            .and_then(|r| r.get("value"))
-            .cloned()
-            .unwrap_or(Value::Null))
-    }
-
-    fn get_zhihuishu_cookies(&mut self) -> Result<Vec<PlaywrightCookie>, String> {
-        let res = self.send("Network.getAllCookies", json!({}))?;
-        let raw_cookies = res
-            .get("cookies")
-            .and_then(|v| v.as_array())
-            .cloned()
-            .unwrap_or_default();
-        Ok(normalize_cdp_cookies(&raw_cookies))
-    }
-
-    fn set_cookies(&mut self, cookies: &[PlaywrightCookie]) -> Result<(), String> {
-        let mut cdp_cookies = Vec::new();
-        for c in cookies {
-            if c.name.trim().is_empty() || c.domain.trim().is_empty() {
-                continue;
-            }
-            let mut obj = json!({
-                "name": c.name,
-                "value": c.value,
-                "domain": c.domain,
-                "path": if c.path.is_empty() { "/" } else { &c.path },
-                "secure": c.secure,
-                "httpOnly": c.http_only,
-            });
-            if let Some(exp) = c.expires {
-                if exp > 0.0 {
-                    obj["expires"] = json!(exp);
-                }
-            }
-            if let Some(ref ss) = c.same_site {
-                if matches!(ss.as_str(), "Strict" | "Lax" | "None") {
-                    obj["sameSite"] = json!(ss);
-                }
-            }
-            cdp_cookies.push(obj);
-        }
-        if !cdp_cookies.is_empty() {
-            let _ = self.send("Network.setCookies", json!({ "cookies": cdp_cookies }))?;
-        }
-        Ok(())
-    }
-
-    fn get_response_body(&mut self, request_id: &str) -> Option<String> {
-        let res = self
-            .send("Network.getResponseBody", json!({ "requestId": request_id }))
-            .ok()?;
-        let body = res.get("body")?.as_str()?;
-        let base64_encoded = res
-            .get("base64Encoded")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
-        if base64_encoded {
-            return decode_base64_utf8(body);
-        }
-        Some(body.to_string())
-    }
-}
-
-fn is_zhihuishu_domain(domain: &str) -> bool {
-    let norm = domain.trim().trim_start_matches('.').to_ascii_lowercase();
-    norm == "zhihuishu.com" || norm.ends_with(".zhihuishu.com")
-}
-
-fn is_login_url(url: &str) -> bool {
-    let lower = url.to_ascii_lowercase();
-    lower.contains("passport.zhihuishu.com") || lower.contains("login.zhihuishu.com")
-}
-
-fn normalize_cdp_cookies(raw_cookies: &[Value]) -> Vec<PlaywrightCookie> {
-    let now = now_epoch_secs() as f64;
-    let mut out = Vec::new();
-    for item in raw_cookies {
-        let name = item
-            .get("name")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .trim()
-            .to_string();
-        let domain = item
-            .get("domain")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .trim()
-            .to_string();
-        if name.is_empty() || !is_zhihuishu_domain(&domain) {
-            continue;
-        }
-        let expires = item
-            .get("expires")
-            .and_then(|v| v.as_f64())
-            .filter(|&e| e > 0.0);
-        if let Some(exp) = expires {
-            if exp <= now {
-                continue;
-            }
-        }
-        let value = item
-            .get("value")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-        let path = item
-            .get("path")
-            .and_then(|v| v.as_str())
-            .filter(|s| !s.is_empty())
-            .unwrap_or("/")
-            .to_string();
-        let http_only = item
-            .get("httpOnly")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
-        let secure = item
-            .get("secure")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
-        let same_site = item
-            .get("sameSite")
-            .and_then(|v| v.as_str())
-            .filter(|s| matches!(*s, "Strict" | "Lax" | "None"))
-            .map(ToString::to_string);
-
-        out.push(PlaywrightCookie {
-            name,
-            value,
-            domain,
-            path,
-            expires,
-            http_only,
-            secure,
-            same_site,
-        });
-    }
-    out
-}
-
-fn save_cookies_atomic(base_dir: &Path, cookies: &[PlaywrightCookie]) -> Result<(), String> {
-    let data_dir = base_dir.join("data");
-    let target = data_dir.join("cookies.json");
-    let json_text =
-        serde_json::to_string(cookies).map_err(|e| format!("序列化 Cookie 失败: {e}"))?;
-    write_file_atomic(&target, json_text.as_bytes(), "Cookie 文件")
-}
-
-fn load_saved_cookies(base_dir: &Path) -> Result<Vec<PlaywrightCookie>, String> {
-    let path = base_dir.join("data").join("cookies.json");
-    if !path.is_file() {
-        return Err("本地暂无保存的登录凭证".to_string());
-    }
-    let raw = fs::read_to_string(&path).map_err(|e| format!("读取本地 Cookie 失败: {e}"))?;
-    let parsed: Vec<PlaywrightCookie> =
-        serde_json::from_str(&raw).map_err(|e| format!("本地 Cookie 文件格式无效: {e}"))?;
-    if parsed.is_empty() {
-        return Err("本地 Cookie 为空".to_string());
-    }
-    Ok(parsed)
-}
-
-fn resolve_session_browser(base_dir: &Path, requested_exe: &str) -> Result<(String, String, String), String> {
+fn resolve_session_browser(
+    base_dir: &Path,
+    requested_exe: &str,
+) -> Result<(String, String, String), String> {
     let detected = detect_installed_browsers();
     let cfg = load_config_from_dir(base_dir).unwrap_or_default();
     let preferred_exe = if !requested_exe.trim().is_empty() {
@@ -748,118 +212,6 @@ fn resolve_session_browser(base_dir: &Path, requested_exe: &str) -> Result<(Stri
         return Ok((driver, exe_path, display_name));
     }
     Err("未在当前设备上检测到 Edge / Chrome 等 Chromium 内核浏览器，请先安装 Chrome 或 Edge 后重试".to_string())
-}
-
-fn normalize_chromium_proxy(raw: &str) -> Option<String> {
-    let trimmed = raw.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-    let (scheme, rest) = trimmed.split_once("://")?;
-    let scheme_lower = scheme.to_ascii_lowercase();
-    let chromium_scheme = match scheme_lower.as_str() {
-        "http" => "http",
-        "https" => "https",
-        "socks5" | "socks5h" => "socks5",
-        _ => return None,
-    };
-    let host_port = rest.rsplit_once('@').map(|(_, h)| h).unwrap_or(rest);
-    let host_port = host_port.trim_end_matches('/');
-    if host_port.is_empty() {
-        return None;
-    }
-    Some(format!("{chromium_scheme}://{host_port}"))
-}
-
-fn launch_cdp_browser(
-    exe_path: &str,
-    port: u16,
-    profile_dir: &Path,
-    headless: bool,
-    initial_url: &str,
-    proxy: &str,
-    manager: &ZhsSessionManager,
-    session_id: u64,
-) -> Result<Child, String> {
-    let job = Arc::new(Job::create()?);
-    let mut cmd = Command::new(exe_path);
-    cmd.arg(format!("--remote-debugging-port={port}"))
-        .arg(format!("--user-data-dir={}", profile_dir.display()))
-        .arg("--no-first-run")
-        .arg("--no-default-browser-check")
-        .arg("--disable-blink-features=AutomationControlled")
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
-
-    if let Some(proxy_arg) = normalize_chromium_proxy(proxy) {
-        cmd.arg(format!("--proxy-server={proxy_arg}"));
-    }
-
-    if headless {
-        cmd.arg("--headless=new")
-            .arg("--disable-gpu")
-            .arg("--window-size=1440,900");
-        configure_hidden_command(&mut cmd);
-    } else {
-        cmd.arg("--window-size=1080,760")
-            .arg("--window-position=140,80");
-    }
-    prepare_process_tree_command(&mut cmd);
-    cmd.arg(initial_url);
-
-    let mut child = cmd
-        .spawn()
-        .map_err(|e| format!("启动浏览器失败 ({exe_path}): {e}"))?;
-    if let Err(e) = job.assign(child.id()) {
-        let _ = child.kill();
-        let _ = child.wait();
-        job.terminate_with_child(Some(&mut child));
-        return Err(format!("托管浏览器进程树失败: {e}"));
-    }
-    if !manager.attach_job(session_id, job) {
-        let _ = child.kill();
-        let _ = child.wait();
-        return Err("已取消登录".to_string());
-    }
-    Ok(child)
-}
-
-fn wait_for_cdp_ws_url(
-    port: u16,
-    child: &mut Child,
-    cancel_flag: &AtomicBool,
-) -> Result<String, String> {
-    let client = reqwest::blocking::Client::builder()
-        .no_proxy()
-        .timeout(Duration::from_secs(2))
-        .build()
-        .map_err(|e| format!("创建本地调试客户端失败: {e}"))?;
-
-    let list_url = format!("http://127.0.0.1:{port}/json/list");
-    let deadline = Instant::now() + Duration::from_secs(20);
-    while Instant::now() < deadline {
-        if cancel_flag.load(Ordering::SeqCst) {
-            return Err("已取消登录".to_string());
-        }
-        if let Ok(Some(_)) = child.try_wait() {
-            return Err("浏览器已关闭".to_string());
-        }
-        if let Ok(resp) = client.get(&list_url).send() {
-            if let Ok(targets) = resp.json::<Vec<Value>>() {
-                if let Some(ws) = targets
-                    .iter()
-                    .find(|t| t.get("type").and_then(|v| v.as_str()) == Some("page"))
-                    .and_then(|t| t.get("webSocketDebuggerUrl"))
-                    .and_then(|v| v.as_str())
-                {
-                    return Ok(ws.to_string());
-                }
-            }
-        }
-        thread::sleep(Duration::from_millis(200));
-    }
-    Err("等待浏览器调试端口就绪超时，请确认浏览器可以正常启动".to_string())
 }
 
 fn get_string_field(obj: &serde_json::Map<String, Value>, keys: &[&str]) -> String {
@@ -884,7 +236,6 @@ fn short_hash(input: &str) -> String {
     format!("{h:016x}")
 }
 
-/// 合并来自 Python 后端的两组已规范化课程列表（如直拉 API 与 CDP 提取），按 URL 去重并保留更完整的元数据。
 fn merge_backend_courses(primary: Vec<CourseItem>, secondary: Vec<CourseItem>) -> Vec<CourseItem> {
     let mut by_url: HashMap<String, CourseItem> = HashMap::new();
     let mut order: Vec<String> = Vec::new();
@@ -932,198 +283,7 @@ fn run_login_autofill(cdp: &mut CdpClient, req: &LoginRequest) -> Result<Value, 
         "studentId": req.student_id.trim(),
         "password": req.password,
     });
-    let js = format!(
-        r#"(async () => {{
-            const cfg = {payload};
-            const sleep = (ms) => new Promise(r => setTimeout(r, ms));
-            const isVisible = (el) => {{
-                if (!el) return false;
-                const s = getComputedStyle(el);
-                return s.display !== 'none' && s.visibility !== 'hidden' && el.offsetWidth > 0 && el.offsetHeight > 0;
-            }};
-            const waitFor = async (fn, timeoutMs = 5000, intervalMs = 150) => {{
-                const deadline = Date.now() + timeoutMs;
-                while (Date.now() < deadline) {{
-                    const res = fn();
-                    if (res) return res;
-                    await sleep(intervalMs);
-                }}
-                return fn();
-            }};
-            const setInputEl = (el, val) => {{
-                if (!el) return false;
-                el.focus();
-                const proto = el.tagName === 'TEXTAREA' ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
-                const desc = Object.getOwnPropertyDescriptor(proto, 'value');
-                if (desc && typeof desc.set === 'function') {{
-                    desc.set.call(el, val);
-                }} else {{
-                    el.value = val;
-                }}
-                el.dispatchEvent(new Event('input', {{ bubbles: true }}));
-                el.dispatchEvent(new Event('change', {{ bubbles: true }}));
-                return true;
-            }};
-            const setInput = (sel, val) => setInputEl(document.querySelector(sel), val);
-            const checkTerms = () => {{
-                const cbs = Array.from(document.querySelectorAll('input.el-checkbox__original'));
-                for (const cb of cbs) {{
-                    if (!cb.checked) cb.click();
-                }}
-            }};
-            const findNewTab = (id, keywords) => {{
-                const byId = id ? document.getElementById(id) : null;
-                if (byId && isVisible(byId)) return byId;
-                return Array.from(document.querySelectorAll('.login-tabs .el-tabs__item, .el-tabs__item'))
-                    .find(el => isVisible(el) && keywords.some(k => (el.innerText || '').trim().includes(k))) || null;
-            }};
-            const clickNewSubmit = async () => {{
-                const btn = await waitFor(() => {{
-                    const el = document.querySelector('.btn-block__grandient_login');
-                    if (!el || !isVisible(el)) return null;
-                    if (el.classList.contains('primary') || !el.classList.contains('info')) return el;
-                    return null;
-                }}, 2500, 120) || document.querySelector('.btn-block__grandient_login');
-                if (btn && isVisible(btn)) {{
-                    btn.click();
-                    return true;
-                }}
-                return false;
-            }};
-
-            const isNewLogin = location.hostname.includes('login.zhihuishu.com')
-                || Boolean(document.querySelector('.login-tabs, .btn-block__grandient_login, input[name="mobile"], input[name="unid"]'));
-
-            if (isNewLogin) {{
-                if (cfg.mode === 'qrcode') {{
-                    const tab = findNewTab('tab-3', ['扫码']);
-                    if (tab) tab.click();
-                    return {{ ok: Boolean(tab), page: 'new', mode: 'qrcode' }};
-                }}
-
-                if (cfg.mode === 'student') {{
-                    const tab = findNewTab('tab-2', ['学号']);
-                    if (tab) tab.click();
-                    const unidEl = await waitFor(() => {{
-                        const el = document.querySelector('input[name="unid"]');
-                        return isVisible(el) ? el : null;
-                    }}, 4000, 120);
-
-                    let schoolPicked = false;
-                    if (cfg.schoolName) {{
-                        const wrapper = document.querySelector('.el-select__wrapper, .el-select');
-                        if (wrapper) wrapper.click();
-                        await sleep(200);
-                        const schInput = await waitFor(() => {{
-                            const el = document.querySelector('input.el-select__input');
-                            return isVisible(el) ? el : null;
-                        }}, 3000, 120);
-                        if (schInput) {{
-                            setInputEl(schInput, cfg.schoolName);
-                            const opt = await waitFor(() => {{
-                                const items = Array.from(document.querySelectorAll('.el-select-dropdown__item')).filter(isVisible);
-                                if (!items.length) return null;
-                                return items.find(i => (i.innerText || '').trim() === cfg.schoolName)
-                                    || items.find(i => (i.innerText || '').trim().includes(cfg.schoolName))
-                                    || items[0];
-                            }}, 5000, 180);
-                            if (opt) {{
-                                opt.click();
-                                schoolPicked = true;
-                                await sleep(250);
-                            }}
-                        }}
-                    }}
-
-                    const filledId = setInputEl(unidEl || document.querySelector('input[name="unid"]'), cfg.studentId);
-                    const pwdEl = Array.from(document.querySelectorAll('input[type="password"]')).find(isVisible)
-                        || document.querySelector('input[type="password"]');
-                    const filledPwd = setInputEl(pwdEl, cfg.password);
-                    checkTerms();
-                    await sleep(300);
-                    let submitted = false;
-                    if (schoolPicked && filledId && filledPwd && cfg.studentId && cfg.password) {{
-                        submitted = await clickNewSubmit();
-                    }}
-                    return {{ ok: filledId && filledPwd, page: 'new', mode: 'student', schoolPicked, submitted }};
-                }}
-
-                // phone / account mode on new login page
-                const tab = findNewTab('tab-1.1', ['账号登录', '手机号']);
-                if (tab && !tab.classList.contains('is-active')) {{
-                    tab.click();
-                    await sleep(250);
-                }}
-                const mobileEl = await waitFor(() => {{
-                    const el = document.querySelector('input[name="mobile"]');
-                    return isVisible(el) ? el : null;
-                }}, 4000, 120);
-                const filledUser = setInputEl(mobileEl || document.querySelector('input[name="mobile"]'), cfg.username);
-                const pwdEl = Array.from(document.querySelectorAll('input[type="password"]')).find(isVisible)
-                    || document.querySelector('input[type="password"]');
-                const filledPwd = setInputEl(pwdEl, cfg.password);
-                checkTerms();
-                await sleep(300);
-                let submitted = false;
-                if (filledUser && filledPwd && cfg.username && cfg.password) {{
-                    submitted = await clickNewSubmit();
-                }}
-                return {{ ok: filledUser && filledPwd, page: 'new', mode: 'phone', submitted }};
-            }}
-
-            // Legacy passport.zhihuishu.com fallback
-            if (cfg.mode === 'qrcode') {{
-                const qrWall = document.querySelector('.qrcode-wall-warp');
-                if (qrWall && isVisible(qrWall)) {{
-                    return {{ ok: true, page: 'legacy', mode: 'qrcode' }};
-                }}
-                const tab = document.querySelector('#qrCodeLoginNew');
-                if (tab && isVisible(tab)) tab.click();
-                return {{ ok: true, page: 'legacy', mode: 'qrcode' }};
-            }}
-
-            if (cfg.mode === 'student') {{
-                const tab = document.querySelector('#qStudentID');
-                if (tab) tab.click();
-                await sleep(250);
-                if (cfg.schoolId) {{
-                    const hidden = document.querySelector('#clSchoolId');
-                    if (hidden) hidden.value = cfg.schoolId;
-                }}
-                if (cfg.schoolName) {{
-                    setInput('#quickSearch', cfg.schoolName);
-                    if (!cfg.schoolId) {{
-                        try {{
-                            if (window.userindex && typeof window.userindex.selectSchoolByName === 'function') {{
-                                window.userindex.selectSchoolByName();
-                            }}
-                        }} catch (e) {{}}
-                        await sleep(500);
-                        const firstItem = document.querySelector('#schoolListCode li');
-                        if (firstItem) firstItem.click();
-                    }}
-                }}
-                setInput('#clCode', cfg.studentId);
-                setInput('#clPassword', cfg.password);
-                checkTerms();
-                await sleep(300);
-                const btn = document.querySelector('.wall-sub-btn');
-                if (btn && cfg.studentId && cfg.password) btn.click();
-                return {{ ok: true, page: 'legacy', mode: 'student' }};
-            }}
-
-            const tab = document.querySelector('#qSignin');
-            if (tab) tab.click();
-            await sleep(200);
-            setInput('#lUsername', cfg.username);
-            setInput('#lPassword', cfg.password);
-            checkTerms();
-            await sleep(300);
-            const btn = document.querySelector('.wall-sub-btn');
-            if (btn && cfg.username && cfg.password) btn.click();
-            return {{ ok: true, page: 'legacy', mode: 'phone' }};
-        }})()"#
-    );
+    let js = format!("({ZHS_LOGIN_AUTOFILL_JS})({payload})");
     cdp.eval_js(&js)
 }
 
@@ -1201,11 +361,9 @@ fn discover_courses_in_current_session(
                 let _ = cdp.send("Page.navigate", json!({ "url": STUDENT_HOME_URL }));
             }
         } else {
-            // Retry once with a clean reload when the initial SPA boot raced with CAS cookie settlement
             let _ = cdp.send("Page.navigate", json!({ "url": STUDENT_HOME_URL }));
         }
 
-        // Wait for student home page & initial XHR course queries to settle
         let wait_deadline = Instant::now() + Duration::from_secs(6);
         let mut ready_ticks = 0u32;
         while Instant::now() < wait_deadline {
@@ -1245,19 +403,12 @@ fn discover_courses_in_current_session(
             }
         }
 
-        // Try switching across course category tabs (共享课 / 翻转课 / 校内课 / 融合课 / AI课)
-        // and advancing pagination so Zhihuishu's SPA fires the API for every enrolled category.
         let _ = cdp.eval_js(ZHS_TAB_SWITCH_JS);
         cdp.drain_events(Duration::from_millis(1200));
 
-        // Layer 1: Collect all captured Zhihuishu JSON API responses (including any newly triggered by tab clicks)
         collect_captured_responses(cdp, true, &mut captured_responses);
 
-        // Layer 2: Inspect DOM links, Vue 2 & Vue 3 reactive state, and user header
-        let dom_val = cdp
-            .eval_js(ZHS_DOM_EXTRACT_JS)
-            .unwrap_or(Value::Null);
-
+        let dom_val = cdp.eval_js(ZHS_DOM_EXTRACT_JS).unwrap_or(Value::Null);
         let dom_courses: Vec<Value> = dom_val
             .get("courses")
             .and_then(|v| v.as_array())
@@ -1269,7 +420,6 @@ fn discover_courses_in_current_session(
             .unwrap_or("")
             .trim();
 
-        // Delegate parsing, hostname validation, classification & deduping to Python SSOT
         if let Ok(extracted) = extract_courses_via_backend(
             app,
             backend,
@@ -1396,52 +546,6 @@ fn fetch_courses_via_backend_api(
     });
     let resp = backend.post_json(Some(app), "/api/courses/fetch", &payload, 30)?;
     Ok(parse_backend_courses_response(&resp))
-}
-
-fn merge_cookies(base: &[PlaywrightCookie], updates: &[PlaywrightCookie]) -> Vec<PlaywrightCookie> {
-    if updates.is_empty() {
-        return base.to_vec();
-    }
-    let mut out = base.to_vec();
-    for upd in updates {
-        let upd_domain = upd.domain.trim().to_ascii_lowercase();
-        let upd_path = if upd.path.is_empty() { "/" } else { upd.path.as_str() };
-        if let Some(slot) = out.iter_mut().find(|c| {
-            c.name == upd.name
-                && c.domain.trim().to_ascii_lowercase() == upd_domain
-                && (if c.path.is_empty() { "/" } else { c.path.as_str() }) == upd_path
-        }) {
-            let upd_exp = upd.expires.filter(|&e| e > 0.0);
-            let slot_exp = slot.expires.filter(|&e| e > 0.0);
-            if upd.value == slot.value {
-                if slot_exp.is_none() {
-                    slot.expires = upd_exp;
-                } else if let (Some(s), Some(u)) = (slot_exp, upd_exp) {
-                    if u > s {
-                        slot.expires = Some(u);
-                    }
-                }
-                if slot.same_site.is_none() {
-                    slot.same_site = upd.same_site.clone();
-                }
-                slot.secure = slot.secure || upd.secure;
-                slot.http_only = slot.http_only || upd.http_only;
-            } else {
-                slot.value = upd.value.clone();
-                if upd_exp.is_some() {
-                    slot.expires = upd_exp;
-                }
-                if upd.same_site.is_some() {
-                    slot.same_site = upd.same_site.clone();
-                }
-                slot.secure = slot.secure || upd.secure;
-                slot.http_only = slot.http_only || upd.http_only;
-            }
-        } else {
-            out.push(upd.clone());
-        }
-    }
-    out
 }
 
 fn merge_and_save_session_config(
@@ -1648,7 +752,6 @@ pub fn execute_zhs_login(
         None
     };
 
-    // Fast path for cookie restore / refresh: call Zhihuishu course APIs directly via Python backend.
     let mut valid_api_fallback: Option<(ApiCoursesResponse, Vec<PlaywrightCookie>)> = None;
     if let Some(ref existing_cookies) = saved_cookies {
         emit_status(
@@ -1742,7 +845,6 @@ pub fn execute_zhs_login(
 
         if let Some(ref existing_cookies) = saved_cookies {
             cdp.set_cookies(existing_cookies)?;
-            // Navigate via CAS entry so a valid CASTGC automatically refreshes the onlinestuh5 ST ticket.
             let _ = cdp.send("Page.navigate", json!({ "url": LOGIN_ENTRY_URL }))?;
             let check_deadline = Instant::now() + Duration::from_secs(15);
             let mut landed = false;
@@ -1770,7 +872,6 @@ pub fn execute_zhs_login(
                     .and_then(|v| v.as_bool())
                     .unwrap_or(false);
 
-                // Only fail fast when CAS explicitly fell through to the rendered login.zhihuishu.com form.
                 if cur.to_ascii_lowercase().contains("login.zhihuishu.com") && has_new_form {
                     return Err("已保存的登录凭证已失效，请重新登录".to_string());
                 }
@@ -1798,7 +899,6 @@ pub fn execute_zhs_login(
                 }
             }
         } else {
-            // Wait for login page (Vue SPA on login.zhihuishu.com or legacy fallback) to mount controls.
             let ready_deadline = Instant::now() + Duration::from_secs(25);
             let mut legacy_seen_since: Option<Instant> = None;
             while Instant::now() < ready_deadline {
@@ -1841,7 +941,6 @@ pub fn execute_zhs_login(
                 if host.contains("login.zhihuishu.com") && has_new {
                     break;
                 }
-                // Legacy passport page redirects to login.zhihuishu.com via JS; only accept it if it stays put.
                 if host.contains("passport.zhihuishu.com")
                     && ready_state == "complete"
                     && has_legacy
@@ -1943,10 +1042,7 @@ pub fn execute_zhs_login(
                         )
                         .unwrap_or(Value::Null);
 
-                    let url_now = state
-                        .get("url")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("");
+                    let url_now = state.get("url").and_then(|v| v.as_str()).unwrap_or("");
                     if !url_now.is_empty() && !is_login_url(url_now) && url_now != "about:blank" {
                         break;
                     }
@@ -2054,7 +1150,6 @@ pub fn execute_zhs_login(
             }
         }
 
-        // Logged in! Collect cookies & discover courses via browser + direct Zhihuishu APIs
         let (browser_courses, mut detected_name, mut detected_school) =
             discover_courses_in_current_session(&mut cdp, app, backend, &cancel_flag)?;
 
@@ -2072,7 +1167,6 @@ pub fn execute_zhs_login(
         if let Ok(api_res) = api_result {
             cookies = merge_cookies(&cookies, &api_res.cookies);
             api_courses = api_res.courses;
-            // 优先采用官方 getLoginUserInfo / CASLOGC 返回的本人姓名与学校，避免首页其他接口误覆盖
             if !api_res.display_name.is_empty() {
                 detected_name = api_res.display_name;
             }
@@ -2120,7 +1214,11 @@ pub fn execute_zhs_login(
 
 #[cfg(test)]
 mod tests {
+    use super::cdp::decode_base64_utf8;
+    use super::cookies::normalize_cdp_cookies;
     use super::*;
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn normalizes_cdp_cookies_filtering_domains_and_expired() {
@@ -2293,7 +1391,6 @@ mod tests {
             },
         ];
         let updates = vec![
-            // Same value with degraded/missing metadata must NOT downgrade
             PlaywrightCookie {
                 name: "CASTGC".into(),
                 value: "tgt-1".into(),
@@ -2304,7 +1401,6 @@ mod tests {
                 secure: false,
                 same_site: None,
             },
-            // New value with missing metadata inherits original expires/same_site/flags
             PlaywrightCookie {
                 name: "SESSION".into(),
                 value: "new-sess".into(),
@@ -2337,12 +1433,10 @@ mod tests {
         let (_sid1, cancel1) = mgr.start_attempt();
         assert!(!cancel1.load(Ordering::SeqCst));
 
-        // 开启新会话会自动取消旧会话，且新会话拥有独立的未取消标志
         let (sid2, cancel2) = mgr.start_attempt();
         assert!(cancel1.load(Ordering::SeqCst));
         assert!(!cancel2.load(Ordering::SeqCst));
 
-        // 显式取消仅标记当前活跃会话，开启第三次会话不影响第二次的取消状态
         mgr.cancel();
         assert!(cancel2.load(Ordering::SeqCst));
 
@@ -2361,14 +1455,12 @@ mod tests {
         let sid2 = mgr.begin(job2);
         assert_ne!(sid1, sid2);
 
-        // Stale finish(sid1) must NOT clear sid2's active session
         mgr.finish(sid1);
         {
             let guard = lock_unpoisoned(&mgr.active_session);
             assert_eq!(guard.as_ref().map(|s| s.id), Some(sid2));
         }
 
-        // Matching finish(sid2) clears active session
         mgr.finish(sid2);
         {
             let guard = lock_unpoisoned(&mgr.active_session);
@@ -2400,12 +1492,9 @@ mod tests {
             remember_credentials: false,
         };
         let res = merge_and_save_session_config(&base_dir, &req, None, Vec::new());
-        assert!(res.is_err(), "corrupt config.ini must fail instead of falling back to default");
-        assert_eq!(
-            fs::read(&config_path).unwrap(),
-            corrupt_bytes,
-            "original config.ini must not be overwritten on read error"
-        );
+        assert!(res.is_err());
+        assert_eq!(fs::read(&config_path).unwrap(), corrupt_bytes);
+
         let _ = fs::remove_dir_all(&base_dir);
     }
 }
