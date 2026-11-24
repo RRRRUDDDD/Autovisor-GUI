@@ -289,6 +289,8 @@ async function call(cmd, args = {}) {
       return 'C:\\Autovisor\\autovisor-question-bank.json';
     case 'import_question_cache':
       return { ok: true, zhidao_questions: 0, ai_questions: 0 };
+    case 'clear_question_cache':
+      return { ok: true, zhidao_questions: 0, ai_questions: 0, json_files: 0 };
     case 'fetch_llm_models': {
       const llm = args.llm || {};
       const apiKey = String(llm.apiKey || '').trim();
@@ -369,6 +371,8 @@ export const tauriApi = {
   exportQuestionCache: (courseId = '') =>
     call('export_question_cache', { courseId: courseId || null }),
   importQuestionCache: () => call('import_question_cache'),
+  clearQuestionCache: (courseId = '') =>
+    call('clear_question_cache', { courseId: courseId || null }),
   fetchLlmModels: ({ llm, proxy = '' }) =>
     call('fetch_llm_models', { llm, proxy }),
   setDebugLog: (enabled) => call('set_debug_log', { enabled: Boolean(enabled) }),

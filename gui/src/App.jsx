@@ -617,6 +617,10 @@ export default function App() {
     return tauriApi.importQuestionCache();
   }, []);
 
+  const handleClearQuestionCache = useCallback(async () => {
+    return tauriApi.clearQuestionCache();
+  }, []);
+
   const handleCheckUpdate = useCallback(async ({ silent = false } = {}) => {
     setCheckingUpdate(true);
     if (!silent) {
@@ -1044,6 +1048,7 @@ export default function App() {
               onTestQuestionBank={handleTestQuestionBank}
               onExportQuestionCache={handleExportQuestionCache}
               onImportQuestionCache={handleImportQuestionCache}
+              onClearQuestionCache={handleClearQuestionCache}
               onImportCookies={handleImportCookies}
               onClearCookies={handleClearCookies}
               onOpenPath={handleOpenPath}

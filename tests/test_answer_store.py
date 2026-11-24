@@ -373,7 +373,11 @@ class ExportImportTests(StoreTestCase):
         self.assertEqual(len(exported["zhidao_questions"]), 1)
         self.assertEqual(len(exported["ai_questions"]), 1)
 
-        store.clear("course-1")
+        counts = store.clear("course-1")
+        self.assertEqual(
+            counts,
+            {"zhidao_questions": 1, "ai_questions": 1, "json_files": 0},
+        )
         stats = store.stats("course-1")
         self.assertEqual(stats["zhidao_questions"], 0)
         self.assertEqual(stats["ai_questions"], 0)
@@ -589,6 +593,45 @@ class AnswerCacheStoreTests(StoreTestCase):
             fresh.get("光合作用的主要产物是什么"),
             {"letters": ["A"]},
         )
+
+    def test_clear_removes_sqlite_rows_and_json_snapshots(self):
+        store, root = self.make_store()
+        store.save_options_by_eid("course-1", "exam-1", "E-1", OPTIONS, content="题干1")
+        store.upsert_ai_question("course-1", "exam-1", "q-1", 1, question_plain="AI题1", answer="A")
+        store.upsert_ai_question("course-2", "exam-2", "q-2", 1, question_plain="AI题2", answer="B")
+
+        c1_dir = root / "exam_answers" / "course-1"
+        c2_dir = root / "exam_answers" / "course-2"
+        c1_dir.mkdir(parents=True)
+        c2_dir.mkdir(parents=True)
+        (c1_dir / "data.json").write_text("{}", encoding="utf-8")
+        (c2_dir / "data.json").write_text("{}", encoding="utf-8")
+        mastery_file = root / "mastery_answers.json"
+        mastery_file.write_text("{}", encoding="utf-8")
+        unrelated = root / "keep.json"
+        unrelated.write_text("{}", encoding="utf-8")
+
+        # 路径穿越 course_id 不会误删 exam_answers 外的文件
+        escape_counts = store.clear("..")
+        self.assertEqual(escape_counts["json_files"], 0)
+        self.assertTrue(unrelated.exists())
+
+        # 按课程清理: 只清 course-1 的记录与快照
+        part = store.clear("course-1")
+        self.assertEqual(part, {"zhidao_questions": 1, "ai_questions": 1, "json_files": 1})
+        self.assertFalse((c1_dir / "data.json").exists())
+        self.assertTrue((c2_dir / "data.json").exists())
+        self.assertTrue(mastery_file.exists())
+        self.assertEqual(store.stats()["ai_questions"], 1)
+
+        # 全量清理: 清空剩余记录与所有 JSON 快照, 不影响无关文件
+        rest = store.clear()
+        self.assertEqual(rest, {"zhidao_questions": 0, "ai_questions": 1, "json_files": 2})
+        self.assertFalse((c2_dir / "data.json").exists())
+        self.assertFalse(mastery_file.exists())
+        self.assertTrue(unrelated.exists())
+        self.assertEqual(store.stats()["zhidao_questions"], 0)
+        self.assertEqual(store.stats()["ai_questions"], 0)
 
 
 if __name__ == "__main__":

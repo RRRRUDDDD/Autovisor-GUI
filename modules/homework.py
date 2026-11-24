@@ -42,14 +42,17 @@ _FILL_RE = re.compile(r"FILL\s*[:：]\s*(.+)", re.IGNORECASE | re.DOTALL)
 
 JS_SIGNATURE = r"""
 el => {
-  const ids = [...el.querySelectorAll("input,textarea")]
-    .map(i => (i.name || "") + ":" + (i.value || ""))
-    .filter(Boolean)
-    .join("|");
-  if (ids) return ids;
+  const anchor = el.querySelector("[id^='anchor_']");
+  if (anchor && anchor.id) return anchor.id;
   const mark = el.getAttribute("data-id") || el.getAttribute("data-questionid")
     || el.getAttribute("data-question-id") || "";
   if (mark) return mark;
+  const ids = [...el.querySelectorAll("input,textarea")]
+    .filter(i => (i.type || "").toLowerCase() !== "hidden")
+    .map(i => (i.name || "") + ":" + (i.value || ""))
+    .filter(s => s && s !== ":")
+    .join("|");
+  if (ids) return ids;
   const text = (el.innerText || "").trim();
   if (text) return text.slice(0, 160);
   const imgs = [...el.querySelectorAll("img")].map(i => i.getAttribute("src") || "").join("|");
@@ -101,12 +104,29 @@ JS_HAS_ANSWER = r"""
 el => {
   const inputs = [...el.querySelectorAll("input")];
   if (inputs.some(i => i.checked)) return true;
-  if (inputs.some(i => (i.value || "").trim() && i.type !== "radio" && i.type !== "checkbox")) return true;
-  const box = el.querySelector("textarea, [contenteditable=true]");
-  if (box && ((box.value || "").trim() || (box.innerText || "").trim())) return true;
+  const textTypes = new Set(["", "text", "search", "number", "tel", "url", "email"]);
+  if (inputs.some(i => {
+    const t = (i.type || "text").toLowerCase();
+    return textTypes.has(t) && !i.hidden && (i.value || "").trim();
+  })) return true;
+  const boxes = [...el.querySelectorAll("textarea, [contenteditable=true]")];
+  if (boxes.some(box => (box.value || "").trim() || (box.innerText || "").trim())) return true;
   return [...el.querySelectorAll(".nodeLab")].some(node => {
     const cls = (node.className || "") + " " + ((node.parentElement && node.parentElement.className) || "");
     return /(^|\s)(active|checked|selected|is-active|is-checked|is-selected)(\s|$)/.test(cls);
+  });
+}
+"""
+
+JS_IMAGES_READY = r"""
+el => {
+  const imgs = [...el.querySelectorAll("img")].filter(i => {
+    const r = i.getBoundingClientRect();
+    return r.width > 0 || r.height > 0 || i.getAttribute("src") || i.getAttribute("data-src");
+  });
+  return imgs.every(i => {
+    if (i.getAttribute("lazy") === "loading") return false;
+    return i.complete && i.naturalWidth > 0;
   });
 }
 """
@@ -261,6 +281,21 @@ async def _has_answer(handle) -> bool:
         return False
 
 
+async def _wait_question_images(handle, timeout: float = 5.0) -> None:
+    """等待题干/选项中的懒加载图片渲染完成, 避免视觉模型截到空白占位图."""
+    evaluate = getattr(handle, "evaluate", None)
+    if not callable(evaluate):
+        return
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            if bool(await evaluate(JS_IMAGES_READY)):
+                return
+        except Exception:
+            return
+        await asyncio.sleep(0.15)
+
+
 async def _visible_options(handle) -> list:
     handles = await handle.query_selector_all(_OPTION_SELECTOR)
     visible = []
@@ -351,6 +386,8 @@ async def _question_total(page) -> int:
                 """() => {
                   const m = (document.body.innerText || "").match(/总题数[:：]\\s*(\\d+)/);
                   if (m) return parseInt(m[1], 10);
+                  const items = document.querySelectorAll(".answerCard_list li").length;
+                  if (items) return items;
                   return document.querySelectorAll(".answerCard_list > *").length || 0;
                 }"""
             )
@@ -678,6 +715,7 @@ async def auto_answer_homework(page, config=None, *, skip_api: bool = False) -> 
             break
         qtype = await _question_type(question)
         options = await _visible_options(question)
+        await _wait_question_images(question)
         try:
             shot = await question.screenshot(type="png", timeout=8000)
         except Exception as exc:

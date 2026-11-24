@@ -666,8 +666,13 @@ async def _run_vision_fallback_on_url(
         )
         return {"skipped": True, "reason": "no_vision_model"}
     logger.info(f"「{label}」含图片题, 正在打开答题页使用视觉模型补答...")
+    prev_base = str(getattr(page, "url", "") or "").split("#", 1)[0]
+    target_base = str(url or "").split("#", 1)[0]
+    same_document = bool(prev_base and target_base and prev_base == target_base)
     try:
         await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+        if same_document and callable(getattr(page, "reload", None)):
+            await page.reload(wait_until="domcontentloaded", timeout=30000)
     except TimeoutError:
         logger.warn(f"「{label}」答题页加载较慢, 继续等待题目渲染...")
     await page.wait_for_timeout(1500)
@@ -1703,6 +1708,11 @@ def parse_args():
         metavar="PATH",
         help="从 Requests CookieJar JSON 安全导入未过期的智慧树 Cookie",
     )
+    parser.add_argument(
+        "--clear-cache",
+        action="store_true",
+        help="清理本地题库缓存（SQLite 与兼容 JSON 快照）",
+    )
     return parser.parse_args()
 
 
@@ -1739,7 +1749,11 @@ def cli() -> int:
         for path in created_files:
             logger.info(f"已生成默认配置文件: {path}", shift=True)
         if config_path in created_files and not (
-            args.course or args.fetch_courses or args.test_notify or args.import_cookies
+            args.course
+            or args.fetch_courses
+            or args.test_notify
+            or args.import_cookies
+            or args.clear_cache
         ):
             logger.warn("配置文件为默认模板, 请填写课程链接([course-url])后重新运行.", shift=True)
             return 0
@@ -1800,6 +1814,14 @@ def cli() -> int:
 
             count = import_zhihuishu_cookies(args.import_cookies, COOKIE_PATH)
             logger.info(f"已安全导入 {count} 条智慧树 Cookie.", shift=True)
+            return 0
+        if args.clear_cache:
+            counts = AiQuestionStore().clear()
+            logger.info(
+                f"已清理本地题库缓存: 知到题 {counts['zhidao_questions']} 条, "
+                f"AI 题 {counts['ai_questions']} 条, 快照文件 {counts['json_files']} 个.",
+                shift=True,
+            )
             return 0
         if args.fetch_courses:
             return asyncio.run(run_fetch_courses(config, write_config=args.write_config))

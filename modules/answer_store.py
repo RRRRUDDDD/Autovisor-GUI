@@ -1186,20 +1186,91 @@ class AiQuestionStore:
         return True
 
     # ------------------------------------------------------------------- misc
-    def clear(self, course_id=None) -> None:
+    def _clear_json_snapshots(self, course_id=None) -> int:
+        """清理与 SQLite 并存的 JSON 题库快照, 避免清理后仍命中旧文件."""
+        removed = 0
+        exam_root = self.data_root / "exam_answers"
+        if course_id is None:
+            if exam_root.is_dir():
+                for path in sorted(exam_root.rglob("*.json")):
+                    if path.is_file():
+                        try:
+                            path.unlink()
+                            removed += 1
+                        except OSError:
+                            pass
+                for child in sorted(exam_root.iterdir(), reverse=True):
+                    if child.is_dir():
+                        try:
+                            child.rmdir()
+                        except OSError:
+                            pass
+            mastery_path = self.data_root / "mastery_answers.json"
+            if mastery_path.is_file():
+                try:
+                    mastery_path.unlink()
+                    removed += 1
+                except OSError:
+                    pass
+            return removed
+
+        cid = str(course_id)
+        if not cid:
+            mastery_path = self.data_root / "mastery_answers.json"
+            if mastery_path.is_file():
+                try:
+                    mastery_path.unlink()
+                    removed += 1
+                except OSError:
+                    pass
+            return removed
+
+        if exam_root.is_dir():
+            try:
+                base = exam_root.resolve()
+                target = (exam_root / cid).resolve()
+                target.relative_to(base)
+            except (OSError, ValueError):
+                return removed
+            if target != base and target.is_dir():
+                for path in sorted(target.glob("*.json")):
+                    if path.is_file():
+                        try:
+                            path.unlink()
+                            removed += 1
+                        except OSError:
+                            pass
+                try:
+                    target.rmdir()
+                except OSError:
+                    pass
+        return removed
+
+    def clear(self, course_id=None, *, include_snapshots: bool = True) -> dict:
         def action(conn):
             if course_id is None:
-                conn.execute("DELETE FROM zhidao_questions")
-                conn.execute("DELETE FROM ai_questions")
+                zhidao_cur = conn.execute("DELETE FROM zhidao_questions")
+                ai_cur = conn.execute("DELETE FROM ai_questions")
             else:
-                conn.execute(
+                zhidao_cur = conn.execute(
                     "DELETE FROM zhidao_questions WHERE course_id=?", (str(course_id),)
                 )
-                conn.execute(
+                ai_cur = conn.execute(
                     "DELETE FROM ai_questions WHERE course_id=?", (str(course_id),)
                 )
+            return max(0, int(zhidao_cur.rowcount or 0)), max(
+                0, int(ai_cur.rowcount or 0)
+            )
 
-        self._write(action)
+        zhidao_deleted, ai_deleted = self._write(action)
+        json_deleted = (
+            self._clear_json_snapshots(course_id) if include_snapshots else 0
+        )
+        return {
+            "zhidao_questions": zhidao_deleted,
+            "ai_questions": ai_deleted,
+            "json_files": json_deleted,
+        }
 
     def stats(self, course_id=None) -> dict:
         def action(conn):

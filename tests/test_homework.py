@@ -278,6 +278,25 @@ class HybridRoutingTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(solved)
 
+    async def test_js_has_answer_and_signature_ignore_hidden_inputs(self):
+        # 静态契约验证：JS_HAS_ANSWER 只检查可见文本输入，不把 <input type="hidden" value="[]"> 误判为已作答
+        self.assertIn("textTypes", homework.JS_HAS_ANSWER)
+        self.assertNotIn('i.type !== "radio" && i.type !== "checkbox"', homework.JS_HAS_ANSWER)
+        # JS_SIGNATURE 优先读取知到 anchor_<eid> 并过滤 hidden 输入
+        self.assertIn("[id^='anchor_']", homework.JS_SIGNATURE)
+        self.assertIn('!== "hidden"', homework.JS_SIGNATURE)
+
+    async def test_wait_question_images_polls_until_ready(self):
+        calls = {"count": 0}
+
+        class _ImgQuestion:
+            async def evaluate(self, _js):
+                calls["count"] += 1
+                return calls["count"] >= 2
+
+        await homework._wait_question_images(_ImgQuestion(), timeout=2.0)
+        self.assertEqual(calls["count"], 2)
+
 
 if __name__ == "__main__":
     unittest.main()

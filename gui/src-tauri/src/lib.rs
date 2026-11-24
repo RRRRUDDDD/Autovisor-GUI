@@ -458,6 +458,22 @@ async fn import_question_cache(
 }
 
 #[tauri::command]
+async fn clear_question_cache(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    course_id: Option<String>,
+) -> Result<serde_json::Value, String> {
+    let backend = Arc::clone(&state.backend);
+    let payload = serde_json::json!({ "courseId": course_id.unwrap_or_default() });
+    let resp = tauri::async_runtime::spawn_blocking(move || {
+        backend.post_json(Some(&app), "/api/cache/clear", &payload, 30)
+    })
+    .await
+    .map_err(|e| format!("清理题库缓存异常: {e}"))??;
+    Ok(resp)
+}
+
+#[tauri::command]
 async fn fetch_llm_models(
     app: AppHandle,
     state: State<'_, AppState>,
@@ -815,6 +831,7 @@ pub fn run() {
             test_question_bank,
             export_question_cache,
             import_question_cache,
+            clear_question_cache,
             fetch_llm_models,
             set_debug_log,
             start_qr_login,

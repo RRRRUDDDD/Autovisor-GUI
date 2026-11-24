@@ -189,6 +189,10 @@ describe('Desktop Parity features (Phases 1-6)', () => {
     const onTestQuestionBank = vi.fn().mockResolvedValue('题库连接正常, 剩余 5 次');
     const onExportQuestionCache = vi.fn().mockResolvedValue('C:\\out.json');
     const onImportQuestionCache = vi.fn().mockResolvedValue({ questions: 3, answers: 4 });
+    const onClearQuestionCache = vi
+      .fn()
+      .mockResolvedValueOnce({ zhidao_questions: 5, ai_questions: 2, json_files: 1 })
+      .mockResolvedValueOnce({ zhidao_questions: 0, ai_questions: 0, json_files: 0 });
 
     render(
       <SettingsView
@@ -199,6 +203,7 @@ describe('Desktop Parity features (Phases 1-6)', () => {
         onTestQuestionBank={onTestQuestionBank}
         onExportQuestionCache={onExportQuestionCache}
         onImportQuestionCache={onImportQuestionCache}
+        onClearQuestionCache={onClearQuestionCache}
       />
     );
 
@@ -240,6 +245,22 @@ describe('Desktop Parity features (Phases 1-6)', () => {
     expect(
       await screen.findByText('题库缓存导入完成：题目 3，答案 4')
     ).toBeTruthy();
+
+    fireEvent.click(screen.getByRole('button', { name: '清理题库缓存' }));
+    fireEvent.click(screen.getByRole('button', { name: '取消' }));
+    expect(onClearQuestionCache).not.toHaveBeenCalled();
+
+    fireEvent.click(screen.getByRole('button', { name: '清理题库缓存' }));
+    fireEvent.click(screen.getByRole('button', { name: '确认清理缓存' }));
+    await waitFor(() => expect(onClearQuestionCache).toHaveBeenCalledTimes(1));
+    expect(
+      await screen.findByText('题库缓存已清理：知到题 5 条，AI 题 2 条，快照文件 1 个')
+    ).toBeTruthy();
+
+    fireEvent.click(screen.getByRole('button', { name: '清理题库缓存' }));
+    fireEvent.click(screen.getByRole('button', { name: '确认清理缓存' }));
+    await waitFor(() => expect(onClearQuestionCache).toHaveBeenCalledTimes(2));
+    expect(await screen.findByText('题库缓存已为空，无需清理')).toBeTruthy();
   });
 
   it('syncs exePath when switching browser driver in SettingsView', () => {

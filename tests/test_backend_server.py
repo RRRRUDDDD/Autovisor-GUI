@@ -489,6 +489,70 @@ class BackendServerProcessTests(unittest.TestCase):
                     err_body = json.loads(err_ctx.exception.read().decode("utf-8"))
                     self.assertIn("error", err_body)
 
+                # 4c. /api/cache/import -> /api/cache/stats -> /api/cache/clear
+                import_payload = {
+                    "data": {
+                        "zhidao_questions": [
+                            {
+                                "course_id": "c-1",
+                                "exam_id": "e-1",
+                                "eid": "E1",
+                                "content": "测试题干",
+                                "options": [{"id": 1, "content": "选项A"}],
+                                "correct_options": [1],
+                            }
+                        ],
+                        "ai_questions": [
+                            {
+                                "course_id": "c-1",
+                                "exam_id": "e-1",
+                                "question_id": "q-1",
+                                "question_plain": "AI 题干",
+                                "answer": "A",
+                            }
+                        ],
+                    }
+                }
+                req_import = urllib.request.Request(
+                    f"{base_url}/api/cache/import",
+                    data=json.dumps(import_payload).encode("utf-8"),
+                    headers={
+                        "X-Autovisor-Token": token,
+                        "Content-Type": "application/json",
+                    },
+                    method="POST",
+                )
+                with urllib.request.urlopen(req_import, timeout=5) as resp:
+                    imp_body = json.loads(resp.read().decode("utf-8"))
+                self.assertTrue(imp_body["ok"])
+                self.assertEqual(imp_body["zhidao_questions"], 1)
+                self.assertEqual(imp_body["ai_questions"], 1)
+
+                req_clear = urllib.request.Request(
+                    f"{base_url}/api/cache/clear",
+                    data=json.dumps({}).encode("utf-8"),
+                    headers={
+                        "X-Autovisor-Token": token,
+                        "Content-Type": "application/json",
+                    },
+                    method="POST",
+                )
+                with urllib.request.urlopen(req_clear, timeout=5) as resp:
+                    clear_body = json.loads(resp.read().decode("utf-8"))
+                self.assertTrue(clear_body["ok"])
+                self.assertEqual(clear_body["zhidao_questions"], 1)
+                self.assertEqual(clear_body["ai_questions"], 1)
+
+                req_stats = urllib.request.Request(
+                    f"{base_url}/api/cache/stats",
+                    headers={"X-Autovisor-Token": token},
+                )
+                with urllib.request.urlopen(req_stats, timeout=5) as resp:
+                    stats_body = json.loads(resp.read().decode("utf-8"))
+                self.assertTrue(stats_body["ok"])
+                self.assertEqual(stats_body["zhidao_questions"], 0)
+                self.assertEqual(stats_body["ai_questions"], 0)
+
                 # 5. Closing stdin triggers graceful shutdown
                 proc.stdin.close()
                 exit_code = proc.wait(timeout=8)

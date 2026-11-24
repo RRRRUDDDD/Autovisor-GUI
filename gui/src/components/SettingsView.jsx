@@ -68,6 +68,7 @@ const SettingsView = ({
   onTestQuestionBank,
   onExportQuestionCache,
   onImportQuestionCache,
+  onClearQuestionCache,
   onImportCookies,
   onClearCookies,
   onOpenPath,
@@ -101,6 +102,7 @@ const SettingsView = ({
   const [testingBank, setTestingBank] = useState(false);
   const [bankResult, setBankResult] = useState(null);
   const [cacheBusy, setCacheBusy] = useState(false);
+  const [confirmClearCache, setConfirmClearCache] = useState(false);
 
   const refreshLogs = useCallback(async () => {
     if (!onListLogFiles) return;
@@ -256,6 +258,7 @@ const SettingsView = ({
   const handleTestQuestionBank = async () => {
     if (!onTestQuestionBank) return;
     setTestingBank(true);
+    setConfirmClearCache(false);
     setBankResult(null);
     try {
       const message = await onTestQuestionBank({
@@ -277,6 +280,7 @@ const SettingsView = ({
   const handleExportCache = async () => {
     if (!onExportQuestionCache) return;
     setCacheBusy(true);
+    setConfirmClearCache(false);
     setBankResult(null);
     try {
       const path = await onExportQuestionCache();
@@ -298,6 +302,7 @@ const SettingsView = ({
   const handleImportCache = async () => {
     if (!onImportQuestionCache) return;
     setCacheBusy(true);
+    setConfirmClearCache(false);
     setBankResult(null);
     try {
       const result = await onImportQuestionCache();
@@ -317,6 +322,36 @@ const SettingsView = ({
       setBankResult({
         type: 'error',
         message: err?.message || String(err) || '导入题库缓存失败',
+      });
+    } finally {
+      setCacheBusy(false);
+    }
+  };
+
+  const handleClearCache = async () => {
+    if (!onClearQuestionCache) return;
+    setCacheBusy(true);
+    setConfirmClearCache(false);
+    setBankResult(null);
+    try {
+      const result = await onClearQuestionCache();
+      const zhidao = Number(result?.zhidao_questions || 0);
+      const ai = Number(result?.ai_questions || 0);
+      const jsonFiles = Number(result?.json_files || 0);
+      const parts = [
+        zhidao > 0 ? `知到题 ${zhidao} 条` : '',
+        ai > 0 ? `AI 题 ${ai} 条` : '',
+        jsonFiles > 0 ? `快照文件 ${jsonFiles} 个` : '',
+      ].filter(Boolean);
+      setBankResult(
+        parts.length
+          ? { type: 'success', message: `题库缓存已清理：${parts.join('，')}` }
+          : { type: 'info', message: '题库缓存已为空，无需清理' }
+      );
+    } catch (err) {
+      setBankResult({
+        type: 'error',
+        message: err?.message || String(err) || '清理题库缓存失败',
       });
     } finally {
       setCacheBusy(false);
@@ -840,11 +875,52 @@ const SettingsView = ({
                 <RefreshCw className="h-3.5 w-3.5" aria-hidden="true" />
                 导入题库缓存
               </Button>
+              {confirmClearCache ? (
+                <>
+                  <Button
+                    type="button"
+                    variant="destructive"
+                    size="sm"
+                    onClick={handleClearCache}
+                    disabled={cacheBusy || taskRunning}
+                  >
+                    <Trash2 className="h-3.5 w-3.5" aria-hidden="true" />
+                    确认清理缓存
+                  </Button>
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="sm"
+                    onClick={() => setConfirmClearCache(false)}
+                    disabled={cacheBusy}
+                  >
+                    取消
+                  </Button>
+                </>
+              ) : (
+                <Button
+                  type="button"
+                  variant="destructive-tonal"
+                  size="sm"
+                  onClick={() => {
+                    setBankResult(null);
+                    setConfirmClearCache(true);
+                  }}
+                  disabled={cacheBusy || taskRunning}
+                >
+                  <Trash2 className="h-3.5 w-3.5" aria-hidden="true" />
+                  清理题库缓存
+                </Button>
+              )}
               {bankResult && (
                 <p
                   role={bankResult.type === 'error' ? 'alert' : 'status'}
                   className={`text-xs font-medium ${
-                    bankResult.type === 'error' ? 'text-error' : 'text-success'
+                    bankResult.type === 'error'
+                      ? 'text-error'
+                      : bankResult.type === 'info'
+                        ? 'text-on-surface-variant'
+                        : 'text-success'
                   }`}
                 >
                   {bankResult.message}

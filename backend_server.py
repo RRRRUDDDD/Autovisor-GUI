@@ -1205,6 +1205,17 @@ class BackendRequestHandler(BaseHTTPRequestHandler):
                 self._send_json(HTTPStatus.BAD_GATEWAY, {"error": str(exc)})
             return
 
+        if path == "/api/cache/clear":
+            from modules.answer_store import AiQuestionStore
+
+            course_id = str(body.get("courseId") or body.get("course_id") or "").strip()
+            try:
+                counts = AiQuestionStore().clear(course_id or None)
+                self._send_json(HTTPStatus.OK, {"ok": True, **counts})
+            except Exception as exc:
+                self._send_json(HTTPStatus.BAD_GATEWAY, {"error": str(exc)})
+            return
+
         if path == "/api/question-bank/test":
             from modules.question_bank import DEFAULT_QUERY_URL, QuestionBankClient
             from modules.llm import question_bank_conf

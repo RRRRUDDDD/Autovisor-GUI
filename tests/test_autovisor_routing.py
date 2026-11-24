@@ -517,6 +517,40 @@ class ZhidaoSharedCourseAssessmentTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(exam_worker.run.call_args.kwargs["exam_id"], "E_LIVE")
         self.assertEqual(exam_worker.run.call_args.kwargs["recruit_id"], "458533")
 
+    async def test_vision_fallback_reloads_on_same_document_hash_navigation(self):
+        logger = MagicMock()
+        page = MagicMock()
+        page.url = (
+            "https://onlineexamh5new.zhihuishu.com/stuExamWeb.html"
+            "#/webExamList/dohomework/458533/S1/E1/1000013343/1847/0"
+        )
+        page.goto = AsyncMock()
+        page.reload = AsyncMock()
+        page.wait_for_timeout = AsyncMock()
+        vision_handler = AsyncMock(return_value={"ok": 10, "fill": 0, "fail": 0})
+        cfg = _config()
+
+        target_url = (
+            "https://onlineexamh5new.zhihuishu.com/stuExamWeb.html"
+            "#/webExamList/dohomework/458533/S2/E2/1000013343/1847/0"
+        )
+        with (
+            patch.object(Autovisor.quiz_page.llm, "vision_enabled", return_value=True),
+            patch.object(Autovisor.homework, "auto_answer_homework", vision_handler),
+        ):
+            res = await Autovisor._run_vision_fallback_on_url(
+                page, target_url, cfg, logger, label="第二章单元测试"
+            )
+
+        self.assertEqual(res, {"ok": 10, "fill": 0, "fail": 0})
+        page.goto.assert_awaited_once_with(
+            target_url, wait_until="domcontentloaded", timeout=30000
+        )
+        page.reload.assert_awaited_once_with(
+            wait_until="domcontentloaded", timeout=30000
+        )
+        vision_handler.assert_awaited_once_with(page, config=cfg, skip_api=True)
+
     async def test_assessment_stage_does_not_scan_flag_2_when_auto_submit_false(self):
         logger = MagicMock()
         page = MagicMock()
