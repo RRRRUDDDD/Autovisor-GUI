@@ -23,7 +23,8 @@
 | `data/gui_courses.json` | JSON (`CourseItem[]`, `camelCase`) | Rust 读写 | 与 `config.ini [course-url]` 合并保留用户手动取消勾选与自定义标题 |
 | `data/mirrors.json` | JSON (`{ name: url }`) | Rust 写，Rust/Python 读 | 默认从内置资源初始化 |
 | `data/cookies.json` | JSON (`PlaywrightCookie[]`) | Rust/Python 原子写 | Unix 强制 `0o600`；加载时过滤过期与非 `*.zhihuishu.com` 域名 |
-| `data/gui_prefs.json` | JSON (`GuiPrefs`) | Rust 锁内事务式读写 (`update_prefs`) | 损坏时备份为 `.corrupt.<ts>` 并报错，禁止静默清空 |
+| `data/gui_prefs.json` | JSON (`GuiPrefs`) | Rust 锁内事务式读写 (`update_prefs`) | 损坏时备份为 `.corrupt.<ts>` 并报错，禁止静默清空；不再持久化或向 WebView 暴露明文密码（仅返回 `hasSavedPhonePassword` / `hasSavedStudentPassword`） |
+| `data/credentials.json` | 加密凭据存储（Windows DPAPI / macOS Keychain / Linux Secret Service，无密钥链时降级 `0o600` 文件） | Rust `credentials.rs` | 首次加载自动迁移旧版 `gui_prefs.json` 明文密码并清除原明文字段；登录时可通过 `LoginRequest.useSavedPassword` 在 Rust 侧解密使用 |
 | `data/questions_bank.db` | SQLite (WAL, `synchronous=NORMAL`) | Python `AiQuestionStore` | 统一题库单点数据源；首次自动迁移旧 `data/answers.db` / `data/answer_cache.json` / `data/exams/*/answers.json` |
 
 ### 1.3 `AutovisorConfig` JSON Schema（Tauri IPC `camelCase`）

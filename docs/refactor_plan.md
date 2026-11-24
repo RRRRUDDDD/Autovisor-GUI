@@ -62,7 +62,7 @@ cargo test --manifest-path gui/src-tauri/Cargo.toml
 - [x] **T4.1** 拆分 Python 巨型入口：`Autovisor.py`、`backend_server.py`、`llm.py`、`exam_ctx.py`、`course_fetcher.py`、`popups.py`
 - [x] **T4.2** 拆分 Rust 模块：`zhs_session.rs`、`config_ini.rs`、`lib.rs`（并切换异步 `reqwest::Client`）
 - [x] **T4.3** 拆分 React 巨型组件：`SettingsView.jsx`、`LoginView.jsx`、`WorkspaceView.jsx`、`App.jsx`（含修复错位日志控件）
-- [ ] **T4.4** 凭据持久化加密（DPAPI / `keyring`）+ 停止在 `get_runtime_info` 暴露明文密码
+- [x] **T4.4** 凭据持久化加密（DPAPI / `keyring`）+ 停止在 `get_runtime_info` 暴露明文密码
 - [ ] **T4.5** 测试覆盖补盲（`ai_smart_mastery`、`quiz_page`、前端核心组件）+ 构建脚本去重 + CI 增加 `clippy`/ESLint
 
 ---

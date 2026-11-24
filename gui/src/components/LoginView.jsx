@@ -111,6 +111,14 @@ const LoginView = ({
   const [rememberStudentCredentials, setRememberStudentCredentials] = useState(
     () => hasSavedStudent
   );
+  const [hasEncryptedPhonePassword, setHasEncryptedPhonePassword] = useState(() =>
+    Boolean(savedLogin?.rememberPhone && savedLogin?.hasSavedPhonePassword && !savedLogin?.phonePassword)
+  );
+  const [hasEncryptedStudentPassword, setHasEncryptedStudentPassword] = useState(() =>
+    Boolean(
+      savedLogin?.rememberStudent && savedLogin?.hasSavedStudentPassword && !savedLogin?.studentPassword
+    )
+  );
   const [clearingSaved, setClearingSaved] = useState(false);
   const [proxyInput, setProxyInput] = useState(() => config?.proxy || '');
   const [showProxyInput, setShowProxyInput] = useState(() => Boolean(config?.proxy));
@@ -299,12 +307,16 @@ const LoginView = ({
       return;
     }
 
+    const usingSavedPhonePw = mode === 'phone' && !phonePassword && hasEncryptedPhonePassword;
+    const usingSavedStudentPw =
+      mode === 'student' && !studentPassword && hasEncryptedStudentPassword;
+
     if (mode === 'phone') {
       if (!username.trim()) {
         setError('请输入手机号或账号');
         return;
       }
-      if (!phonePassword) {
+      if (!phonePassword && !usingSavedPhonePw) {
         setError('请输入登录密码');
         return;
       }
@@ -318,7 +330,7 @@ const LoginView = ({
         setError('请输入大学学号');
         return;
       }
-      if (!studentPassword) {
+      if (!studentPassword && !usingSavedStudentPw) {
         setError('请输入学号登录密码');
         return;
       }
@@ -336,6 +348,7 @@ const LoginView = ({
       schoolName: mode === 'student' ? (selectedSchool?.name || schoolQuery).trim() : '',
       studentId: mode === 'student' ? studentId.trim() : '',
       password: mode === 'phone' ? phonePassword : mode === 'student' ? studentPassword : '',
+      useSavedPassword: usingSavedPhonePw || usingSavedStudentPw,
       browserExe: activeBrowser?.exePath || config?.exePath || '',
       proxy: trimmedProxy,
       rememberCredentials:
@@ -360,12 +373,14 @@ const LoginView = ({
       if (targetMode === 'phone') {
         setUsername('');
         setPhonePassword('');
+        setHasEncryptedPhonePassword(false);
         setRememberCredentials(false);
       } else if (targetMode === 'student') {
         setSchoolQuery('');
         setSelectedSchool(null);
         setStudentId('');
         setStudentPassword('');
+        setHasEncryptedStudentPassword(false);
         setRememberStudentCredentials(false);
       }
     } catch (err) {
@@ -490,15 +505,23 @@ const LoginView = ({
                     username={username}
                     onChangeUsername={setUsername}
                     password={phonePassword}
-                    onChangePassword={setPhonePassword}
+                    onChangePassword={(val) => {
+                      setPhonePassword(val);
+                      if (val) setHasEncryptedPhonePassword(false);
+                    }}
                     showPassword={showPassword}
                     onToggleShowPassword={() => setShowPassword((s) => !s)}
                     rememberCredentials={rememberCredentials}
                     onChangeRemember={setRememberCredentials}
-                    hasSavedPhone={hasSavedPhone}
+                    hasSavedPhone={hasSavedPhone || hasEncryptedPhonePassword}
                     loading={loading}
                     clearingSaved={clearingSaved}
                     onClearRemembered={() => void handleClearRemembered('phone')}
+                    passwordPlaceholder={
+                      hasEncryptedPhonePassword
+                        ? '已加密保存密码，留空直接登录或输入新密码'
+                        : '请输入密码'
+                    }
                   />
                 )}
 
@@ -511,17 +534,25 @@ const LoginView = ({
                     studentId={studentId}
                     onChangeStudentId={setStudentId}
                     password={studentPassword}
-                    onChangePassword={setStudentPassword}
+                    onChangePassword={(val) => {
+                      setStudentPassword(val);
+                      if (val) setHasEncryptedStudentPassword(false);
+                    }}
                     showPassword={showPassword}
                     onToggleShowPassword={() => setShowPassword((s) => !s)}
                     rememberCredentials={rememberStudentCredentials}
                     onChangeRemember={setRememberStudentCredentials}
-                    hasSavedStudent={hasSavedStudent}
+                    hasSavedStudent={hasSavedStudent || hasEncryptedStudentPassword}
                     effectiveProxy={effectiveProxy}
                     loading={loading}
                     clearingSaved={clearingSaved}
                     mountedRef={mountedRef}
                     onClearRemembered={() => void handleClearRemembered('student')}
+                    passwordPlaceholder={
+                      hasEncryptedStudentPassword
+                        ? '已加密保存密码，留空直接登录或输入新密码'
+                        : '请输入密码'
+                    }
                   />
                 )}
 

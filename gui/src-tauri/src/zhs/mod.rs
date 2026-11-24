@@ -9,6 +9,7 @@ use crate::browser_detect::{detect_installed_browsers, resolve_browser_choice};
 use crate::config::{
     load_config_from_dir, merge_discovered_courses, save_config_to_dir, AutovisorConfig, CourseItem,
 };
+use crate::credentials::{self, PHONE_PASSWORD_KEY, STUDENT_PASSWORD_KEY};
 use crate::process_tree::Job;
 use crate::runtime::{update_prefs, SavedLoginInfo, SessionProfile};
 use cdp::{
@@ -59,6 +60,8 @@ pub struct LoginRequest {
     pub proxy: String,
     #[serde(default)]
     pub remember_credentials: bool,
+    #[serde(default)]
+    pub use_saved_password: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -667,27 +670,45 @@ fn finalize_session_result(
             }
             if req.mode == "phone" {
                 if req.remember_credentials {
+                    let stored_ok = if !req.password.is_empty() {
+                        credentials::store_secret(base_dir, PHONE_PASSWORD_KEY, &req.password)
+                            .is_ok()
+                    } else {
+                        credentials::has_secret(base_dir, PHONE_PASSWORD_KEY)
+                    };
                     saved.remember_phone = true;
                     saved.phone_username = req.username.trim().to_string();
-                    saved.phone_password = req.password.clone();
+                    saved.phone_password.clear();
+                    saved.has_saved_phone_password = stored_ok;
                 } else {
+                    let _ = credentials::delete_secret(base_dir, PHONE_PASSWORD_KEY);
                     saved.remember_phone = false;
                     saved.phone_username.clear();
                     saved.phone_password.clear();
+                    saved.has_saved_phone_password = false;
                 }
             } else if req.mode == "student" {
                 if req.remember_credentials {
+                    let stored_ok = if !req.password.is_empty() {
+                        credentials::store_secret(base_dir, STUDENT_PASSWORD_KEY, &req.password)
+                            .is_ok()
+                    } else {
+                        credentials::has_secret(base_dir, STUDENT_PASSWORD_KEY)
+                    };
                     saved.remember_student = true;
                     saved.school_id = req.school_id.trim().to_string();
                     saved.school_name = req.school_name.trim().to_string();
                     saved.student_id = req.student_id.trim().to_string();
-                    saved.student_password = req.password.clone();
+                    saved.student_password.clear();
+                    saved.has_saved_student_password = stored_ok;
                 } else {
+                    let _ = credentials::delete_secret(base_dir, STUDENT_PASSWORD_KEY);
                     saved.remember_student = false;
                     saved.school_id.clear();
                     saved.school_name.clear();
                     saved.student_id.clear();
                     saved.student_password.clear();
+                    saved.has_saved_student_password = false;
                 }
             }
             prefs.saved_login = Some(saved);
@@ -730,8 +751,22 @@ pub fn execute_zhs_login(
     manager: &ZhsSessionManager,
     backend: &BackendManager,
     base_dir: &Path,
-    req: LoginRequest,
+    mut req: LoginRequest,
 ) -> Result<SessionResult, String> {
+    if req.password.is_empty() && req.use_saved_password {
+        let secret_key = match req.mode.as_str() {
+            "phone" => Some(PHONE_PASSWORD_KEY),
+            "student" => Some(STUDENT_PASSWORD_KEY),
+            _ => None,
+        };
+        if let Some(key) = secret_key {
+            let loaded = credentials::load_secret(base_dir, key)?;
+            match loaded {
+                Some(secret) => req.password = secret,
+                None => return Err("已保存的密码不可用，请重新输入密码".to_string()),
+            }
+        }
+    }
     let (session_id, cancel_flag) = manager.start_attempt();
     let is_cookie_mode = req.mode == "cookie";
     let auto_captcha = load_config_from_dir(base_dir)
@@ -1490,6 +1525,7 @@ mod tests {
             browser_exe: String::new(),
             proxy: String::new(),
             remember_credentials: false,
+            use_saved_password: false,
         };
         let res = merge_and_save_session_config(&base_dir, &req, None, Vec::new());
         assert!(res.is_err());

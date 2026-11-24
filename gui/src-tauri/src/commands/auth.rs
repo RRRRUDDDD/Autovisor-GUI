@@ -1,4 +1,5 @@
 use crate::config::load_config_from_dir;
+use crate::credentials::{self, PHONE_PASSWORD_KEY, STUDENT_PASSWORD_KEY};
 use crate::error::AppError;
 use crate::runtime::{self, update_prefs, RuntimeInfo};
 use crate::zhs::{
@@ -66,6 +67,7 @@ pub async fn refresh_courses(
         browser_exe: String::new(),
         proxy: String::new(),
         remember_credentials: false,
+        use_saved_password: false,
     };
     tauri::async_runtime::spawn_blocking(move || {
         execute_zhs_login(&app, &manager, &backend, &base_dir, req)
@@ -95,12 +97,29 @@ pub fn clear_saved_login(
     state: State<'_, AppState>,
     mode: Option<String>,
 ) -> Result<RuntimeInfo, AppError> {
-    update_prefs(|prefs| match mode.as_deref().map(str::trim) {
+    let base_dir = data_dir();
+    let trimmed_mode = mode.as_deref().map(str::trim);
+    match trimmed_mode {
+        Some("phone") => {
+            credentials::delete_secret(&base_dir, PHONE_PASSWORD_KEY).map_err(AppError::Config)?;
+        }
+        Some("student") => {
+            credentials::delete_secret(&base_dir, STUDENT_PASSWORD_KEY)
+                .map_err(AppError::Config)?;
+        }
+        _ => {
+            credentials::delete_secret(&base_dir, PHONE_PASSWORD_KEY).map_err(AppError::Config)?;
+            credentials::delete_secret(&base_dir, STUDENT_PASSWORD_KEY)
+                .map_err(AppError::Config)?;
+        }
+    }
+    update_prefs(|prefs| match trimmed_mode {
         Some("phone") => {
             if let Some(ref mut saved) = prefs.saved_login {
                 saved.remember_phone = false;
                 saved.phone_username.clear();
                 saved.phone_password.clear();
+                saved.has_saved_phone_password = false;
             }
         }
         Some("student") => {
@@ -110,6 +129,7 @@ pub fn clear_saved_login(
                 saved.school_name.clear();
                 saved.student_id.clear();
                 saved.student_password.clear();
+                saved.has_saved_student_password = false;
             }
         }
         _ => {

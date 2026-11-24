@@ -2,6 +2,7 @@ mod backend;
 mod browser_detect;
 mod commands;
 mod config;
+mod credentials;
 mod error;
 mod process_tree;
 mod runtime;

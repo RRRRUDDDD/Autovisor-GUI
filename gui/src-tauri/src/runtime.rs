@@ -3,6 +3,7 @@ use crate::browser_detect::{
     detect_installed_browsers, refresh_installed_browsers, DetectedBrowser,
 };
 use crate::config::{save_config_to_dir, write_file_atomic, AutovisorConfig};
+use crate::credentials::{self, PHONE_PASSWORD_KEY, STUDENT_PASSWORD_KEY};
 use crate::window_close::CloseAction;
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -31,8 +32,11 @@ pub struct SavedLoginInfo {
     pub remember_phone: bool,
     #[serde(default)]
     pub phone_username: String,
-    #[serde(default)]
+    /// 旧版明文字段：仅用于一次性读取迁移，绝不再序列化回磁盘或下发给 WebView。
+    #[serde(default, skip_serializing)]
     pub phone_password: String,
+    #[serde(default)]
+    pub has_saved_phone_password: bool,
     #[serde(default)]
     pub remember_student: bool,
     #[serde(default)]
@@ -41,8 +45,11 @@ pub struct SavedLoginInfo {
     pub school_name: String,
     #[serde(default)]
     pub student_id: String,
-    #[serde(default)]
+    /// 旧版明文字段：仅用于一次性读取迁移，绝不再序列化回磁盘或下发给 WebView。
+    #[serde(default, skip_serializing)]
     pub student_password: String,
+    #[serde(default)]
+    pub has_saved_student_password: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -287,12 +294,39 @@ where
     update_prefs_at(&path, legacy.as_deref(), mutator)
 }
 
+/// 将旧版 `gui_prefs.json` 中的明文密码一次性迁移到加密凭据存储，并回写脱敏后的 `gui_prefs.json`。
+pub fn migrate_legacy_saved_passwords(base_dir: &Path, prefs_path: &Path, prefs: &mut GuiPrefs) {
+    let Some(saved) = prefs.saved_login.as_mut() else {
+        return;
+    };
+    let mut migrated = false;
+    if !saved.phone_password.is_empty() {
+        let plain = std::mem::take(&mut saved.phone_password);
+        if credentials::store_secret(base_dir, PHONE_PASSWORD_KEY, &plain).is_ok() {
+            saved.has_saved_phone_password = true;
+            migrated = true;
+        }
+    }
+    if !saved.student_password.is_empty() {
+        let plain = std::mem::take(&mut saved.student_password);
+        if credentials::store_secret(base_dir, STUDENT_PASSWORD_KEY, &plain).is_ok() {
+            saved.has_saved_student_password = true;
+            migrated = true;
+        }
+    }
+    if migrated {
+        let _ = save_prefs_to_path(prefs_path, prefs);
+    }
+}
+
 pub fn load_prefs() -> GuiPrefs {
     let _guard = prefs_lock().lock().unwrap_or_else(|e| e.into_inner());
     let paths = resolve_app_paths();
     let path = prefs_path_in_data_dir(&paths.data_dir);
     let legacy = legacy_prefs_path_for(&paths, &appdata_dir());
-    load_prefs_with_legacy(&path, legacy.as_deref())
+    let mut prefs = load_prefs_with_legacy(&path, legacy.as_deref());
+    migrate_legacy_saved_passwords(&paths.data_dir, &path, &mut prefs);
+    prefs
 }
 
 #[allow(dead_code)]
@@ -577,6 +611,16 @@ pub fn get_runtime_info_with_refresh(
         s
     });
 
+    let saved_login = prefs.saved_login.map(|mut saved| {
+        saved.phone_password.clear();
+        saved.student_password.clear();
+        saved.has_saved_phone_password =
+            saved.remember_phone && credentials::has_secret(&base_dir, PHONE_PASSWORD_KEY);
+        saved.has_saved_student_password =
+            saved.remember_student && credentials::has_secret(&base_dir, STUDENT_PASSWORD_KEY);
+        saved
+    });
+
     RuntimeInfo {
         backend_phase: backend_status.phase.clone(),
         backend_error: backend_status.error.clone(),
@@ -592,7 +636,7 @@ pub fn get_runtime_info_with_refresh(
         close_behavior,
         detected_browsers,
         session,
-        saved_login: prefs.saved_login,
+        saved_login,
     }
 }
 
@@ -869,7 +913,7 @@ mod tests {
                 school_id: "1001".to_string(),
                 school_name: "清华大学".to_string(),
                 student_id: "20240001".to_string(),
-                student_password: "secret".to_string(),
+                has_saved_student_password: true,
                 ..Default::default()
             }),
         };
@@ -942,6 +986,65 @@ mod tests {
         let tail = read_log_tail(&log_path, 7).unwrap();
         assert!(!tail.contains('\u{FFFD}'));
         assert!(tail.ends_with("丁戊"));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn saved_login_never_serializes_plaintext_passwords_and_migrates_legacy_prefs() {
+        let root = make_temp_dir("legacy_pw_migration");
+        let prefs_path = root.join("data").join("gui_prefs.json");
+        fs::create_dir_all(prefs_path.parent().unwrap()).unwrap();
+
+        // 模拟旧版 gui_prefs.json 中含明文手机号与学号密码
+        let legacy_json = r#"{
+            "closeBehavior": "ask",
+            "savedLogin": {
+                "loginMode": "phone",
+                "rememberPhone": true,
+                "phoneUsername": "13800138000",
+                "phonePassword": "legacy-phone-secret",
+                "rememberStudent": true,
+                "schoolId": "1001",
+                "schoolName": "清华大学",
+                "studentId": "20240001",
+                "studentPassword": "legacy-student-secret"
+            }
+        }"#;
+        fs::write(&prefs_path, legacy_json).unwrap();
+
+        let mut loaded = load_prefs_from_path_strict(&prefs_path).unwrap();
+        migrate_legacy_saved_passwords(&root, &prefs_path, &mut loaded);
+
+        // 1. 内存与序列化 JSON 中不再包含明文密码
+        let serialized = serde_json::to_string(&loaded).unwrap();
+        assert!(!serialized.contains("legacy-phone-secret"));
+        assert!(!serialized.contains("legacy-student-secret"));
+        assert!(!serialized.contains("phonePassword"));
+        assert!(!serialized.contains("studentPassword"));
+        assert!(serialized.contains("\"hasSavedPhonePassword\":true"));
+        assert!(serialized.contains("\"hasSavedStudentPassword\":true"));
+
+        // 2. 磁盘上的 gui_prefs.json 已被重写脱敏
+        let disk_prefs = fs::read_to_string(&prefs_path).unwrap();
+        assert!(!disk_prefs.contains("legacy-phone-secret"));
+        assert!(!disk_prefs.contains("legacy-student-secret"));
+
+        // 3. 密码已安全迁移到加密凭据存储并可解密还原
+        assert_eq!(
+            credentials::load_secret(&root, PHONE_PASSWORD_KEY)
+                .unwrap()
+                .as_deref(),
+            Some("legacy-phone-secret")
+        );
+        assert_eq!(
+            credentials::load_secret(&root, STUDENT_PASSWORD_KEY)
+                .unwrap()
+                .as_deref(),
+            Some("legacy-student-secret")
+        );
+
+        let _ = credentials::delete_secret(&root, PHONE_PASSWORD_KEY);
+        let _ = credentials::delete_secret(&root, STUDENT_PASSWORD_KEY);
         let _ = fs::remove_dir_all(&root);
     }
 }
