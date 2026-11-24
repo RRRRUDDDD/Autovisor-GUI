@@ -6,6 +6,7 @@ const PROXY_SCHEMES = new Set(['http:', 'https:', 'socks5:', 'socks5h:']);
 function parseStrictUrl(raw, allowedSchemes) {
   const trimmed = String(raw || '').trim();
   if (!trimmed) return { empty: true, ok: true };
+  // eslint-disable-next-line no-control-regex
   if (/[\s\u0000-\u001f\u007f]/.test(trimmed)) return { empty: false, ok: false };
   try {
     const rawUrl = new URL(trimmed);

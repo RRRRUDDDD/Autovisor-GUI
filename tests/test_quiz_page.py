@@ -194,6 +194,69 @@ class QuizPageCheckboxTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(r2["ok"], 1)
         self.assertEqual(solve_mock.await_count, 4)
 
+    async def test_format_selected_options_and_skips_already_checked_single_choice(self):
+        q = {
+            "type": "single",
+            "question": "1+1=?",
+            "options": ["1", "2", "3"],
+            "answer": [1],
+            "confidence": "high",
+        }
+        self.assertEqual(quiz_page._format_selected_options(q, [1]), "B.2")
+        self.assertEqual(quiz_page._format_selected_options(q, [9]), "#9")
+
+        groups = [
+            {
+                "name": "radio1",
+                "type": "radio",
+                "options": [
+                    {"text": "1", "idx": 0, "sel": False},
+                    {"text": "2", "idx": 1, "sel": True},  # 已经选中正确答案
+                    {"text": "3", "idx": 2, "sel": False},
+                ],
+            }
+        ]
+        page = _FakeQuizPage(groups)
+        click_mock = AsyncMock(return_value=True)
+        with patch.object(quiz_page, "_click", click_mock):
+            ok, fail, filled = await quiz_page._answer_questions_once(
+                page, [q], groups, pass_name="复核"
+            )
+        self.assertEqual((ok, fail, filled), (1, 0, 0))
+        click_mock.assert_not_awaited()
+
+    async def test_fill_blank_question_writes_textbox(self):
+        class _TextboxPage:
+            def __init__(self):
+                self.filled_args = []
+
+            async def evaluate(self, script, arg=None):
+                if script is quiz_page.JS_TEXTBOXES:
+                    return [{"i": 0}]
+                if script is quiz_page.JS_FILL:
+                    self.filled_args.append(arg)
+                    return True
+                return None
+
+            async def wait_for_timeout(self, _ms):
+                return None
+
+        page = _TextboxPage()
+        questions = [
+            {
+                "type": "fill",
+                "question": "中国的首都是____",
+                "options": [],
+                "answer": ["北京"],
+                "confidence": "high",
+            }
+        ]
+        ok, fail, filled = await quiz_page._answer_questions_once(
+            page, questions, [], pass_name="首答"
+        )
+        self.assertEqual((ok, fail, filled), (0, 0, 1))
+        self.assertEqual(page.filled_args, [[0, "北京", False]])
+
 
 if __name__ == "__main__":
     unittest.main()

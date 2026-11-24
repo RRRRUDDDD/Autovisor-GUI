@@ -153,5 +153,72 @@ class AiSmartMasteryFixesTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(summary["failed"], [])
 
 
+class AiSmartMasteryUnitTests(unittest.TestCase):
+    def test_url_and_percent_parsers(self):
+        self.assertTrue(
+            mastery_mod.is_ai_leaning_url(
+                "https://ai-smart-course-student-pro.zhihuishu.com/learnPage/10/20/30"
+            )
+        )
+        self.assertFalse(mastery_mod.is_ai_leaning_url("https://example.com"))
+        self.assertEqual(
+            mastery_mod.parse_learn_url(
+                "https://ai-smart-course-student-pro.zhihuishu.com/learnPage/10/20/30?x=1"
+            ),
+            {"courseId": "10", "nodeUid": "20", "classId": "30"},
+        )
+        self.assertEqual(mastery_mod.parse_learn_url("https://example.com"), {})
+        self.assertEqual(
+            mastery_mod.parse_exam_url(
+                "https://x/studentReviewTestOrExam/99/1/2/88/nodeA/?paperId=777"
+            ),
+            {
+                "examTestId": "99",
+                "courseId": "88",
+                "nodeName": "nodeA",
+                "paperId": "777",
+            },
+        )
+        self.assertEqual(mastery_mod.parse_percent("85%"), 85)
+        self.assertEqual(mastery_mod.parse_percent("掌握度 100"), 100)
+        self.assertIsNone(mastery_mod.parse_percent("无数字"))
+
+    def test_answer_cache_sqlite_roundtrip_and_letter_normalization(self):
+        import tempfile
+        from pathlib import Path
+
+        with tempfile.TemporaryDirectory() as tmp:
+            cache_path = Path(tmp) / "mastery_answers.json"
+            cache = mastery_mod.AnswerCache(cache_path)
+            cache.put("下列哪项属于线性结构？", {"letters": ["A", "C"]}, ["栈", "树", "队列"])
+            cache.put("简述时间复杂度的含义", {"text": "表示算法执行时间随规模增长的趋势"})
+            cache.put("填空题示例", {"values": ["O(n)", "O(1)"]})
+            # Empty answer is ignored
+            cache.put("无效题", {})
+
+            self.assertEqual(
+                cache.get("下列哪项属于线性结构？"),
+                {"letters": ["A", "C"]},
+            )
+            self.assertEqual(
+                cache.get("简述时间复杂度的含义"),
+                {"text": "表示算法执行时间随规模增长的趋势"},
+            )
+            self.assertEqual(
+                cache.get("填空题示例"),
+                {"values": ["O(n)", "O(1)"]},
+            )
+            self.assertIsNone(cache.get("无效题"))
+            # Normalization converts legacy "A、B" into letters while keeping prose text intact
+            self.assertEqual(
+                mastery_mod.AnswerCache._normalize_record({"text": "A、B、C"}),
+                {"letters": ["A", "B", "C"]},
+            )
+            self.assertEqual(
+                mastery_mod.AnswerCache._normalize_record({"text": "circular/linear"}),
+                {"text": "circular/linear"},
+            )
+
+
 if __name__ == "__main__":
     unittest.main()

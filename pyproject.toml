@@ -29,9 +29,6 @@ Homepage = "https://github.com/RRRRUDDDD/Autovisor-GUI"
 Repository = "https://github.com/RRRRUDDDD/Autovisor-GUI.git"
 Issues = "https://github.com/RRRRUDDDD/Autovisor-GUI/issues"
 
-[project.optional-dependencies]
-captcha = []
-
 [dependency-groups]
 build = ["pyinstaller==6.13.0"]
 

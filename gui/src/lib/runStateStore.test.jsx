@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { act, cleanup, render, waitFor } from '@testing-library/react';
 import { applyRunStatePayload } from './runStateStore';
 import { tauriApi } from './tauriApi';
 import { defaultConfig } from './configModel';

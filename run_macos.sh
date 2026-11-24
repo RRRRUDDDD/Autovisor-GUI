@@ -109,14 +109,10 @@ deploy() {
 
     ensure_uv
 
-    local captcha driver extra=""
-    captcha=$(ini_value "$cfg" enableAutoCaptcha | tr '[:upper:]' '[:lower:]')
+    local driver
     driver=$(ini_value "$cfg" driver | tr '[:upper:]' '[:lower:]')
-    case "$captcha" in
-        true|1|yes|on) extra="--extra captcha" ;;
-    esac
-    echo "[setup] 安装 Python 依赖 (uv sync $extra)..."
-    uv sync $extra
+    echo "[setup] 安装 Python 依赖 (uv sync)..."
+    uv sync
 
     case "$driver" in
         chromium)

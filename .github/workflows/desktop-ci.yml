@@ -14,6 +14,34 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  python-linux-313:
+    name: python (ubuntu / 3.13)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Setup uv & Python 3.13
+        uses: astral-sh/setup-uv@v10.1.0
+        with:
+          python-version: "3.13"
+          enable-cache: true
+
+      - name: Install OpenCV runtime libraries
+        run: sudo apt-get update && sudo apt-get install -y libgl1
+
+      - name: Install Python dependencies
+        run: uv sync
+
+      - name: Verify captcha & backend dependencies
+        run: |
+          uv run --no-sync python -c "import cv2, numpy; print(cv2.__version__, numpy.__version__)"
+          uv run --no-sync python backend_server.py --verify-deps
+
+      - name: Python unit tests
+        run: uv run --no-sync python -m unittest discover -s tests -v
+
   desktop-check:
     name: desktop (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
@@ -50,6 +78,8 @@ jobs:
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
 
       - name: Cache Rust
         uses: Swatinem/rust-cache@v2
@@ -63,22 +93,24 @@ jobs:
           enable-cache: true
 
       - name: Install Python dependencies
-        run: uv sync --extra captcha
+        run: uv sync
 
       - name: Verify backend dependencies and run Python unit tests
         run: |
           uv run --no-sync python backend_server.py --verify-deps
           uv run --no-sync python -m unittest discover -s tests -v
 
-      - name: Frontend test & build
+      - name: Frontend lint, test & build
         working-directory: gui
         run: |
           npm ci
+          npm run lint
           npm test
           npm run build
 
-      - name: Rust check & unit tests
+      - name: Rust check, clippy & unit tests
         working-directory: gui/src-tauri
         run: |
           cargo check
+          cargo clippy --all-targets -- -D warnings
           cargo test

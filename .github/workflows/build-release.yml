@@ -129,7 +129,7 @@ jobs:
           enable-cache: true
 
       - name: Install Python dependencies
-        run: uv sync --extra captcha
+        run: uv sync
 
       - name: Verify backend dependencies and run Python unit tests
         run: |
@@ -194,7 +194,7 @@ jobs:
           enable-cache: true
 
       - name: Install Python dependencies
-        run: uv sync --extra captcha
+        run: uv sync
 
       - name: Install frontend dependencies
         working-directory: gui
@@ -329,7 +329,7 @@ jobs:
           enable-cache: true
 
       - name: Install Python dependencies
-        run: uv sync --extra captcha
+        run: uv sync
 
       - name: Install frontend dependencies
         working-directory: gui
@@ -437,7 +437,7 @@ jobs:
           enable-cache: true
 
       - name: Install Python dependencies
-        run: uv sync --extra captcha
+        run: uv sync
 
       - name: Install frontend dependencies
         working-directory: gui
