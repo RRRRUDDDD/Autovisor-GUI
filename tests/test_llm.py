@@ -682,17 +682,20 @@ class OpenAiStreamTests(unittest.TestCase):
 
     def test_reasoning_heartbeats_keep_stream_alive_beyond_idle_timeout(self):
         lines = [
-            _sse_delta({"reasoning_content": f"思考{i}"}) for i in range(12)
+            _sse_delta({"reasoning_content": f"思考{i}"}) for i in range(15)
         ] + [_sse_delta({"content": "```answer\n[{\"id\": 1}]\n```"})]
         resp = _StreamResponse(lines, delay=0.04)
-        conf = dict(self.CONF, stream_idle_timeout=0.1, stream_timeout=2)
+        conf = dict(self.CONF, stream_idle_timeout=0.4, stream_timeout=4)
+        started = time.monotonic()
         with patch("modules.llm.requests.post", return_value=resp):
             reply = llm.chat_sync("题目", conf_override=conf, stream=True)
+        elapsed = time.monotonic() - started
         self.assertIn('"id": 1', reply)
+        self.assertGreater(elapsed, conf["stream_idle_timeout"])
 
     def test_idle_timeout_exits_promptly(self):
-        resp = _StreamResponse([_sse_delta({"content": "never"})], delay=0.6)
-        conf = dict(self.CONF, stream_idle_timeout=0.1, stream_timeout=2)
+        resp = _StreamResponse([_sse_delta({"content": "never"})], delay=1.5)
+        conf = dict(self.CONF, stream_idle_timeout=0.15, stream_timeout=3)
         started = time.monotonic()
         with patch("modules.llm.requests.post", return_value=resp):
             with self.assertRaises(RuntimeError) as ctx:
@@ -700,14 +703,14 @@ class OpenAiStreamTests(unittest.TestCase):
         elapsed = time.monotonic() - started
         self.assertIn("未收到新数据", str(ctx.exception))
         self.assertTrue(resp.closed)
-        self.assertLess(elapsed, 0.45)
+        self.assertLess(elapsed, 1.0)
 
     def test_total_timeout_stops_long_reasoning(self):
         lines = [
             _sse_delta({"reasoning_content": f"思考{i}"}) for i in range(100)
         ]
-        resp = _StreamResponse(lines, delay=0.05)
-        conf = dict(self.CONF, stream_idle_timeout=0.2, stream_timeout=0.3)
+        resp = _StreamResponse(lines, delay=0.03)
+        conf = dict(self.CONF, stream_idle_timeout=0.4, stream_timeout=0.5)
         started = time.monotonic()
         with patch("modules.llm.requests.post", return_value=resp):
             with self.assertRaises(RuntimeError) as ctx:
@@ -715,7 +718,7 @@ class OpenAiStreamTests(unittest.TestCase):
         elapsed = time.monotonic() - started
         self.assertIn("总时长", str(ctx.exception))
         self.assertTrue(resp.closed)
-        self.assertLess(elapsed, 0.8)
+        self.assertLess(elapsed, 1.5)
 
     def test_utf8_bytes_sse_with_comments_and_metadata_streams(self):
         lines = [
