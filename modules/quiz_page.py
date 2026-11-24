@@ -8,6 +8,7 @@
 """
 import asyncio
 import difflib
+import hashlib
 import re
 import time
 
@@ -60,13 +61,14 @@ JS_COLLECT = r"""
 """
 
 JS_CLICK = r"""
-([key, idx]) => {
+([key, idx, wantChecked = true]) => {
   const els = [...document.querySelectorAll("input[type=radio],input[type=checkbox]")]
     .filter(el => { const r = el.getBoundingClientRect(); return r.width > 0 || r.height > 0; })
     .filter(el => (el.dataset.qhKey || el.name) === key);
   const el = els[idx];
   if (!el) return false;
-  if (el.type === "checkbox" && el.checked) return true;
+  const targetChecked = wantChecked !== false;
+  if (el.type === "checkbox" && el.checked === targetChecked) return true;
   let target = null;
   if (el.id) target = document.querySelector('label[for="' + CSS.escape(el.id) + '"]');
   target = target || el.closest("label") || el.closest(".el-radio")
@@ -100,15 +102,16 @@ JS_CHECK_ANSWERED = r"""
 """
 
 JS_TEXTBOXES = r"""
-() => [...document.querySelectorAll("textarea, input[type=text]")]
-  .filter(el => { const r = el.getBoundingClientRect(); return r.width > 0 && r.height > 0 && !el.value.trim(); })
+(includeFilled) => [...document.querySelectorAll("textarea, input[type=text]")]
+  .filter(el => { const r = el.getBoundingClientRect(); return r.width > 0 && r.height > 0 && (includeFilled || !el.value.trim()); })
   .map((el, i) => ({ i }))
 """
 
 JS_FILL = r"""
-(i, value) => {
+(args) => {
+  const i = args[0], value = args[1], includeFilled = Boolean(args[2]);
   const els = [...document.querySelectorAll("textarea, input[type=text]")]
-    .filter(el => { const r = el.getBoundingClientRect(); return r.width > 0 && r.height > 0 && !el.value.trim(); });
+    .filter(el => { const r = el.getBoundingClientRect(); return r.width > 0 && r.height > 0 && (includeFilled || !el.value.trim()); });
   const el = els[i];
   if (!el) return false;
   el.focus(); el.value = value;
@@ -245,9 +248,9 @@ def match_group(question: dict, groups: list):
     return None
 
 
-async def _click(page, key: str, idx: int) -> bool:
+async def _click(page, key: str, idx: int, want_checked: bool = True) -> bool:
     try:
-        return bool(await page.evaluate(JS_CLICK, [key, idx]))
+        return bool(await page.evaluate(JS_CLICK, [key, idx, want_checked]))
     except Exception:
         return False
 
@@ -335,22 +338,26 @@ async def _try_submit(page):
         logger.event("测验提交", 结果="异常", 错误=logger.summarize_exception(exc))
 
 
-async def _fill_blank(page, q: dict) -> bool:
+async def _fill_blank(page, q: dict, *, force_redo: bool = False, blank_idx: int = 0) -> bool:
     text = (q.get("answer") or [""])[0] if isinstance(q.get("answer"), list) else str(q.get("answer") or "")
     if not str(text).strip():
         return False
     try:
-        boxes = await page.evaluate(JS_TEXTBOXES)
+        boxes = await page.evaluate(JS_TEXTBOXES, bool(force_redo))
         if not boxes:
             return False
-        return bool(await page.evaluate(JS_FILL, [boxes[0]["i"], str(text)]))
+        target_box = boxes[blank_idx] if force_redo and blank_idx < len(boxes) else boxes[0]
+        return bool(await page.evaluate(JS_FILL, [target_box["i"], str(text), bool(force_redo)]))
     except Exception:
         return False
 
 
-async def _answer_questions_once(page, questions, groups, pass_name: str):
+async def _answer_questions_once(
+    page, questions, groups, pass_name: str, *, force_redo: bool = False
+):
     """对当前页的题目与已选状态比对后作答, 返回 (ok, fail, filled)。"""
     ok, fail, filled = 0, 0, 0
+    fill_cursor = 0
     for i, q in enumerate(questions):
         num = q.get("index") or i + 1
         q_short = _brief(q.get("question", ""), 32)
@@ -366,7 +373,8 @@ async def _answer_questions_once(page, questions, groups, pass_name: str):
                     else str(q.get("answer") or "")
                 )
                 ans_short = _brief(ans_raw, 60)
-                if await _fill_blank(page, q):
+                if await _fill_blank(page, q, force_redo=force_redo, blank_idx=fill_cursor):
+                    fill_cursor += 1
                     filled += 1
                     logger.info(
                         f"  [{pass_name}] 题{num} 已填空: {q_short} -> 「{ans_short}」 (置信度:{conf})"
@@ -430,10 +438,14 @@ async def _answer_questions_once(page, questions, groups, pass_name: str):
                         结果="已选一致",
                     )
                     continue
-                plan = list(need)
+                actions: list[tuple[int, bool]] = [(a, True) for a in need]
                 if wrong and group.get("type") == "checkbox":
-                    plan += wrong  # 多选: 点掉选错的
-                done = all(await _click(page, group["name"], a) for a in plan)
+                    actions += [(a, False) for a in wrong]  # 多选: 点掉选错的
+                done = True
+                for a, want in actions:
+                    if not await _click(page, group["name"], a, want_checked=want):
+                        done = False
+                        break
                 if done:
                     ok += 1
                     detail = []
@@ -556,6 +568,7 @@ async def make_zhidao_answerer(page, config=None):
             user_agent=user_agent,
         ),
         timeout=45,
+        owns_session=True,
     )
 
     def ask(prompt: str) -> str:
@@ -566,23 +579,127 @@ async def make_zhidao_answerer(page, config=None):
             _ZHIDAO_FAILED_UNTIL = time.time() + _ZHIDAO_COOLDOWN
             raise
 
+    ask.close = answerer.close
     return ask
 
 
 _make_zhidao_answerer = make_zhidao_answerer
 
 
-async def _answer_all_pages(page, pass_name: str, answerer=None) -> dict:
+JS_EXTRACT_QUIZ_TEXT = r"""
+() => {
+  const selectors = [
+    '.examPaper_subject',
+    '.questionBox',
+    '.exam-main',
+    '.exam-content',
+    '.quiz-container',
+    '.question-list',
+    '.paper-content',
+    '[class*="examPaper"]',
+    '[class*="question-wrap"]',
+    '[class*="questionBox"]',
+    'main',
+    '[role="main"]',
+  ];
+  let fallback = '';
+  for (const sel of selectors) {
+    const nodes = document.querySelectorAll(sel);
+    if (!nodes || !nodes.length) continue;
+    const parts = [];
+    let hasInteractive = false;
+    for (const el of nodes) {
+      const style = window.getComputedStyle(el);
+      if (style && (style.display === 'none' || style.visibility === 'hidden')) continue;
+      const txt = (el.innerText || '').trim();
+      if (txt.length >= 20) {
+        parts.push(txt);
+        if (!hasInteractive && el.querySelector && el.querySelector(
+          'input, textarea, label, [role="radio"], [role="checkbox"], .nodeLab, .subject_node'
+        )) {
+          hasInteractive = true;
+        }
+      }
+    }
+    if (parts.length) {
+      const joined = parts.join('\n\n');
+      if (joined.length >= 30) {
+        if (hasInteractive) return joined;
+        if (!fallback) fallback = joined;
+      }
+    }
+  }
+  return fallback;
+}
+"""
+
+
+async def _extract_quiz_text_with_scope(page) -> tuple[str, bool]:
+    """优先提取测验主容器文本，减少导航/侧栏噪音与 LLM Token 消耗；未命中时回退 body。
+    返回 (text, used_scoped)。
+    """
+    try:
+        scoped = await page.evaluate(JS_EXTRACT_QUIZ_TEXT)
+        if isinstance(scoped, str) and len(scoped.strip()) >= 30:
+            return scoped[:24000], True
+    except TargetClosedError:
+        raise
+    except Exception:
+        pass
+    return (await page.inner_text("body"))[:60000], False
+
+
+async def _extract_quiz_text(page) -> str:
+    """兼容接口：返回提取出的测验文本。"""
+    text, _ = await _extract_quiz_text_with_scope(page)
+    return text
+
+
+def _page_text_signature(text: str) -> str:
+    return hashlib.sha256(_norm(text).encode("utf-8")).hexdigest()
+
+
+async def _answer_all_pages(
+    page,
+    pass_name: str,
+    answerer=None,
+    *,
+    force_redo: bool = False,
+    page_cache: dict | None = None,
+) -> dict:
     """逐页作答循环 (含确认/翻页/补救阶梯), 不负责提交。返回统计。"""
     total = {"ok": 0, "fail": 0, "fill": 0, "pages": 0}
+    cache = page_cache if page_cache is not None else {}
     last_sig = None
     same_rounds = 0
     for _step in range(120):
         try:
-            text = (await page.inner_text("body"))[:60000]
+            text, used_scoped = await _extract_quiz_text_with_scope(page)
         except TargetClosedError:
             raise
-        questions = await llm.solve_quiz_page(text, answerer)
+        text_sig = _page_text_signature(text)
+        from_cache = False
+        if text_sig in cache and same_rounds == 0:
+            questions = cache[text_sig]
+            from_cache = True
+            logger.debug(f"[{pass_name}] 命中当前页题目答案缓存 ({len(questions)} 题), 跳过重复调 LLM.")
+        else:
+            questions = await llm.solve_quiz_page(text, answerer)
+            if not questions and used_scoped:
+                try:
+                    full_text = (await page.inner_text("body"))[:60000]
+                except TargetClosedError:
+                    raise
+                except Exception:
+                    full_text = ""
+                if full_text and _page_text_signature(full_text) != text_sig:
+                    text = full_text
+                    text_sig = _page_text_signature(text)
+                    if text_sig in cache and same_rounds == 0:
+                        questions = cache[text_sig]
+                        from_cache = True
+                    else:
+                        questions = await llm.solve_quiz_page(text, answerer)
         if not questions:
             logger.info(f"[{pass_name}] 当前页未识别出题目, 测验可能已到最后一页或已结束.")
             break
@@ -617,10 +734,19 @@ async def _answer_all_pages(page, pass_name: str, answerer=None) -> dict:
         last_sig = sig
 
         groups = await page.evaluate(JS_COLLECT)
-        ok, fail, filled = await _answer_questions_once(page, questions, groups, pass_name)
+        ok, fail, filled = await _answer_questions_once(
+            page, questions, groups, pass_name, force_redo=force_redo
+        )
         total["ok"] += ok
         total["fail"] += fail
         total["fill"] += filled
+
+        if fail == 0 and (ok > 0 or filled > 0):
+            cache[text_sig] = questions
+        elif fail > 0:
+            cache.pop(text_sig, None)
+            if from_cache:
+                logger.debug(f"[{pass_name}] 缓存答案作答存在失败项，已失效该页缓存。")
 
         if ok == 0 and fail == 0 and filled == 0:
             logger.info(f"[{pass_name}] 本页没有可作答的题目, 停止翻页.")
@@ -651,13 +777,15 @@ def _summary(r: dict) -> str:
 async def auto_answer_new_page(page, config=None):
     """context.on('page') 回调: 捕获新开页面并自动作答测验。"""
     entered = False
+    answerer = None
     try:
         await asyncio.sleep(2)
         url = page.url or ""
         if not any(d in url for d in ("zhihuishu.com", "polymas.com")):
             return
         now = time.time()
-        if url in ANSWERED and now - ANSWERED[url] < _ANSWER_COOLDOWN:
+        force_redo = bool(getattr(config, "forceRedoAnswered", False))
+        if not force_redo and url in ANSWERED and now - ANSWERED[url] < _ANSWER_COOLDOWN:
             return
         if homework.is_non_quiz_exam_page(url):
             logger.debug(f"检测到考试列表/学习报告页, 跳过自动答题: {url}")
@@ -691,7 +819,7 @@ async def auto_answer_new_page(page, config=None):
         except Exception:
             pass
         await page.wait_for_timeout(4000)  # 等 SPA 渲染
-        text = (await page.inner_text("body"))[:60000]
+        text = await _extract_quiz_text(page)
         if len(text.strip()) < 30:
             return
 
@@ -705,7 +833,10 @@ async def auto_answer_new_page(page, config=None):
             答案源=f"智慧树AI->{llm_label}" if answerer else llm_label,
         )
 
-        r1 = await _answer_all_pages(page, "首答", answerer)
+        page_cache: dict = {}
+        r1 = await _answer_all_pages(
+            page, "首答", answerer, force_redo=force_redo, page_cache=page_cache
+        )
         logger.info(f"[首答] 完成: {_summary(r1)}")
         logger.event("测验页面首答", **r1)
 
@@ -726,7 +857,9 @@ async def auto_answer_new_page(page, config=None):
             if not await _click_prev(page):
                 break
             await page.wait_for_timeout(800)
-        r2 = await _answer_all_pages(page, "复核", answerer)
+        r2 = await _answer_all_pages(
+            page, "复核", answerer, force_redo=force_redo, page_cache=page_cache
+        )
         logger.info(f"[复核] 完成: {_summary(r2)}")
         await _try_submit(page)
         logger.event("测验页面作答", 首答=_summary(r1), 复核=_summary(r2), 已提交=True)
@@ -737,3 +870,10 @@ async def auto_answer_new_page(page, config=None):
             logger.log_exception("测验页面自动作答异常.", exc)
         else:
             logger.debug(f"测验页面自动作答跳过: {exc}")
+    finally:
+        close_fn = getattr(answerer, "close", None)
+        if callable(close_fn):
+            try:
+                close_fn()
+            except Exception:
+                pass

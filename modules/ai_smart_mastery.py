@@ -352,7 +352,9 @@ async def fill_blanks(page: Page, question: dict, answer: dict | None) -> list[s
     return [value for value in filled if value], actual
 
 
-async def pick_options(page: Page, answer: dict | None, question: dict) -> list[str]:
+async def pick_options(
+    page: Page, answer: dict | None, question: dict, *, force_redo: bool = False
+) -> list[str]:
     """按缓存答案点击选项; 支持单选(radio)/多选(checkbox)/判断题(文字答案)."""
     options = question.get("options") or []
     selector = question.get("selector") or "ul.radio-view li"
@@ -372,6 +374,17 @@ async def pick_options(page: Page, answer: dict | None, question: dict) -> list[
                 break
     if not indexes:
         indexes = [0]
+
+    # 开启强制重答时，先取消多选题中先前已选但不在目标中的旧选项
+    if force_redo and ("checkbox" in selector or question.get("kind") == "multiple"):
+        target_set = set(indexes)
+        for pos, opt in enumerate(options):
+            if opt.get("checked") and pos not in target_set:
+                try:
+                    await page.locator(selector).nth(pos).click(timeout=4000)
+                    await page.wait_for_timeout(400)
+                except Exception:
+                    pass
 
     picked = []
     for index in indexes:
@@ -478,14 +491,16 @@ async def answer_missing(page: Page, cache: "AnswerCache", logger) -> bool:
     return False
 
 
-async def answer_current(page: Page, cache: "AnswerCache", logger) -> dict | None:
+async def answer_current(
+    page: Page, cache: "AnswerCache", logger, *, force_redo: bool = False
+) -> dict | None:
     """作答当前显示的这一题."""
     question = await read_exam_question(page)
     if not question or not question["text"]:
         return None
-    # 答题卡显示这题已经作答, 就不要再点一遍(多选会被点掉)
+    # 答题卡显示这题已经作答, 默认跳过(避免多选被点掉); 开启强制重答时则重新作答覆盖
     answered_numbers = await sheet_answered_numbers(page)
-    if question["number"] and question["number"] in answered_numbers:
+    if not force_redo and question["number"] and question["number"] in answered_numbers:
         logger.info(f"第{question['number']}题已作答, 跳过重复点击.")
         return {
             "text": question["text"],
@@ -505,7 +520,7 @@ async def answer_current(page: Page, cache: "AnswerCache", logger) -> dict | Non
         logger.warn(f"第{question['number']}题没有可点选项, 跳过.")
     else:
         try:
-            picked = await pick_options(page, known, question)
+            picked = await pick_options(page, known, question, force_redo=force_redo)
         except Exception as error:
             logger.warn(f"第{question['number']}题作答失败: {type(error).__name__}")
     logger.info(
@@ -523,7 +538,9 @@ async def answer_current(page: Page, cache: "AnswerCache", logger) -> dict | Non
     return {"text": question["text"], "picked": picked, "cached": bool(known)}
 
 
-async def answer_exam(page: Page, cache: AnswerCache, logger) -> list[dict]:
+async def answer_exam(
+    page: Page, cache: AnswerCache, logger, *, force_redo: bool = False
+) -> list[dict]:
     await page.wait_for_selector(EXAM_QUESTION, timeout=30_000)
     await page.wait_for_timeout(1000)
     await go_to_first_question(page)
@@ -537,7 +554,7 @@ async def answer_exam(page: Page, cache: AnswerCache, logger) -> list[dict]:
         if question["number"] and question["number"] == last_number:
             break
         last_number = question["number"]
-        record = await answer_current(page, cache, logger)
+        record = await answer_current(page, cache, logger, force_redo=force_redo)
         if record:
             answered.append(record)
         next_button = page.locator(EXAM_NEXT)
@@ -774,6 +791,8 @@ async def run_mastery(
     logger,
     max_attempts: int = 4,
     target: int = MAX_MASTERY,
+    *,
+    force_redo: bool = False,
 ) -> dict:
     learn = parse_learn_url(learn_url)
     if not learn:
@@ -792,111 +811,129 @@ async def run_mastery(
         limit = 200_000 if "questions-paper" in url else 4_000
         captured.append({"url": url.split("zhihuishu.com")[-1], "body": text[:limit]})
 
-    page.on("response", lambda r: asyncio.ensure_future(on_response(r)))
+    pending_tasks: set[asyncio.Task] = set()
+
+    def handler(response):
+        task = asyncio.create_task(on_response(response))
+        pending_tasks.add(task)
+        task.add_done_callback(pending_tasks.discard)
+
+    page.on("response", handler)
 
     history: list[dict] = []
     mastery = None
     rounds = max_attempts
-    for attempt in range(1, rounds + 1):
-        logger.info(f"—— 掌握度提升 第 {attempt}/{rounds} 轮 ——")
-        captured.clear()
-        exam = await open_practice(page, learn_url, logger)
-        if not exam.get("paperId"):
-            logger.error("没有进入答题页, 停止.")
-            break
-        # 题库大小决定要刷几轮: 每轮只能抽到 6 题
-        if attempt == 1:
-            bank = 0
-            for item in captured:
-                matched = re.search(r'"questionNum"\s*:\s*(\d+)', item["body"])
-                if matched:
-                    bank = max(bank, int(matched.group(1)))
-            if bank:
-                rounds = min(max(max_attempts, bank // 6 + 4), 12)
-                logger.info(f"题库 {bank} 题, 本轮计划刷 {rounds} 轮")
+    try:
+        for attempt in range(1, rounds + 1):
+            logger.info(f"—— 掌握度提升 第 {attempt}/{rounds} 轮 ——")
+            captured.clear()
+            exam = await open_practice(page, learn_url, logger)
+            if not exam.get("paperId"):
+                logger.error("没有进入答题页, 停止.")
+                break
+            # 题库大小决定要刷几轮: 每轮只能抽到 6 题
+            if attempt == 1:
+                bank = 0
+                for item in captured:
+                    matched = re.search(r'"questionNum"\s*:\s*(\d+)', item["body"])
+                    if matched:
+                        bank = max(bank, int(matched.group(1)))
+                if bank:
+                    rounds = min(max(max_attempts, bank // 6 + 4), 12)
+                    logger.info(f"题库 {bank} 题, 本轮计划刷 {rounds} 轮")
 
-        answered = await answer_exam(page, cache, logger)
-        logger.event(
-            "答题完成",
-            题数=len(answered),
-            命中缓存=sum(1 for item in answered if item["cached"]),
-        )
-        if not await submit_exam(page, logger, cache):
-            logger.warn("提交后没有跳到解析页, 本轮结束.")
-        else:
-            # /point 页的 questions-paper 响应要等 1~3 秒才回来, 先等它到齐
-            for _ in range(12):
-                await page.wait_for_timeout(1000)
-                if any("aiExamQuestionInfo" in item["body"] for item in captured):
+            answered = await answer_exam(page, cache, logger, force_redo=force_redo)
+            logger.event(
+                "答题完成",
+                题数=len(answered),
+                命中缓存=sum(1 for item in answered if item["cached"]),
+            )
+            if not await submit_exam(page, logger, cache):
+                logger.warn("提交后没有跳到解析页, 本轮结束.")
+            else:
+                # /point 页的 questions-paper 响应要等 1~3 秒才回来, 先等它到齐
+                for _ in range(12):
+                    await page.wait_for_timeout(1000)
+                    if any("aiExamQuestionInfo" in item["body"] for item in captured):
+                        break
+                answers: dict[str, dict] = {}
+                for item in captured:
+                    if "questions-paper" not in item["url"]:
+                        continue
+                    try:
+                        payload = json.loads(item["body"])
+                    except json.JSONDecodeError:
+                        logger.debug(
+                            f"payload 解析失败 len={len(item['body'])} head={item['body'][:60]!r}"
+                        )
+                        continue
+                    parsed = answers_from_paper_payload(payload)
+                    logger.debug(f"payload {item['url'][-40:]} -> {len(parsed)} 题")
+                    if parsed:
+                        answers.update(parsed)
+                logger.event("答案解析", 题目=len(answers), 来源="接口")
+                if not answers:
+                    preview_url = build_preview_url(learn, exam)
+                    await page.goto(preview_url, wait_until="domcontentloaded")
+                    try:
+                        answers = await scrape_preview_answers(page, logger)
+                    except Exception as error:
+                        logger.warn(f"解析页抓取失败: {type(error).__name__}")
+                        answers = {}
+                    logger.event("答案解析", 题目=len(answers), 来源="解析页")
+                for text, answer in answers.items():
+                    cache.put(text, answer)
+                if answers:
+                    logger.info(f"本轮收录参考答案 {len(answers)} 题 (题库累计 {len(cache.items)} 题).")
+                logger.event("答案入库", 本轮=len(answers), 累计=len(cache.items))
+
+            await page.goto(learn_url, wait_until="domcontentloaded")
+            await page.wait_for_selector(MASTERY_ACTION, timeout=30_000)
+            try:
+                await page.wait_for_load_state("networkidle", timeout=15_000)
+            except Exception:
+                pass
+            await page.wait_for_timeout(1500)
+            mastery = await read_mastery(page)
+            history.append(
+                {
+                    "attempt": attempt,
+                    "mastery": mastery,
+                    "cached": sum(1 for item in answered if item["cached"]),
+                    "questions": len(answered),
+                }
+            )
+            logger.info(f"第 {attempt}/{rounds} 轮交卷后掌握度: {mastery}% (目标 {target}%)")
+            logger.event("掌握度结果", 轮次=attempt, 掌握度=mastery)
+            for item in captured:
+                if "get-knowledge-mastery-stat" in item["url"]:
+                    logger.event("掌握度统计", 轮次=attempt, 原始=item["body"])
+                if "/exam/questions-paper" in item["url"]:
+                    logger.event("试卷信息", 轮次=attempt, 原始=item["body"])
+            if mastery is not None and mastery >= target:
+                logger.info(f"掌握度已达标: {mastery}%")
+                break
+            # 有的知识点即使全对也要刷好几轮掌握度才涨, 所以连续 3 轮没变化才放弃
+            if len(history) >= 4:
+                recent = [item["mastery"] for item in history[-3:]]
+                all_cached = all(
+                    item["cached"] >= item["questions"] and item["questions"]
+                    for item in history[-3:]
+                )
+                if len(set(recent)) == 1 and all_cached:
+                    logger.warn("连续 3 轮全对但掌握度不再变化, 停止该知识点.")
                     break
-            answers: dict[str, dict] = {}
-            for item in captured:
-                if "questions-paper" not in item["url"]:
-                    continue
-                try:
-                    payload = json.loads(item["body"])
-                except json.JSONDecodeError:
-                    logger.debug(
-                        f"payload 解析失败 len={len(item['body'])} head={item['body'][:60]!r}"
-                    )
-                    continue
-                parsed = answers_from_paper_payload(payload)
-                logger.debug(f"payload {item['url'][-40:]} -> {len(parsed)} 题")
-                if parsed:
-                    answers.update(parsed)
-            logger.event("答案解析", 题目=len(answers), 来源="接口")
-            if not answers:
-                preview_url = build_preview_url(learn, exam)
-                await page.goto(preview_url, wait_until="domcontentloaded")
-                try:
-                    answers = await scrape_preview_answers(page, logger)
-                except Exception as error:
-                    logger.warn(f"解析页抓取失败: {type(error).__name__}")
-                    answers = {}
-                logger.event("答案解析", 题目=len(answers), 来源="解析页")
-            for text, answer in answers.items():
-                cache.put(text, answer)
-            if answers:
-                logger.info(f"本轮收录参考答案 {len(answers)} 题 (题库累计 {len(cache.items)} 题).")
-            logger.event("答案入库", 本轮=len(answers), 累计=len(cache.items))
-
-        await page.goto(learn_url, wait_until="domcontentloaded")
-        await page.wait_for_selector(MASTERY_ACTION, timeout=30_000)
+            await asyncio.sleep(0.5)
+    finally:
         try:
-            await page.wait_for_load_state("networkidle", timeout=15_000)
+            page.remove_listener("response", handler)
         except Exception:
             pass
-        await page.wait_for_timeout(1500)
-        mastery = await read_mastery(page)
-        history.append(
-            {
-                "attempt": attempt,
-                "mastery": mastery,
-                "cached": sum(1 for item in answered if item["cached"]),
-                "questions": len(answered),
-            }
-        )
-        logger.info(f"第 {attempt}/{rounds} 轮交卷后掌握度: {mastery}% (目标 {target}%)")
-        logger.event("掌握度结果", 轮次=attempt, 掌握度=mastery)
-        for item in captured:
-            if "get-knowledge-mastery-stat" in item["url"]:
-                logger.event("掌握度统计", 轮次=attempt, 原始=item["body"])
-            if "/exam/questions-paper" in item["url"]:
-                logger.event("试卷信息", 轮次=attempt, 原始=item["body"])
-        if mastery is not None and mastery >= target:
-            logger.info(f"掌握度已达标: {mastery}%")
-            break
-        # 有的知识点即使全对也要刷好几轮掌握度才涨, 所以连续 3 轮没变化才放弃
-        if len(history) >= 4:
-            recent = [item["mastery"] for item in history[-3:]]
-            all_cached = all(
-                item["cached"] >= item["questions"] and item["questions"]
-                for item in history[-3:]
-            )
-            if len(set(recent)) == 1 and all_cached:
-                logger.warn("连续 3 轮全对但掌握度不再变化, 停止该知识点.")
-                break
-        time.sleep(0.5)
+        if pending_tasks:
+            for task in list(pending_tasks):
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*list(pending_tasks), return_exceptions=True)
 
     return {"mastery": mastery, "attempts": history}
 
@@ -1043,6 +1080,8 @@ async def run_course_mastery(
     max_attempts: int = 3,
     limit: int = 0,
     passes: int = 3,
+    *,
+    force_redo: bool = False,
 ) -> dict:
     """遍历课程里所有知识点把掌握度刷到 target.
 
@@ -1118,6 +1157,7 @@ async def run_course_mastery(
                     logger,
                     max_attempts=max_attempts + (pass_index - 1) * 2,
                     target=target,
+                    force_redo=force_redo,
                 )
             except Exception as error:
                 logger.error(f"刷掌握度异常: {type(error).__name__}: {error}")
@@ -1135,7 +1175,7 @@ async def run_course_mastery(
             }
             records[node["nodeUid"]] = record
             if final is not None and final >= target:
-                pass
+                improved += 1
             else:
                 still_pending.append(node)
                 if final is not None and mastery is not None and final > mastery:

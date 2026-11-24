@@ -782,6 +782,78 @@ class OpenAiStreamTests(unittest.TestCase):
         self.assertEqual(aliased["stream_timeout"], 90)
         self.assertEqual(aliased["stream_idle_timeout"], 15)
 
+    def test_think_aware_stream_ignores_aim_block_inside_think_and_strips_unclosed_think(self):
+        # <think> tag split across chunks AND contains a decoy ```answer``` block
+        lines = [
+            _sse_delta({"content": "<thi"}).encode("utf-8"),
+            _sse_delta({"content": 'nk>先假设 ```answer\n["A"]\n``` 但好像不对</thi'}).encode("utf-8"),
+            _sse_delta({"content": 'nk>最终答案：\n```answer\n["B"]\n```'}).encode("utf-8"),
+            _sse_delta({"content": "\n多余解释不应再被读取"}).encode("utf-8"),
+        ]
+        resp = _StreamResponse(lines, delay=0.01)
+        with patch("modules.llm.requests.post", return_value=resp):
+            reply = llm.chat_sync("题目", conf_override=self.CONF, stream=True)
+        self.assertIn('["B"]', reply)
+        self.assertNotIn('["A"]', reply)
+        self.assertNotIn("多余解释", reply)
+        self.assertTrue(resp.closed)
+
+        # Unclosed truncated <think> is also stripped cleanly
+        self.assertEqual(
+            llm._strip_think_tags("前缀答案<think>未闭合的思考内容"),
+            "前缀答案",
+        )
+
+    def test_http_session_pool_reused_per_thread(self):
+        import threading
+
+        s1 = llm._get_http_session()
+        s2 = llm._get_http_session()
+        self.assertIsNotNone(s1)
+        self.assertIs(s1, s2)
+
+        other = []
+
+        def worker():
+            other.append(llm._get_http_session())
+            llm.close_http_session()
+
+        t = threading.Thread(target=worker)
+        t.start()
+        t.join(timeout=3)
+        self.assertEqual(len(other), 1)
+        self.assertIsNot(s1, other[0])
+
+    def test_to_indexes_bounds_and_short_option_safety_and_raw_decode_quiz_json(self):
+        # list[int] bounds check + dedup + reject bool
+        self.assertEqual(llm.to_indexes([-1, 0, 2, 2, 99], ["甲", "乙", "丙"]), [0, 2])
+        self.assertEqual(llm.to_indexes([True], ["对", "错"]), [])
+
+        # Avoid single-char option false substring match
+        self.assertEqual(llm.to_indexes("答案是错误", ["错", "错误"]), [1])
+        self.assertEqual(llm.to_indexes("包含一的句子", ["一", "完全无关选项"]), [])
+
+        # raw_decode handles surrounding braces before and after JSON
+        messy = (
+            "说明 {这里有花括号干扰} 如下：\n"
+            '{"questions": [{"index": 1, "question": "1+1=?", "options": ["1", "2"], "type": "single", "answer": [1]}]}\n'
+            "结尾补充 {另一个花括号}"
+        )
+        qs = llm._parse_quiz_questions(messy)
+        self.assertEqual(len(qs), 1)
+        self.assertEqual(qs[0]["question"], "1+1=?")
+
+    def test_close_all_http_sessions_and_stateless_cookies(self):
+        llm.close_all_http_sessions()
+        s1 = llm._get_http_session()
+        self.assertIsNotNone(s1)
+        # Stateless cookie policy refuses storing cookies across providers/keys
+        self.assertFalse(s1.cookies._policy.set_ok(None, None))
+        llm.close_all_http_sessions()
+        s2 = llm._get_http_session()
+        self.assertIsNot(s1, s2)
+        llm.close_all_http_sessions()
+
 
 if __name__ == "__main__":
     unittest.main()

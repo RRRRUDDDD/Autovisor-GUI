@@ -1,0 +1,157 @@
+# encoding=utf-8
+import asyncio
+import unittest
+from unittest.mock import AsyncMock, patch
+
+from modules import ai_smart_mastery as mastery_mod
+
+
+class _DummyLogger:
+    def info(self, *_args, **_kwargs):
+        pass
+
+    def warn(self, *_args, **_kwargs):
+        pass
+
+    def error(self, *_args, **_kwargs):
+        pass
+
+    def debug(self, *_args, **_kwargs):
+        pass
+
+    def event(self, *_args, **_kwargs):
+        pass
+
+    def section(self, *_args, **_kwargs):
+        pass
+
+
+class _FakeCache:
+    def __init__(self):
+        self.items = {}
+
+    def put(self, text, answer):
+        self.items[text] = answer
+
+
+class _FakeMasteryPage:
+    def __init__(self):
+        self.listeners = []
+
+    def on(self, event, handler):
+        self.listeners.append((event, handler))
+
+    def remove_listener(self, event, handler):
+        self.listeners = [item for item in self.listeners if item != (event, handler)]
+
+    async def goto(self, *_args, **_kwargs):
+        return None
+
+    async def wait_for_selector(self, *_args, **_kwargs):
+        return None
+
+    async def wait_for_load_state(self, *_args, **_kwargs):
+        return None
+
+    async def wait_for_timeout(self, _ms):
+        return None
+
+
+class AiSmartMasteryFixesTests(unittest.IsolatedAsyncioTestCase):
+    async def test_run_mastery_removes_response_listener_and_uses_async_sleep(self):
+        page = _FakeMasteryPage()
+        cache = _FakeCache()
+        logger = _DummyLogger()
+        learn_url = "https://ai-smart-course-student-pro.zhihuishu.com/learnPage/100/200/300"
+
+        hung_started = asyncio.Event()
+        hung_cancelled = False
+
+        class _SlowResponse:
+            url = "https://ai-smart-course-student-pro.zhihuishu.com/exam/questions-paper"
+
+            async def text(self):
+                nonlocal hung_cancelled
+                hung_started.set()
+                try:
+                    await asyncio.Event().wait()
+                except asyncio.CancelledError:
+                    hung_cancelled = True
+                    raise
+                return "{}"
+
+        async def fake_open_practice(_page, _url, _logger):
+            # Trigger a slow response handler that stays pending when run_mastery exits
+            for ev, fn in list(page.listeners):
+                if ev == "response":
+                    fn(_SlowResponse())
+            await hung_started.wait()
+            return {"paperId": "P1"}
+
+        sleep_calls = []
+
+        async def fake_async_sleep(sec):
+            sleep_calls.append(sec)
+
+        with (
+            patch.object(mastery_mod, "open_practice", side_effect=fake_open_practice),
+            patch.object(mastery_mod, "answer_exam", new=AsyncMock(return_value=[{"cached": True}])),
+            patch.object(mastery_mod, "submit_exam", new=AsyncMock(return_value=False)),
+            patch.object(mastery_mod, "read_mastery", side_effect=[50, 100]),
+            patch.object(mastery_mod.asyncio, "sleep", side_effect=fake_async_sleep),
+            patch.object(mastery_mod.time, "sleep", side_effect=AssertionError("must not call blocking time.sleep")),
+        ):
+            res = await mastery_mod.run_mastery(
+                page, learn_url, cache, logger, max_attempts=2, target=100
+            )
+
+        self.assertEqual(res["mastery"], 100)
+        self.assertEqual(page.listeners, [], "response listener must be removed in finally")
+        self.assertTrue(hung_cancelled, "pending response task must be cancelled in finally")
+        self.assertEqual(sleep_calls, [0.5])
+
+    async def test_run_course_mastery_counts_target_reached_as_improved_to_avoid_early_abort(self):
+        page = _FakeMasteryPage()
+        cache = _FakeCache()
+        logger = _DummyLogger()
+        nodes = [
+            {"nodeUid": "n1", "name": "知识点1", "module": "M1", "unit": "U1", "freeExam": 0},
+            {"nodeUid": "n2", "name": "知识点2", "module": "M1", "unit": "U1", "freeExam": 0},
+        ]
+
+        # Pass 1: n1 stays 50, n2 stays 50 -> both go to pass 2
+        # Pass 2: n1 reaches target 100 (improved!), n2 stays 50 -> must continue to pass 3!
+        # Pass 3: n2 reaches target 100 -> all done!
+        read_seq = iter([50, 50, 50, 50, 50])
+        run_seq = iter([
+            {"mastery": 50, "attempts": []},   # pass 1 n1
+            {"mastery": 50, "attempts": []},   # pass 1 n2
+            {"mastery": 100, "attempts": []},  # pass 2 n1 (reached target)
+            {"mastery": 50, "attempts": []},   # pass 2 n2 (stuck this pass)
+            {"mastery": 100, "attempts": []},  # pass 3 n2 (reached target)
+        ])
+
+        with (
+            patch.object(mastery_mod, "read_node_mastery", side_effect=lambda *_a, **_kw: next(read_seq)),
+            patch.object(mastery_mod, "run_mastery", side_effect=lambda *_a, **_kw: next(run_seq)),
+        ):
+            summary = await mastery_mod.run_course_mastery(
+                page,
+                nodes,
+                "100",
+                "300",
+                cache,
+                logger,
+                target=100,
+                max_attempts=2,
+                passes=3,
+            )
+
+        self.assertEqual(len(summary["passes"]), 3, "pass 3 must run because n1 reached target in pass 2")
+        self.assertEqual(summary["passes"][-1]["still"], 0)
+        self.assertEqual(len(summary["done"]), 2)
+        self.assertEqual(summary["failed"], [])
+
+
+if __name__ == "__main__":
+    unittest.main()

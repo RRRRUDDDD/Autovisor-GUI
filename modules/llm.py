@@ -159,12 +159,16 @@ def reset_cache():
     global _LLM_CONF, _WARNED
     _LLM_CONF = None
     _WARNED = False
+    close_all_http_sessions()
 
 
 def set_proxy(proxy: str | None):
     """设置运行时网络代理（来自 config.ini），自动跳过本机回环地址。"""
     global _RUNTIME_PROXY
-    _RUNTIME_PROXY = str(proxy or "").strip()
+    new_proxy = str(proxy or "").strip()
+    if new_proxy != _RUNTIME_PROXY:
+        _RUNTIME_PROXY = new_proxy
+        close_all_http_sessions()
 
 
 def infer_api_format(api_base: str = "", provider: str = "") -> str:
@@ -401,9 +405,106 @@ def _sim(a: str, b: str) -> float:
 
 
 def _strip_think_tags(text: str) -> str:
-    """移除推理模型可能输出的 <think>...</think> 思考过程，保留最终答案。"""
-    cleaned = re.sub(r"<think>.*?</think>", "", text or "", flags=re.DOTALL | re.IGNORECASE)
+    """移除推理模型可能输出的 <think>...</think> 及截断未闭合的 <think>... 思考过程，保留最终答案。"""
+    cleaned = re.sub(
+        r"<think\b[^>]*>.*?</think>", "", text or "", flags=re.DOTALL | re.IGNORECASE
+    )
+    cleaned = re.sub(
+        r"<think\b[^>]*>.*$", "", cleaned, flags=re.DOTALL | re.IGNORECASE
+    )
     return cleaned.strip()
+
+
+_HTTP_LOCAL = threading.local()
+_HTTP_SESSIONS_LOCK = threading.Lock()
+_HTTP_SESSIONS: set = set()
+_HTTP_SESSION_EPOCH = 0
+_ORIGINAL_REQUESTS_POST = getattr(requests, "post", None) if requests is not None else None
+_ORIGINAL_REQUESTS_GET = getattr(requests, "get", None) if requests is not None else None
+
+
+class _StatelessCookiePolicy:
+    """禁止 requests.Session 持久化 Set-Cookie，防止跨厂商/API Key 状态串号。"""
+
+    def set_ok(self, cookie, request):
+        return False
+
+    def return_ok(self, cookie, request):
+        return False
+
+    def domain_return_ok(self, domain, request):
+        return False
+
+    def path_return_ok(self, path, request):
+        return False
+
+
+def _get_http_session():
+    """返回当前线程复用的无状态 requests.Session 连接池（keep-alive 复用且支持集中关闭）。"""
+    if requests is None:
+        return None
+    sess = getattr(_HTTP_LOCAL, "session", None)
+    local_epoch = getattr(_HTTP_LOCAL, "epoch", -1)
+    with _HTTP_SESSIONS_LOCK:
+        cur_epoch = _HTTP_SESSION_EPOCH
+        if sess is None or local_epoch != cur_epoch:
+            sess = requests.Session()
+            try:
+                sess.cookies.set_policy(_StatelessCookiePolicy())
+            except Exception:
+                pass
+            _HTTP_LOCAL.session = sess
+            _HTTP_LOCAL.epoch = cur_epoch
+            _HTTP_SESSIONS.add(sess)
+    return sess
+
+
+def close_http_session() -> None:
+    """关闭并清理当前线程缓存的 HTTP Session。"""
+    sess = getattr(_HTTP_LOCAL, "session", None)
+    if sess is not None:
+        _HTTP_LOCAL.session = None
+        _HTTP_LOCAL.epoch = -1
+        with _HTTP_SESSIONS_LOCK:
+            _HTTP_SESSIONS.discard(sess)
+        try:
+            sess.close()
+        except Exception:
+            pass
+
+
+def close_all_http_sessions() -> None:
+    """关闭所有线程创建的 LLM HTTP Session 并递增代际，防止代理切换或退出后句柄残留。"""
+    global _HTTP_SESSION_EPOCH
+    with _HTTP_SESSIONS_LOCK:
+        _HTTP_SESSION_EPOCH += 1
+        sessions = list(_HTTP_SESSIONS)
+        _HTTP_SESSIONS.clear()
+    _HTTP_LOCAL.session = None
+    _HTTP_LOCAL.epoch = -1
+    for sess in sessions:
+        try:
+            sess.close()
+        except Exception:
+            pass
+
+
+def _http_post(url: str, **kwargs):
+    if requests is not None and getattr(requests, "post", None) is not _ORIGINAL_REQUESTS_POST:
+        return requests.post(url, **kwargs)
+    sess = _get_http_session()
+    if sess is not None:
+        return sess.post(url, **kwargs)
+    return requests.post(url, **kwargs)
+
+
+def _http_get(url: str, **kwargs):
+    if requests is not None and getattr(requests, "get", None) is not _ORIGINAL_REQUESTS_GET:
+        return requests.get(url, **kwargs)
+    sess = _get_http_session()
+    if sess is not None:
+        return sess.get(url, **kwargs)
+    return requests.get(url, **kwargs)
 
 
 def build_endpoint(
@@ -617,7 +718,7 @@ def fetch_models(conf_override: dict | None, proxy: str = "") -> list[str]:
     if proxies:
         kwargs["proxies"] = proxies
     try:
-        resp = requests.get(endpoint, **kwargs)
+        resp = _http_get(endpoint, **kwargs)
     except Exception as exc:
         raise RuntimeError(f"拉取模型列表失败: {exc}") from exc
 
@@ -805,7 +906,7 @@ def _post_with_fallback(
         if proxies:
             kwargs["proxies"] = proxies
         try:
-            resp = requests.post(url, **kwargs)
+            resp = _http_post(url, **kwargs)
         except Exception as exc:
             if attempt >= retries:
                 raise RuntimeError(f"请求失败: {exc}") from exc
@@ -860,9 +961,107 @@ def _sse_text(raw) -> str:
 def _has_aim_block(text: str, aim_start: str, aim_end: str) -> bool:
     if not aim_start or not aim_end:
         return False
-    return re.search(
-        re.escape(aim_start) + r".*?" + re.escape(aim_end), text, re.DOTALL
-    ) is not None
+    visible = _strip_think_tags(text)
+    start_idx = visible.find(aim_start)
+    if start_idx < 0:
+        return False
+    return visible.find(aim_end, start_idx + len(aim_start)) >= 0
+
+
+_THINK_OPEN_RE = re.compile(r"<think\b[^>]*>", re.IGNORECASE)
+_THINK_CLOSE_RE = re.compile(r"</think>", re.IGNORECASE)
+
+
+def _trailing_tag_prefix_len(text: str, *, closing: bool) -> int:
+    """返回 text 尾部可能构成不完整 <think...> 或 </think> 标签的最大保留长度。"""
+    lt = text.rfind("<")
+    if lt < 0:
+        return 0
+    tail = text[lt:]
+    if ">" in tail:
+        return 0
+    lower = tail.lower()
+    if closing:
+        return len(tail) if "</think>".startswith(lower) else 0
+    if "<think".startswith(lower):
+        return len(tail)
+    if lower.startswith("<think") and (len(lower) == 6 or lower[6].isspace()):
+        return len(tail) if len(tail) <= 64 else 0
+    return 0
+
+
+class _ThinkAwareAimTracker:
+    """增量追踪 <think>...</think> 状态，仅对思考块之外的正文以 O(N) 尾窗匹配目标块。"""
+
+    def __init__(self, aim_start: str, aim_end: str):
+        self._aim_start = aim_start or ""
+        self._aim_end = aim_end or ""
+        self._enabled = bool(self._aim_start and self._aim_end)
+        self._in_think = False
+        self._tag_carry = ""
+        self._aim_started = False
+        self._aim_tail = ""
+        self._matched = False
+
+    def _feed_visible(self, text: str) -> bool:
+        if not text or not self._enabled or self._matched:
+            return self._matched
+        if not self._aim_started:
+            probe = self._aim_tail + text
+            idx = probe.find(self._aim_start)
+            if idx >= 0:
+                self._aim_started = True
+                after = probe[idx + len(self._aim_start) :]
+                if after.find(self._aim_end) >= 0:
+                    self._matched = True
+                    return True
+                keep = max(len(self._aim_end) - 1, 0)
+                self._aim_tail = after[-keep:] if keep else ""
+            else:
+                keep = max(len(self._aim_start) - 1, 0)
+                self._aim_tail = probe[-keep:] if keep else ""
+            return False
+        probe = self._aim_tail + text
+        if probe.find(self._aim_end) >= 0:
+            self._matched = True
+            return True
+        keep = max(len(self._aim_end) - 1, 0)
+        self._aim_tail = probe[-keep:] if keep else ""
+        return False
+
+    def feed(self, chunk: str) -> bool:
+        if not self._enabled or not chunk or self._matched:
+            return self._matched
+        buf = self._tag_carry + chunk
+        self._tag_carry = ""
+        while buf:
+            if not self._in_think:
+                m = _THINK_OPEN_RE.search(buf)
+                if m:
+                    if m.start() > 0 and self._feed_visible(buf[: m.start()]):
+                        return True
+                    self._in_think = True
+                    buf = buf[m.end() :]
+                    continue
+                keep = _trailing_tag_prefix_len(buf, closing=False)
+                if keep:
+                    visible_part = buf[:-keep]
+                    self._tag_carry = buf[-keep:]
+                else:
+                    visible_part = buf
+                if visible_part and self._feed_visible(visible_part):
+                    return True
+                break
+            else:
+                m = _THINK_CLOSE_RE.search(buf)
+                if m:
+                    self._in_think = False
+                    buf = buf[m.end() :]
+                    continue
+                keep = _trailing_tag_prefix_len(buf, closing=True)
+                self._tag_carry = buf[-keep:] if keep else ""
+                break
+        return self._matched
 
 
 def _consume_openai_stream(
@@ -873,10 +1072,20 @@ def _consume_openai_stream(
     total_timeout: float,
     idle_timeout: float,
 ) -> str:
-    """后台线程读取 SSE, 主线程双超时等待; 命中目标代码块后立即断开连接."""
+    """后台线程读取 SSE, 主线程双超时等待; 仅在 <think> 之外命中目标代码块后立即断开连接."""
     deadline = time.monotonic() + max(float(total_timeout), 0.001)
     stop_event = threading.Event()
+    close_lock = threading.Lock()
+    response_closed = False
     chunks: queue.Queue = queue.Queue(maxsize=_STREAM_QUEUE_SIZE)
+
+    def _close_once() -> None:
+        nonlocal response_closed
+        with close_lock:
+            if response_closed:
+                return
+            response_closed = True
+        _close_response(resp)
 
     def _emit(item) -> bool:
         while not stop_event.is_set():
@@ -936,24 +1145,25 @@ def _consume_openai_stream(
             if body_lines and not saw_data and not stop_event.is_set():
                 # 整个响应没有任何合法 data: 行, 正文可能是普通 JSON.
                 _emit(("unsupported", "\n".join(body_lines)))
-            else:
+            elif not stop_event.is_set():
                 _emit(("done", None))
         except Exception as exc:
-            _emit(("error", exc))
+            if not stop_event.is_set():
+                _emit(("error", exc))
         finally:
-            _close_response(resp)
+            _close_once()
 
     reader = threading.Thread(target=_reader, daemon=True, name="llm-sse-reader")
     reader.start()
 
     parts: list[str] = []
-    collected = ""
+    tracker = _ThinkAwareAimTracker(aim_start, aim_end)
     try:
         while True:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 stop_event.set()
-                _close_response(resp)
+                _close_once()
                 raise RuntimeError(
                     f"流式响应超时: 总时长超过 {float(total_timeout):g} 秒"
                 )
@@ -961,7 +1171,7 @@ def _consume_openai_stream(
                 kind, payload = chunks.get(timeout=min(remaining, idle_timeout))
             except queue.Empty:
                 stop_event.set()
-                _close_response(resp)
+                _close_once()
                 # 剩余总时长小于 idle 时, 等待期间可能刚好越过总超时线.
                 if time.monotonic() >= deadline:
                     raise RuntimeError(
@@ -974,24 +1184,27 @@ def _consume_openai_stream(
                 continue
             if kind == "chunk":
                 parts.append(payload)
-                collected += payload
-                if _has_aim_block(collected, aim_start, aim_end):
+                if tracker.feed(payload):
                     stop_event.set()
-                    _close_response(resp)
-                    return _strip_think_tags(collected)
+                    return _strip_think_tags("".join(parts))
                 continue
             if kind == "done":
                 break
             if kind == "unsupported":
                 stop_event.set()
-                _close_response(resp)
                 raise StreamNotSupportedError(payload)
             if kind == "error":
                 stop_event.set()
-                _close_response(resp)
                 raise RuntimeError(f"流式读取失败: {payload}")
     finally:
         stop_event.set()
+        # 优先给 reader 极短窗口在自身线程优雅关闭连接，避免跨线程同时操作底层 socket；
+        # 若 reader 仍阻塞在 recv() 上则由主线程兜底强关。
+        reader.join(timeout=0.05)
+        if reader.is_alive():
+            _close_once()
+        else:
+            _close_once()
 
     return _strip_think_tags("".join(parts))
 
@@ -1015,19 +1228,20 @@ def _chat_openai_stream(
     idle_timeout = _positive_float(idle_timeout, DEFAULT_STREAM_IDLE_TIMEOUT)
     if idle_timeout > total_timeout:
         idle_timeout = total_timeout
+    socket_read_timeout = max(0.5, min(idle_timeout + 2.0, total_timeout + 2.0))
 
     attempt = 0
     while True:
         kwargs = {
             "headers": headers,
             "json": stream_body,
-            "timeout": (10, total_timeout + 5),
+            "timeout": (10, socket_read_timeout),
             "stream": True,
         }
         if proxies:
             kwargs["proxies"] = proxies
         try:
-            resp = requests.post(endpoint, **kwargs)
+            resp = _http_post(endpoint, **kwargs)
         except Exception as exc:
             if attempt >= retries:
                 raise RuntimeError(f"流式请求失败: {exc}") from exc
@@ -1411,23 +1625,44 @@ def to_indexes(answer, options: list) -> list:
     """把各种形态的答案统一成选项下标数组; 填空/无法解析返回空表以外的处理见调用方。"""
     if answer is None:
         return []
-    if isinstance(answer, list) and answer and all(isinstance(x, int) for x in answer):
-        return answer
+    if (
+        isinstance(answer, list)
+        and answer
+        and all(isinstance(x, int) and not isinstance(x, bool) for x in answer)
+    ):
+        seen: list[int] = []
+        for x in answer:
+            if 0 <= x < len(options) and x not in seen:
+                seen.append(x)
+        return seen
     items = answer if isinstance(answer, list) else [answer]
     items = [str(x).strip() for x in items if str(x).strip()]
     idxs = []
     letters = "ABCDEFGH"
+    norm_options = [_norm(o) for o in options]
     for item in items:
         if re.fullmatch(r"[A-Ha-h]+", item) and len(item) <= max(len(options), 1):
-            idxs.extend(letters.index(c.upper()) for c in item.upper())
+            for c in item.upper():
+                idx = letters.index(c)
+                if 0 <= idx < len(options) and idx not in idxs:
+                    idxs.append(idx)
             continue
         n_item = _norm(item)
         hit = -1
-        for i, o in enumerate(options):
-            n_o = _norm(o)
-            if n_o and (n_o == n_item or n_o in n_item or n_item in n_o):
+        # 1. 优先全等匹配，避免短选项子串误命中
+        for i, n_o in enumerate(norm_options):
+            if n_o and n_o == n_item:
                 hit = i
                 break
+        # 2. 其次唯一子串匹配（限制最短公共长度 >= 2，避免单字选项误匹配）
+        if hit < 0 and len(n_item) >= 2:
+            sub_hits = [
+                i
+                for i, n_o in enumerate(norm_options)
+                if len(n_o) >= 2 and (n_o in n_item or n_item in n_o)
+            ]
+            if len(sub_hits) == 1:
+                hit = sub_hits[0]
         if hit < 0:
             m = re.match(r"^([A-Ha-h])[\.、．:：]", item)
             if m:
@@ -1435,28 +1670,38 @@ def to_indexes(answer, options: list) -> list:
         if hit < 0 and item.isdigit():
             n = int(item)
             hit = n - 1 if 1 <= n <= len(options) else n
-        if 0 <= hit < len(options):
+        if 0 <= hit < len(options) and hit not in idxs:
             idxs.append(hit)
     return idxs
 
 
 def _parse_quiz_questions(answer_text: str) -> list:
-    """从模型回复里取出 questions 数组, 容忍 ```json 围栏和前后说明."""
+    """从模型回复里取出 questions 数组, 容忍 ```json 围栏和前后含大括号的说明."""
     raw = _strip_think_tags(answer_text or "")
     if not raw:
         return []
+    candidates: list[str] = []
     block = re.search(r"```(?:json)?\s*(.*?)```", raw, re.DOTALL | re.IGNORECASE)
     if block:
-        raw = block.group(1).strip()
-    start, end = raw.find("{"), raw.rfind("}")
-    if start >= 0 and end > start:
-        raw = raw[start : end + 1]
-    try:
-        data = json.loads(raw)
-    except (ValueError, TypeError):
-        return []
-    questions = data.get("questions") if isinstance(data, dict) else None
-    return questions if isinstance(questions, list) else []
+        candidates.append(block.group(1).strip())
+    candidates.append(raw)
+
+    decoder = json.JSONDecoder()
+    for text in candidates:
+        pos = 0
+        while True:
+            start = text.find("{", pos)
+            if start < 0:
+                break
+            try:
+                data, end = decoder.raw_decode(text, start)
+            except (ValueError, TypeError):
+                pos = start + 1
+                continue
+            if isinstance(data, dict) and isinstance(data.get("questions"), list):
+                return data["questions"]
+            pos = max(end, start + 1)
+    return []
 
 
 def _quiz_prompt(text: str) -> str:
