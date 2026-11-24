@@ -168,5 +168,24 @@ class SaveCredentialsTests(unittest.TestCase):
         self.assertIn(";中文注释", content)
 
 
+class SaveCookiesAtomicTests(unittest.TestCase):
+    def test_replace_permission_error_does_not_double_close_fd(self):
+        from modules.utils import save_cookies
+
+        with tempfile.TemporaryDirectory() as tmp:
+            target = os.path.join(tmp, "cookies.json")
+            with (
+                mock.patch("modules.utils.os.replace", side_effect=PermissionError("locked")),
+                mock.patch("modules.utils.os.close") as close_mock,
+            ):
+                with self.assertRaises(PermissionError):
+                    save_cookies([_cookie("a")], target)
+            # os.fdopen already took ownership and closed the fd; except block must not os.close() it again
+            close_mock.assert_not_called()
+            # temp file should be cleaned up
+            leftovers = [f for f in os.listdir(tmp) if f.startswith(".cookies-")]
+            self.assertEqual(leftovers, [])
+
+
 if __name__ == "__main__":
     unittest.main()

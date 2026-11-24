@@ -183,9 +183,14 @@ class AiQuestionStore:
 
     # ------------------------------------------------------------------ sqlite
     def _connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(str(self.db_path), timeout=BUSY_TIMEOUT_MS / 1000)
+        conn = sqlite3.connect(
+            str(self.db_path),
+            timeout=BUSY_TIMEOUT_MS / 1000,
+            isolation_level=None,
+        )
         conn.row_factory = sqlite3.Row
         conn.execute(f"PRAGMA busy_timeout={BUSY_TIMEOUT_MS}")
+        conn.execute("PRAGMA synchronous=NORMAL")
         return conn
 
     def _init_schema(self) -> None:
@@ -201,14 +206,29 @@ class AiQuestionStore:
                 conn.close()
 
     @contextmanager
+    def _write_cursor(self):
+        with self._lock:
+            conn = self._connect()
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                yield conn
+                if conn.in_transaction:
+                    conn.execute("COMMIT")
+            except Exception:
+                if conn.in_transaction:
+                    try:
+                        conn.execute("ROLLBACK")
+                    except sqlite3.Error:
+                        pass
+                raise
+            finally:
+                conn.close()
+
+    @contextmanager
     def _cursor(self):
         conn = self._connect()
         try:
             yield conn
-            conn.commit()
-        except Exception:
-            conn.rollback()
-            raise
         finally:
             conn.close()
 
@@ -216,7 +236,7 @@ class AiQuestionStore:
         last_error = None
         for attempt in range(4):
             try:
-                with self._cursor() as conn:
+                with self._write_cursor() as conn:
                     return action(conn)
             except sqlite3.OperationalError as exc:
                 message = str(exc).lower()
@@ -504,6 +524,56 @@ class AiQuestionStore:
 
         return self._write(action)
 
+    @staticmethod
+    def _merge_zhidao_rows(primary, secondary) -> dict:
+        """合并两条知到题目记录：非空优先取 primary，错题组合去重合并并按上限截断。"""
+        p = dict(primary) if primary is not None else {}
+        s = dict(secondary) if secondary is not None else {}
+
+        p_eid = _as_text(p.get("eid")) or None
+        s_eid = _as_text(s.get("eid")) or None
+        p_qid = _as_text(p.get("question_id")) or None
+        s_qid = _as_text(s.get("question_id")) or None
+
+        p_options = _json_load(p.get("options"), [])
+        s_options = _json_load(s.get("options"), [])
+        merged_options = p_options or s_options
+
+        p_correct = _json_load(p.get("correct_options"), [])
+        s_correct = _json_load(s.get("correct_options"), [])
+        merged_correct = p_correct or s_correct
+
+        s_wrong = _json_load(s.get("wrong_options"), [])
+        p_wrong = _json_load(p.get("wrong_options"), [])
+        merged_wrong: list = []
+        for source in (
+            s_wrong if isinstance(s_wrong, list) else [],
+            p_wrong if isinstance(p_wrong, list) else [],
+        ):
+            for combo in source:
+                if combo not in merged_wrong:
+                    merged_wrong.append(combo)
+        if len(merged_wrong) > WRONG_COMBO_LIMIT:
+            merged_wrong = merged_wrong[-WRONG_COMBO_LIMIT:]
+
+        merged_hashed = (
+            _as_text(p.get("option_ids_hash"))
+            or _as_text(s.get("option_ids_hash"))
+            or option_hash(merged_options)
+        )
+        return {
+            "eid": p_eid or s_eid,
+            "question_id": p_qid or s_qid,
+            "course_name": _as_text(p.get("course_name")) or _as_text(s.get("course_name")),
+            "question_type": _as_text(p.get("question_type")) or _as_text(s.get("question_type")),
+            "content": _as_text(p.get("content")) or _as_text(s.get("content")),
+            "options": merged_options,
+            "option_ids_hash": merged_hashed,
+            "correct_options": merged_correct,
+            "wrong_options": merged_wrong,
+            "ai_analysis": _as_text(p.get("ai_analysis")) or _as_text(s.get("ai_analysis")),
+        }
+
     def save_options_by_id(
         self,
         course_id,
@@ -526,8 +596,8 @@ class AiQuestionStore:
                 conn, course_id, exam_id, question_id=question_id
             )
             if row is not None:
-                eid = row["eid"]
-                if not eid:
+                merged = self._merge_zhidao_rows(row, None)
+                if not merged["eid"]:
                     bridge = self._bridge_zhidao(
                         conn,
                         course_id,
@@ -538,23 +608,30 @@ class AiQuestionStore:
                         exclude_id=row["id"],
                     )
                     if bridge is not None:
-                        eid = bridge["eid"]
+                        merged = self._merge_zhidao_rows(row, bridge)
                         conn.execute(
                             "DELETE FROM zhidao_questions WHERE id=?", (bridge["id"],)
                         )
                 conn.execute(
                     "UPDATE zhidao_questions SET eid=COALESCE(eid, ?), options=?, "
-                    "option_ids_hash=?, content=COALESCE(NULLIF(?, ''), content), "
-                    "question_type=COALESCE(NULLIF(?, ''), question_type), "
-                    "course_name=COALESCE(NULLIF(?, ''), course_name), "
+                    "option_ids_hash=?, content=COALESCE(NULLIF(?, ''), ?), "
+                    "question_type=COALESCE(NULLIF(?, ''), ?), "
+                    "course_name=COALESCE(NULLIF(?, ''), ?), "
+                    "correct_options=?, wrong_options=?, ai_analysis=?, "
                     "last_updated=? WHERE id=?",
                     (
-                        eid,
-                        _json_dumps(list(options or [])),
-                        hashed,
+                        merged["eid"],
+                        _json_dumps(list(options or []) or merged["options"]),
+                        hashed or merged["option_ids_hash"],
                         _as_text(content),
+                        merged["content"],
                         _as_text(question_type),
+                        merged["question_type"],
                         _as_text(course_name),
+                        merged["course_name"],
+                        _json_dumps(merged["correct_options"]),
+                        _json_dumps(merged["wrong_options"]),
+                        merged["ai_analysis"],
                         now,
                         row["id"],
                     ),
@@ -726,8 +803,9 @@ class AiQuestionStore:
         return [self._zhidao_row(row) for row in self._read(action)]
 
     # ------------------------------------------------------------- ai: write
-    def upsert_ai_question(
+    def _upsert_ai_question_conn(
         self,
+        conn: sqlite3.Connection,
         course_id,
         exam_id,
         question_id,
@@ -750,65 +828,92 @@ class AiQuestionStore:
         plain = _as_text(question_plain)
         now = time.time()
 
-        def action(conn):
-            row = conn.execute(
-                "SELECT * FROM ai_questions WHERE course_id=? AND exam_id=? "
-                "AND question_id=? AND version=?",
-                (course_id, exam_id, question_id, version),
-            ).fetchone()
-            if row is not None:
-                current_plain = row["question_plain"] or ""
-                merged_plain = plain or current_plain
-                merged_raw = _as_text(question_raw) or (row["question_raw"] or "")
-                merged_answer = _as_text(answer) or (row["answer"] or "")
-                merged_content = _as_text(answer_content) or (row["answer_content"] or "")
-                existing_dict = _json_load(row["question_dict"], {})
-                if question_dict is None or question_dict == {}:
-                    merged_dict = existing_dict
-                else:
-                    merged_dict = question_dict
-                conn.execute(
-                    "UPDATE ai_questions SET course_name=COALESCE(NULLIF(?, ''), course_name), "
-                    "question_plain=?, question_raw=?, answer=?, answer_content=?, "
-                    "question_dict=?, cache_key=?, loose_key=?, last_updated=? WHERE id=?",
-                    (
-                        _as_text(course_name),
-                        merged_plain,
-                        merged_raw,
-                        merged_answer,
-                        merged_content,
-                        _json_dumps(merged_dict),
-                        cache_key(merged_plain),
-                        loose_key(merged_plain),
-                        now,
-                        row["id"],
-                    ),
-                )
-                return int(row["id"])
-            cursor = conn.execute(
-                "INSERT INTO ai_questions(course_id, course_name, exam_id, question_id, "
-                "version, question_plain, question_raw, answer, answer_content, "
-                "question_dict, cache_key, loose_key, last_updated) "
-                "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        row = conn.execute(
+            "SELECT * FROM ai_questions WHERE course_id=? AND exam_id=? "
+            "AND question_id=? AND version=?",
+            (course_id, exam_id, question_id, version),
+        ).fetchone()
+        if row is not None:
+            current_plain = row["question_plain"] or ""
+            merged_plain = plain or current_plain
+            merged_raw = _as_text(question_raw) or (row["question_raw"] or "")
+            merged_answer = _as_text(answer) or (row["answer"] or "")
+            merged_content = _as_text(answer_content) or (row["answer_content"] or "")
+            existing_dict = _json_load(row["question_dict"], {})
+            if question_dict is None or question_dict == {}:
+                merged_dict = existing_dict
+            else:
+                merged_dict = question_dict
+            conn.execute(
+                "UPDATE ai_questions SET course_name=COALESCE(NULLIF(?, ''), course_name), "
+                "question_plain=?, question_raw=?, answer=?, answer_content=?, "
+                "question_dict=?, cache_key=?, loose_key=?, last_updated=? WHERE id=?",
                 (
-                    course_id,
                     _as_text(course_name),
-                    exam_id,
-                    question_id,
-                    version,
-                    plain,
-                    _as_text(question_raw),
-                    _as_text(answer),
-                    _as_text(answer_content),
-                    _json_dumps(question_dict or {}),
-                    cache_key(plain),
-                    loose_key(plain),
+                    merged_plain,
+                    merged_raw,
+                    merged_answer,
+                    merged_content,
+                    _json_dumps(merged_dict),
+                    cache_key(merged_plain),
+                    loose_key(merged_plain),
                     now,
+                    row["id"],
                 ),
             )
-            return int(cursor.lastrowid)
+            return int(row["id"])
+        cursor = conn.execute(
+            "INSERT INTO ai_questions(course_id, course_name, exam_id, question_id, "
+            "version, question_plain, question_raw, answer, answer_content, "
+            "question_dict, cache_key, loose_key, last_updated) "
+            "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                course_id,
+                _as_text(course_name),
+                exam_id,
+                question_id,
+                version,
+                plain,
+                _as_text(question_raw),
+                _as_text(answer),
+                _as_text(answer_content),
+                _json_dumps(question_dict or {}),
+                cache_key(plain),
+                loose_key(plain),
+                now,
+            ),
+        )
+        return int(cursor.lastrowid)
 
-        return self._write(action)
+    def upsert_ai_question(
+        self,
+        course_id,
+        exam_id,
+        question_id,
+        version: int = 1,
+        *,
+        question_plain: str = "",
+        question_raw: str = "",
+        answer: str = "",
+        answer_content: str = "",
+        question_dict=None,
+        course_name: str = "",
+    ) -> int:
+        return self._write(
+            lambda conn: self._upsert_ai_question_conn(
+                conn,
+                course_id,
+                exam_id,
+                question_id,
+                version,
+                question_plain=question_plain,
+                question_raw=question_raw,
+                answer=answer,
+                answer_content=answer_content,
+                question_dict=question_dict,
+                course_name=course_name,
+            )
+        )
 
     # -------------------------------------------------------------- ai: query
     def get_ai_question(
@@ -925,7 +1030,7 @@ class AiQuestionStore:
         return count
 
     def _migrate_course_dir(self, course_id, directory: Path) -> int:
-        count = 0
+        batch: list[tuple] = []
         for file in sorted(directory.glob("*.json")):
             try:
                 payload = json.loads(file.read_text(encoding="utf-8"))
@@ -938,7 +1043,14 @@ class AiQuestionStore:
                 if not isinstance(record, dict):
                     continue
                 question_id, version = _split_legacy_key(str(raw_key))
-                self.upsert_ai_question(
+                batch.append((exam_id, question_id, version, record))
+        if not batch:
+            return 0
+
+        def action(conn):
+            for exam_id, question_id, version, record in batch:
+                self._upsert_ai_question_conn(
+                    conn,
                     course_id,
                     exam_id,
                     question_id,
@@ -949,8 +1061,9 @@ class AiQuestionStore:
                     answer_content=_as_text(record.get("answer_content")),
                     question_dict=record.get("questionDict") or {},
                 )
-                count += 1
-        return count
+            return len(batch)
+
+        return self._write(action)
 
     def _migrate_mastery(self, path: Path) -> int:
         try:
@@ -959,23 +1072,31 @@ class AiQuestionStore:
             return 0
         if not isinstance(payload, dict):
             return 0
-        count = 0
-        for key, record in payload.items():
-            if not isinstance(record, dict):
-                continue
-            self.upsert_ai_question(
-                "",
-                "",
-                cache_key(key) or loose_key(key) or str(key),
-                1,
-                question_plain=str(key),
-                question_raw=str(key),
-                answer=_flatten_answer(record),
-                answer_content="",
-                question_dict=record,
-            )
-            count += 1
-        return count
+        items = [
+            (key, record)
+            for key, record in payload.items()
+            if isinstance(record, dict)
+        ]
+        if not items:
+            return 0
+
+        def action(conn):
+            for key, record in items:
+                self._upsert_ai_question_conn(
+                    conn,
+                    "",
+                    "",
+                    cache_key(key) or loose_key(key) or str(key),
+                    1,
+                    question_plain=str(key),
+                    question_raw=str(key),
+                    answer=_flatten_answer(record),
+                    answer_content="",
+                    question_dict=record,
+                )
+            return len(items)
+
+        return self._write(action)
 
     # ---------------------------------------------------------- export/import
     def export_data(self, course_id=None) -> dict:
@@ -1022,32 +1143,39 @@ class AiQuestionStore:
         if not isinstance(zhidao_items, list) or not isinstance(ai_items, list):
             raise ValueError("zhidao_questions / ai_questions 必须是数组")
 
-        counts = {"zhidao_questions": 0, "ai_questions": 0}
-        for item in zhidao_items:
-            if isinstance(item, dict) and self._import_zhidao_item(item):
-                counts["zhidao_questions"] += 1
-        for item in ai_items:
-            if not isinstance(item, dict):
-                continue
-            question_id = item.get("question_id")
-            if question_id is None:
-                continue
-            self.upsert_ai_question(
-                item.get("course_id", ""),
-                item.get("exam_id", ""),
-                question_id,
-                item.get("version", 1),
-                question_plain=item.get("question_plain", ""),
-                question_raw=item.get("question_raw", ""),
-                answer=item.get("answer", ""),
-                answer_content=item.get("answer_content", ""),
-                question_dict=item.get("question_dict") or {},
-                course_name=item.get("course_name", ""),
-            )
-            counts["ai_questions"] += 1
-        return counts
+        def action(conn):
+            counts = {"zhidao_questions": 0, "ai_questions": 0}
+            for item in zhidao_items:
+                if isinstance(item, dict) and self._import_zhidao_item_conn(conn, item):
+                    counts["zhidao_questions"] += 1
+            for item in ai_items:
+                if not isinstance(item, dict):
+                    continue
+                question_id = item.get("question_id")
+                if question_id is None:
+                    continue
+                self._upsert_ai_question_conn(
+                    conn,
+                    item.get("course_id", ""),
+                    item.get("exam_id", ""),
+                    question_id,
+                    item.get("version", 1),
+                    question_plain=item.get("question_plain", ""),
+                    question_raw=item.get("question_raw", ""),
+                    answer=item.get("answer", ""),
+                    answer_content=item.get("answer_content", ""),
+                    question_dict=item.get("question_dict") or {},
+                    course_name=item.get("course_name", ""),
+                )
+                counts["ai_questions"] += 1
+            return counts
+
+        return self._write(action)
 
     def _import_zhidao_item(self, item: dict) -> bool:
+        return self._write(lambda conn: self._import_zhidao_item_conn(conn, item))
+
+    def _import_zhidao_item_conn(self, conn: sqlite3.Connection, item: dict) -> bool:
         course_id = _as_text(item.get("course_id"))
         exam_id = _as_text(item.get("exam_id"))
         eid = item.get("eid")
@@ -1056,133 +1184,106 @@ class AiQuestionStore:
             return False
         options = _json_load(item.get("options"), [])
         correct_options = _json_load(item.get("correct_options"), [])
-        wrong_options = _json_load(item.get("wrong_options"), [])
+        raw_wrong = _json_load(item.get("wrong_options"), [])
+        wrong_options: list = []
+        if isinstance(raw_wrong, list):
+            for combo in raw_wrong:
+                if combo not in wrong_options:
+                    wrong_options.append(combo)
+            if len(wrong_options) > WRONG_COMBO_LIMIT:
+                wrong_options = wrong_options[-WRONG_COMBO_LIMIT:]
         ai_analysis = _as_text(item.get("ai_analysis"))
         hashed = item.get("option_ids_hash") or option_hash(options)
         content = _as_text(item.get("content"))
         now = time.time()
 
-        def action(conn):
-            eid_row = None
-            qid_row = None
-            if eid is not None:
-                eid_row = self._find_zhidao(
-                    conn, course_id, exam_id, eid=str(eid)
-                )
-            if question_id is not None:
-                qid_row = self._find_zhidao(
-                    conn, course_id, exam_id, question_id=str(question_id)
-                )
-            row = eid_row or qid_row
-            dropped = None
-            if (
-                eid_row is not None
-                and qid_row is not None
-                and eid_row["id"] != qid_row["id"]
-            ):
-                keep, dropped = (
-                    (eid_row, qid_row) if eid_row["id"] < qid_row["id"] else (qid_row, eid_row)
-                )
-                conn.execute("DELETE FROM zhidao_questions WHERE id=?", (dropped["id"],))
-                row = conn.execute(
-                    "SELECT * FROM zhidao_questions WHERE id=?", (keep["id"],)
-                ).fetchone()
-            if row is None and hashed:
-                sql = (
-                    "SELECT * FROM zhidao_questions WHERE course_id=? AND exam_id=? "
-                    "AND option_ids_hash=? ORDER BY id LIMIT 1"
-                )
-                row = conn.execute(sql, (course_id, exam_id, hashed)).fetchone()
-            if row is None:
-                cursor = conn.execute(
-                    "INSERT INTO zhidao_questions(course_id, course_name, exam_id, eid, "
-                    "question_id, question_type, content, options, option_ids_hash, "
-                    "correct_options, wrong_options, ai_analysis, last_updated) "
-                    "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                    (
-                        course_id,
-                        _as_text(item.get("course_name")),
-                        exam_id,
-                        None if eid is None else str(eid),
-                        None if question_id is None else str(question_id),
-                        _as_text(item.get("question_type")),
-                        content,
-                        _json_dumps(options),
-                        hashed,
-                        _json_dumps(correct_options),
-                        _json_dumps(wrong_options),
-                        ai_analysis,
-                        now,
-                    ),
-                )
-                return int(cursor.lastrowid)
-
-            drop_options = _json_load(dropped["options"], []) if dropped is not None else []
-            drop_correct = _json_load(dropped["correct_options"], []) if dropped is not None else []
-            drop_wrong = _json_load(dropped["wrong_options"], []) if dropped is not None else []
-            drop_analysis = _as_text(dropped["ai_analysis"]) if dropped is not None else ""
-            drop_content = _as_text(dropped["content"]) if dropped is not None else ""
-            drop_hashed = _as_text(dropped["option_ids_hash"]) if dropped is not None else ""
-            drop_qtype = _as_text(dropped["question_type"]) if dropped is not None else ""
-            drop_course_name = _as_text(dropped["course_name"]) if dropped is not None else ""
-
-            existing_options = _json_load(row["options"], [])
-            merged_options = options or existing_options or drop_options
-            merged_hashed = (
-                hashed
-                or _as_text(row["option_ids_hash"])
-                or drop_hashed
-                or option_hash(merged_options)
+        eid_row = None
+        qid_row = None
+        if eid is not None:
+            eid_row = self._find_zhidao(conn, course_id, exam_id, eid=str(eid))
+        if question_id is not None:
+            qid_row = self._find_zhidao(
+                conn, course_id, exam_id, question_id=str(question_id)
             )
-            existing_correct = _json_load(row["correct_options"], [])
-            merged_correct = correct_options or existing_correct or drop_correct
-            existing_history = _json_load(row["wrong_options"], [])
-            if not isinstance(existing_history, list):
-                existing_history = []
-            merged_history = list(existing_history)
-            for source_history in (
-                drop_wrong if isinstance(drop_wrong, list) else [],
-                wrong_options if isinstance(wrong_options, list) else [],
-            ):
-                for combo in source_history:
-                    if combo not in merged_history:
-                        merged_history.append(combo)
-            merged_analysis = ai_analysis or _as_text(row["ai_analysis"]) or drop_analysis
-            merged_content = content or _as_text(row["content"]) or drop_content
-            merged_qtype = (
-                _as_text(item.get("question_type"))
-                or _as_text(row["question_type"])
-                or drop_qtype
+        row = eid_row or qid_row
+        dropped = None
+        if (
+            eid_row is not None
+            and qid_row is not None
+            and eid_row["id"] != qid_row["id"]
+        ):
+            keep, dropped = (
+                (eid_row, qid_row) if eid_row["id"] < qid_row["id"] else (qid_row, eid_row)
             )
-            merged_course_name = (
-                _as_text(item.get("course_name"))
-                or _as_text(row["course_name"])
-                or drop_course_name
+            conn.execute("DELETE FROM zhidao_questions WHERE id=?", (dropped["id"],))
+            row = conn.execute(
+                "SELECT * FROM zhidao_questions WHERE id=?", (keep["id"],)
+            ).fetchone()
+        if row is None and hashed:
+            sql = (
+                "SELECT * FROM zhidao_questions WHERE course_id=? AND exam_id=? "
+                "AND option_ids_hash=? ORDER BY id LIMIT 1"
             )
+            row = conn.execute(sql, (course_id, exam_id, hashed)).fetchone()
+        if row is None:
             conn.execute(
-                "UPDATE zhidao_questions SET eid=COALESCE(eid, ?), "
-                "question_id=COALESCE(question_id, ?), "
-                "course_name=?, question_type=?, content=?, options=?, "
-                "option_ids_hash=?, correct_options=?, wrong_options=?, "
-                "ai_analysis=?, last_updated=? WHERE id=?",
+                "INSERT INTO zhidao_questions(course_id, course_name, exam_id, eid, "
+                "question_id, question_type, content, options, option_ids_hash, "
+                "correct_options, wrong_options, ai_analysis, last_updated) "
+                "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
+                    course_id,
+                    _as_text(item.get("course_name")),
+                    exam_id,
                     None if eid is None else str(eid),
                     None if question_id is None else str(question_id),
-                    merged_course_name,
-                    merged_qtype,
-                    merged_content,
-                    _json_dumps(merged_options),
-                    merged_hashed,
-                    _json_dumps(merged_correct),
-                    _json_dumps(merged_history),
-                    merged_analysis,
+                    _as_text(item.get("question_type")),
+                    content,
+                    _json_dumps(options),
+                    hashed,
+                    _json_dumps(correct_options),
+                    _json_dumps(wrong_options),
+                    ai_analysis,
                     now,
-                    row["id"],
                 ),
             )
-            return int(row["id"])
+            return True
 
-        self._write(action)
+        existing_merged = self._merge_zhidao_rows(row, dropped)
+        incoming = {
+            "eid": None if eid is None else str(eid),
+            "question_id": None if question_id is None else str(question_id),
+            "course_name": _as_text(item.get("course_name")),
+            "question_type": _as_text(item.get("question_type")),
+            "content": content,
+            "options": options,
+            "option_ids_hash": hashed,
+            "correct_options": correct_options,
+            "wrong_options": wrong_options,
+            "ai_analysis": ai_analysis,
+        }
+        merged = self._merge_zhidao_rows(incoming, existing_merged)
+        conn.execute(
+            "UPDATE zhidao_questions SET eid=COALESCE(eid, ?), "
+            "question_id=COALESCE(question_id, ?), "
+            "course_name=?, question_type=?, content=?, options=?, "
+            "option_ids_hash=?, correct_options=?, wrong_options=?, "
+            "ai_analysis=?, last_updated=? WHERE id=?",
+            (
+                merged["eid"],
+                merged["question_id"],
+                merged["course_name"],
+                merged["question_type"],
+                merged["content"],
+                _json_dumps(merged["options"]),
+                merged["option_ids_hash"],
+                _json_dumps(merged["correct_options"]),
+                _json_dumps(merged["wrong_options"]),
+                merged["ai_analysis"],
+                now,
+                row["id"],
+            ),
+        )
         return True
 
     # ------------------------------------------------------------------- misc

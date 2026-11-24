@@ -60,17 +60,20 @@ def create_retry_session(
 ) -> requests.Session:
     """创建带指数退避重试与可选代理的 requests.Session。"""
     session = requests.Session()
-    retry = Retry(
-        total=total_retries,
-        connect=total_retries,
-        read=total_retries,
-        status=total_retries,
-        backoff_factor=backoff_factor,
-        status_forcelist=list(status_forcelist),
-        allowed_methods=frozenset({"GET", "POST", "HEAD", "OPTIONS"}),
-        raise_on_status=False,
-    )
-    adapter = HTTPAdapter(max_retries=retry)
+    if total_retries <= 0:
+        adapter = HTTPAdapter(max_retries=0)
+    else:
+        retry = Retry(
+            total=total_retries,
+            connect=total_retries,
+            read=total_retries,
+            status=total_retries,
+            backoff_factor=backoff_factor,
+            status_forcelist=list(status_forcelist),
+            allowed_methods=frozenset({"GET", "POST", "HEAD", "OPTIONS"}),
+            raise_on_status=False,
+        )
+        adapter = HTTPAdapter(max_retries=retry)
     session.mount("http://", adapter)
     session.mount("https://", adapter)
 

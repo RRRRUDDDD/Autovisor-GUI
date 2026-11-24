@@ -73,18 +73,24 @@ def save_cookies(cookies, filename="cookies.json"):
     try:
         if os.name != "nt":
             os.chmod(temp_path, 0o600)
-        with os.fdopen(fd, "w", encoding="utf-8") as file:
+        file_obj = os.fdopen(fd, "w", encoding="utf-8")
+        fd = None
+        with file_obj as file:
             json.dump(cookies, file)
         os.replace(temp_path, filename)
         if os.name != "nt":
             os.chmod(filename, 0o600)
     except Exception:
-        try:
-            os.close(fd)
-        except OSError:
-            pass
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
         if os.path.exists(temp_path):
-            os.remove(temp_path)
+            try:
+                os.remove(temp_path)
+            except OSError:
+                pass
         raise
 
 def is_zhihuishu_domain(domain) -> bool:

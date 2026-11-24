@@ -640,5 +640,109 @@ class AnswerCacheStoreTests(StoreTestCase):
         self.assertEqual(row["content"], "清理后新题")
 
 
+class T15ConcurrencyAndMergeTests(StoreTestCase):
+    def test_save_options_by_id_bridge_preserves_eid_answers_and_analysis(self):
+        store, _ = self.make_store()
+        # 1. Existing eid row already has correct_options, wrong_options, and ai_analysis
+        store.save_options_by_eid(
+            "course-m", "exam-m", "E-99", OPTIONS, question_type="1", content="桥接保留题"
+        )
+        store.record_wrong("course-m", "exam-m", eid="E-99", wrong_options=[12])
+        store.mark_correct(
+            "course-m",
+            "exam-m",
+            eid="E-99",
+            correct_options=[11],
+            ai_analysis="权威解析内容",
+            auto_clear_wrong=False,
+        )
+        # 2. Separate question_id row created first without options/content so it doesn't bridge yet
+        store.save_options_by_id("course-m", "exam-m", "Q-99", [], question_type="1", content="")
+        self.assertEqual(store.stats("course-m")["zhidao_questions"], 2)
+
+        # 3. Now save_options_by_id supplies matching options -> triggers bridge + delete of eid row
+        merged_id = store.save_options_by_id(
+            "course-m", "exam-m", "Q-99", OPTIONS, question_type="1", content="桥接保留题"
+        )
+        self.assertEqual(store.stats("course-m")["zhidao_questions"], 1)
+        row = store.get_by_id("course-m", "Q-99", exam_id="exam-m")
+        self.assertEqual(row["id"], merged_id)
+        self.assertEqual(row["eid"], "E-99")
+        self.assertEqual(row["correct_options"], [11])
+        self.assertEqual(row["wrong_options"], [["12"]])
+        self.assertEqual(row["ai_analysis"], "权威解析内容")
+
+    def test_multithreaded_concurrent_writes_succeed_without_lock_or_integrity_errors(self):
+        store, _ = self.make_store()
+        errors: list[Exception] = []
+
+        def worker(tid: int):
+            try:
+                for i in range(15):
+                    eid = f"E-{tid}-{i}"
+                    opts = [
+                        {"id": tid * 1000 + i * 2 + 1, "content": "A"},
+                        {"id": tid * 1000 + i * 2 + 2, "content": "B"},
+                    ]
+                    store.save_options_by_eid(
+                        "course-c", "exam-c", eid, opts, content=f"并发题-{tid}-{i}"
+                    )
+                    store.record_wrong(
+                        "course-c", "exam-c", eid=eid, wrong_options=[opts[1]["id"]]
+                    )
+                    store.upsert_ai_question(
+                        "course-c",
+                        "exam-c",
+                        f"q-{tid}-{i}",
+                        1,
+                        question_plain=f"AI并发题-{tid}-{i}",
+                        answer="A",
+                    )
+            except Exception as exc:
+                errors.append(exc)
+
+        threads = [threading.Thread(target=worker, args=(t,)) for t in range(6)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=30)
+
+        self.assertEqual(errors, [])
+        stats = store.stats("course-c")
+        self.assertEqual(stats["zhidao_questions"], 90)
+        self.assertEqual(stats["ai_questions"], 90)
+
+    def test_import_caps_oversized_wrong_options_to_limit(self):
+        from modules.answer_store import WRONG_COMBO_LIMIT
+
+        store, _ = self.make_store()
+        oversized = [[str(i)] for i in range(WRONG_COMBO_LIMIT + 15)]
+        payload = {
+            "zhidao_questions": [
+                {
+                    "course_id": "course-lim",
+                    "exam_id": "exam-lim",
+                    "eid": "E-lim",
+                    "content": "超长错题记录",
+                    "options": OPTIONS,
+                    "wrong_options": oversized,
+                }
+            ],
+            "ai_questions": [],
+        }
+        store.import_data(payload)
+        row = store.get_by_eid("course-lim", "E-lim", exam_id="exam-lim")
+        self.assertEqual(len(row["wrong_options"]), WRONG_COMBO_LIMIT)
+        self.assertEqual(row["wrong_options"], oversized[-WRONG_COMBO_LIMIT:])
+
+        # Re-importing more wrong options also respects the limit
+        more = [[f"new-{i}"] for i in range(10)]
+        payload["zhidao_questions"][0]["wrong_options"] = more
+        store.import_data(payload)
+        row2 = store.get_by_eid("course-lim", "E-lim", exam_id="exam-lim")
+        self.assertEqual(len(row2["wrong_options"]), WRONG_COMBO_LIMIT)
+        self.assertEqual(row2["wrong_options"][-10:], more)
+
+
 if __name__ == "__main__":
     unittest.main()

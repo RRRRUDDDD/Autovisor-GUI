@@ -99,6 +99,8 @@ class Config:
             self.enablePptReference = self.get_bool_field('course-option', 'enablePptReference', fallback=True)
             # 播放页: 只读拦截课中弹题接口, 直接取服务端正确答案 (默认开启)
             self.enablePopupIntercept = self.get_bool_field('course-option', 'enablePopupIntercept', fallback=True)
+            # 答题时遇到已有保存答案的题目是否强制重新作答 (默认关闭)
+            self.forceRedoAnswered = self.get_bool_field('course-option', 'forceRedoAnswered', fallback=False)
             # 知到作业: 达标得分率与单份最大重做次数 (0=使用默认轮次)
             self.homeworkThreshold = self._safe_get_float('course-option', 'homeworkThreshold', 100.0)
             self.homeworkMaxRedo = int(self._safe_get_float('course-option', 'homeworkMaxRedo', 3.0))
@@ -362,6 +364,8 @@ enableFormalExamApi = True
 enablePptReference = True
 ;播放页: 只读拦截课中弹题接口, 直接取服务端正确答案 (默认:True)
 enablePopupIntercept = True
+;答题时遇到已有保存答案的题目是否强制重新作答 (默认:False)
+forceRedoAnswered = False
 ;知到作业达标得分率 0-100, 低于该值自动重做 (默认:100)
 homeworkThreshold = 100
 ;知到作业单份最大重做次数 (默认:3, 0=使用默认轮次)
