@@ -180,11 +180,21 @@ def normalize_course_url(url: str) -> str:
 
 
 def classify_course_url(url: str) -> str | None:
-    """识别智慧树有效课程播放页地址，返回课程类型标签；非课程播放页返回 None。"""
+    """识别智慧树有效课程播放页/答题任务页地址，返回类型标签；非有效地址返回 None。"""
     text = normalize_course_url(url)
     if not text.startswith("https://"):
         return None
-    host = (urlparse(text).hostname or "").lower()
+    parsed = urlparse(text)
+    host = (parsed.hostname or "").lower()
+    is_zhs_host = host == "zhihuishu.com" or host.endswith(".zhihuishu.com")
+    if is_zhs_host:
+        lower_full = text.lower()
+        if "/dohomework/" in lower_full:
+            return "知到作业"
+        if "/doexam/" in lower_full:
+            return "知到考试"
+        if "/testdetail/" in lower_full:
+            return "AI 测试详情"
     for target_host, label in COURSE_HOST_LABELS:
         if host == target_host or host.endswith("." + target_host):
             return label
@@ -344,6 +354,7 @@ def _build_course_from_dict(
         pc_url_lower = _pick_str(obj, ("pcUrl", "studyUrl", "url")).lower()
         is_hike = (
             "startinng" in parent_lower
+            or "starting" in parent_lower
             or "hike" in parent_lower
             or "aided" in parent_lower
             or "schoolcourse" in parent_lower
@@ -373,17 +384,83 @@ def _build_course_from_dict(
     )
 
 
-def extract_courses_from_json(payload, *, source_url: str = "") -> list[FetchedCourse]:
-    """递归从智慧树接口 JSON 响应中提取课程信息。"""
+_COURSE_ENDPOINT_KEYWORDS = (
+    "course",
+    "share",
+    "recommend",
+    "banner",
+    "hot",
+    "teacher",
+    "schoollist",
+)
+_PROFILE_URL_KEYWORDS = (
+    "getloginuserinfo",
+    "userinfo",
+    "loginuser",
+    "studentinfo",
+    "getloginschoolinfo",
+    "accountinfo",
+)
+_PROFILE_PARENT_KEYS = frozenset(
+    {
+        "userinfo",
+        "loginuser",
+        "loginuserinfo",
+        "studentinfo",
+        "accountinfo",
+        "user",
+    }
+)
+_USER_NAME_FIELDS = ("realName", "nickName", "userName", "studentName")
+_USER_SCHOOL_FIELDS = ("schoolName", "collegeName", "universityName")
+
+
+def _is_user_profile_context(source_url: str, parent_key: str) -> bool:
+    url_lower = str(source_url or "").strip().lower()
+    parent_lower = str(parent_key or "").strip().lower()
+    if url_lower and any(bad in url_lower for bad in _COURSE_ENDPOINT_KEYWORDS):
+        return False
+    url_is_profile = bool(url_lower) and any(
+        good in url_lower for good in _PROFILE_URL_KEYWORDS
+    )
+    return url_is_profile or parent_lower in _PROFILE_PARENT_KEYS
+
+
+def extract_courses_and_profile_from_json(
+    payload, *, source_url: str = ""
+) -> tuple[list[FetchedCourse], str, str]:
+    """递归从智慧树接口 JSON 响应中提取课程信息与当前学生姓名/学校。"""
     found: list[FetchedCourse] = []
+    display_name = ""
+    school_name = ""
 
     def _walk(node, parent_key: str = "") -> None:
+        nonlocal display_name, school_name
         if isinstance(node, dict):
             item = _build_course_from_dict(
                 node, parent_key=parent_key, source_url=source_url
             )
+            looks_like_course = (
+                item is not None
+                or "courseName" in node
+                or "courseTitle" in node
+                or "recruitAndCourseId" in node
+                or "secret" in node
+                or "courseId" in node
+            )
             if item is not None:
                 found.append(item)
+            elif not looks_like_course and _is_user_profile_context(
+                source_url, parent_key
+            ):
+                if not display_name:
+                    candidate = _pick_str(node, _USER_NAME_FIELDS)
+                    if candidate and len(candidate) <= 32:
+                        display_name = candidate
+                if not school_name:
+                    sch = _pick_str(node, _USER_SCHOOL_FIELDS)
+                    if sch and len(sch) <= 48:
+                        school_name = sch
             for key, value in node.items():
                 if _should_skip_container_key(key):
                     continue
@@ -408,7 +485,103 @@ def extract_courses_from_json(payload, *, source_url: str = "") -> list[FetchedC
                     _walk(entry, parent_key)
 
     _walk(payload)
-    return dedupe_courses(found)
+    return dedupe_courses(found), display_name, school_name
+
+
+def extract_courses_from_json(payload, *, source_url: str = "") -> list[FetchedCourse]:
+    """递归从智慧树接口 JSON 响应中提取课程信息。"""
+    courses, _, _ = extract_courses_and_profile_from_json(
+        payload, source_url=source_url
+    )
+    return courses
+
+
+def extract_courses_from_captured(
+    responses: list[dict] | None = None,
+    dom_courses: list[dict] | None = None,
+    *,
+    dom_user_name: str = "",
+    extra_courses: list[dict] | None = None,
+) -> tuple[list[FetchedCourse], str, str]:
+    """从浏览器 CDP 捕获的原始响应列表、DOM 课程列表与可选课程列表中统一提取、校验并去重。"""
+    collected: list[FetchedCourse] = []
+    display_name = ""
+    school_name = ""
+
+    for entry in responses or ():
+        if not isinstance(entry, dict):
+            continue
+        source_url = str(entry.get("url") or "").strip()
+        body = entry.get("body")
+        if isinstance(body, str):
+            trimmed = body.strip()
+            if not (trimmed.startswith("{") or trimmed.startswith("[")):
+                continue
+            try:
+                body = json.loads(trimmed)
+            except json.JSONDecodeError:
+                continue
+        if not isinstance(body, (dict, list)):
+            continue
+        courses, name, school = extract_courses_and_profile_from_json(
+            body, source_url=source_url
+        )
+        collected.extend(courses)
+        if not display_name and name:
+            display_name = name
+        if not school_name and school:
+            school_name = school
+
+    for item in dom_courses or ():
+        if not isinstance(item, dict):
+            continue
+        norm_url = normalize_course_url(str(item.get("url") or ""))
+        course_type = classify_course_url(norm_url)
+        if not course_type:
+            continue
+        raw_title = str(item.get("title") or "").strip()
+        title = raw_title if not _is_generic_title(raw_title) else course_type
+        collected.append(
+            FetchedCourse(
+                title=title,
+                url=norm_url,
+                course_type=course_type,
+                teacher=str(item.get("teacher") or "").strip(),
+                school=str(item.get("school") or "").strip(),
+                progress=_format_progress(_pick_str(item, _PROGRESS_FIELDS)),
+            )
+        )
+
+    for item in extra_courses or ():
+        if not isinstance(item, dict):
+            continue
+        norm_url = normalize_course_url(str(item.get("url") or ""))
+        course_type = classify_course_url(norm_url)
+        if not course_type:
+            continue
+        raw_title = str(item.get("title") or "").strip()
+        explicit_type = str(
+            item.get("courseType") or item.get("course_type") or ""
+        ).strip()
+        effective_type = explicit_type or course_type
+        title = raw_title if not _is_generic_title(raw_title) else effective_type
+        collected.append(
+            FetchedCourse(
+                title=title,
+                url=norm_url,
+                course_type=effective_type,
+                teacher=str(item.get("teacher") or "").strip(),
+                school=str(item.get("school") or "").strip(),
+                progress=_format_progress(str(item.get("progress") or "")),
+            )
+        )
+
+    if not display_name:
+        trimmed_dom_name = str(dom_user_name or "").strip()
+        if trimmed_dom_name and len(trimmed_dom_name) <= 32:
+            display_name = trimmed_dom_name
+
+    return dedupe_courses(collected), display_name, school_name
 
 
 def dedupe_courses(courses: list[FetchedCourse]) -> list[FetchedCourse]:
@@ -474,10 +647,21 @@ def append_courses_to_config(config_path: str, courses: list[FetchedCourse]) -> 
     if raw is None:
         return 0
 
-    existing_urls = set(
-        re.findall(r"https://[-A-Za-z0-9+&@#/%?=~_|!:,.;]+[-A-Za-z0-9+&@#/%=~_|]", raw)
-    )
-    new_urls = [c.url for c in courses if c.url not in existing_urls]
+    existing_urls = {
+        normalize_course_url(u)
+        for u in re.findall(
+            r"https?://[-A-Za-z0-9+&@#/%?=~_|!:,.;]+[-A-Za-z0-9+&@#/%=~_|]", raw
+        )
+        if normalize_course_url(u)
+    }
+    seen_new: set[str] = set()
+    new_urls: list[str] = []
+    for c in courses:
+        norm = normalize_course_url(c.url)
+        if not norm or norm in existing_urls or norm in seen_new:
+            continue
+        seen_new.add(norm)
+        new_urls.append(norm)
     if not new_urls:
         return 0
 
@@ -907,10 +1091,34 @@ async def fetch_courses_from_page(
     logger=None,
     proxy: str = "",
 ) -> list[FetchedCourse]:
-    """优先调用智慧树课程接口拉取全量课程，并结合学生首页网络响应与 DOM/Vue 状态补充。"""
+    """优先调用智慧树课程接口拉取全量课程，失败或为空时再回退学生首页网络响应与 DOM/Vue 状态。"""
     captured: list[FetchedCourse] = []
     api_courses: list[FetchedCourse] = []
     pending_tasks: list[asyncio.Task] = []
+
+    async def _try_api_fetch() -> bool:
+        try:
+            context = getattr(page, "context", None)
+            if context is not None and hasattr(context, "cookies"):
+                ctx_cookies = await context.cookies()
+                if ctx_cookies:
+                    api_res = await asyncio.to_thread(
+                        fetch_courses_via_api,
+                        ctx_cookies,
+                        proxy=proxy,
+                        logger=logger,
+                    )
+                    if api_res.courses:
+                        api_courses.extend(api_res.courses)
+                    return bool(api_res.session_valid and api_res.courses)
+        except Exception as exc:
+            if logger:
+                logger.debug(f"通过接口直拉课程列表失败: {exc}")
+        return False
+
+    # 先尝试使用当前浏览器上下文 Cookie 直拉官方接口，命中即免除首页 6.2s 等待
+    if await _try_api_fetch():
+        return dedupe_courses(api_courses)
 
     async def _inspect_response(response) -> None:
         try:
@@ -996,21 +1204,9 @@ async def fetch_courses_from_page(
             if logger:
                 logger.debug(f"加载学生首页失败，回退直接接口拉取: {exc}")
 
-        try:
-            context = getattr(page, "context", None)
-            if context is not None and hasattr(context, "cookies"):
-                ctx_cookies = await context.cookies()
-                if ctx_cookies:
-                    api_res = await asyncio.to_thread(
-                        fetch_courses_via_api,
-                        ctx_cookies,
-                        proxy=proxy,
-                        logger=logger,
-                    )
-                    api_courses.extend(api_res.courses)
-        except Exception as exc:
-            if logger:
-                logger.debug(f"通过接口补充拉取课程列表失败: {exc}")
+        # 访问首页可能刷新了子域 SESSION Cookie，若先前接口直拉未命中则再补充拉取一次
+        if not api_courses:
+            await _try_api_fetch()
     finally:
         try:
             page.remove_listener("response", _on_response)

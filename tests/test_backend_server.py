@@ -1339,6 +1339,92 @@ class Phase2TaskCancellationTests(unittest.TestCase):
             finally:
                 srv.server_close()
 
+    def test_courses_extract_endpoint_parses_cdp_responses_and_dom_courses(self):
+        import threading
+        import urllib.request
+        from backend_server import BackendHTTPServer, BackendRequestHandler
+
+        with tempfile.TemporaryDirectory() as tmp:
+            mgr = TaskManager(tmp)
+            token = "extract-test-token"
+            srv = BackendHTTPServer(
+                ("127.0.0.1", 0),
+                BackendRequestHandler,
+                mgr,
+                token=token,
+                app_version="3.20.0",
+            )
+            port = srv.server_address[1]
+            t = threading.Thread(target=srv.serve_forever, daemon=True)
+            t.start()
+            try:
+                payload = {
+                    "responses": [
+                        {
+                            "url": "https://onlineservice-api.zhihuishu.com/gateway/f/v1/login/getLoginUserInfo",
+                            "body": json.dumps(
+                                {
+                                    "code": 200,
+                                    "result": {"realName": "李四", "schoolName": "工大"},
+                                }
+                            ),
+                        },
+                        {
+                            "url": "https://hikeservice.zhihuishu.com/student/course/aided/getMyCourseList",
+                            "body": json.dumps(
+                                {
+                                    "code": 200,
+                                    "result": {
+                                        "startInngcourseList": [
+                                            {
+                                                "courseId": 10086,
+                                                "courseName": "劳动教育",
+                                                "studyRate": "60%",
+                                            }
+                                        ]
+                                    },
+                                }
+                            ),
+                        },
+                    ],
+                    "domCourses": [
+                        {
+                            "url": "//wisdom-mooc.zhihuishu.com/play/999#/",
+                            "title": "AI 慕课实战",
+                        },
+                        {
+                            "url": "https://evil.example.com/studyvideoh5.zhihuishu.com",
+                            "title": "非法域名",
+                        },
+                    ],
+                }
+                req = urllib.request.Request(
+                    f"http://127.0.0.1:{port}/api/courses/extract",
+                    data=json.dumps(payload).encode("utf-8"),
+                    headers={
+                        "Content-Type": "application/json",
+                        "X-Autovisor-Token": token,
+                    },
+                    method="POST",
+                )
+                with urllib.request.urlopen(req, timeout=5) as resp:
+                    body = json.loads(resp.read().decode("utf-8"))
+                self.assertTrue(body["ok"])
+                self.assertTrue(body["sessionValid"])
+                self.assertEqual(body["displayName"], "李四")
+                self.assertEqual(body["schoolName"], "工大")
+                self.assertEqual(len(body["courses"]), 2)
+                urls = [c["url"] for c in body["courses"]]
+                self.assertIn(
+                    "https://hike.zhihuishu.com/aidedteaching/sourceLearning/sourceLearning?courseId=10086",
+                    urls,
+                )
+                self.assertIn("https://wisdom-mooc.zhihuishu.com/play/999", urls)
+            finally:
+                srv.graceful_shutdown(stop_http=True)
+                srv.server_close()
+                t.join(timeout=3.0)
+
 
 if __name__ == "__main__":
     unittest.main()

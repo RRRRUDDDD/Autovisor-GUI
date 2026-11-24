@@ -862,104 +862,6 @@ fn wait_for_cdp_ws_url(
     Err("等待浏览器调试端口就绪超时，请确认浏览器可以正常启动".to_string())
 }
 
-fn normalize_zhs_url(raw: &str) -> Option<String> {
-    let trimmed = raw.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-    let mut full = if trimmed.starts_with("//") {
-        format!("https:{trimmed}")
-    } else if trimmed.starts_with("http://") {
-        trimmed.replacen("http://", "https://", 1)
-    } else if trimmed.starts_with("https://") {
-        trimmed.to_string()
-    } else {
-        return None;
-    };
-    if full.ends_with("#/") {
-        full.truncate(full.len() - 2);
-    } else if full.ends_with('#') {
-        full.truncate(full.len() - 1);
-    }
-    let lower = full.to_ascii_lowercase();
-    let is_course_host = lower.contains("studyvideoh5.zhihuishu.com")
-        || lower.contains("fusioncourseh5.zhihuishu.com")
-        || lower.contains("studywisdomh5.zhihuishu.com")
-        || lower.contains("wisdom-mooc.zhihuishu.com")
-        || lower.contains("ai-smart-course-student-pro.zhihuishu.com")
-        || lower.contains("hike.zhihuishu.com");
-    if is_course_host {
-        Some(full)
-    } else {
-        None
-    }
-}
-
-fn infer_course_type_label(url: &str) -> &'static str {
-    let lower = url.to_ascii_lowercase();
-    if lower.contains("ai-smart-course-student-pro.zhihuishu.com") {
-        "AI 智慧课"
-    } else if lower.contains("wisdom-mooc.zhihuishu.com") {
-        "AI 慕课"
-    } else if lower.contains("fusioncourseh5.zhihuishu.com") {
-        "融合共享课"
-    } else if lower.contains("studywisdomh5.zhihuishu.com") || lower.contains("hike.zhihuishu.com") {
-        "翻转 / 智慧课"
-    } else if lower.contains("studyvideoh5.zhihuishu.com") {
-        "智慧共享课"
-    } else {
-        "智慧树课程"
-    }
-}
-
-fn is_generic_course_title(title: &str) -> bool {
-    let t = title.trim();
-    t.is_empty()
-        || matches!(
-            t,
-            "智慧共享课"
-                | "融合共享课"
-                | "翻转 / 智慧课"
-                | "校内学分课"
-                | "AI 慕课"
-                | "AI 智慧课"
-                | "智慧树课程"
-                | "进入学习"
-                | "继续学习"
-                | "开始学习"
-                | "去学习"
-                | "立即学习"
-                | "查看详情"
-                | "进入课程"
-                | "开始上课"
-        )
-}
-
-fn should_skip_course_container_key(key: &str) -> bool {
-    let lower = key.trim().to_ascii_lowercase();
-    if lower.is_empty() {
-        return false;
-    }
-    [
-        "recommend",
-        "hotcourse",
-        "banner",
-        "advert",
-        "adlist",
-        "guesslike",
-        "popular",
-        "endcourse",
-        "finishcourse",
-        "finishedcourse",
-        "overcourse",
-        "historycourse",
-        "pastcourse",
-        "closedcourse",
-    ]
-    .iter()
-    .any(|bad| lower.contains(bad))
-}
-
 fn get_string_field(obj: &serde_json::Map<String, Value>, keys: &[&str]) -> String {
     for key in keys {
         if let Some(val) = obj.get(*key) {
@@ -973,257 +875,6 @@ fn get_string_field(obj: &serde_json::Map<String, Value>, keys: &[&str]) -> Stri
     String::new()
 }
 
-fn format_progress_value(obj: &serde_json::Map<String, Value>) -> String {
-    for key in [
-        "progress",
-        "studyProcess",
-        "studyProgress",
-        "lessonProgress",
-        "learnProgress",
-        "studyRate",
-        "progressRate",
-        "completeRate",
-        "progressPercent",
-        "finishedPercent",
-        "schedule",
-        "process",
-        "finishPercent",
-    ] {
-        if let Some(val) = obj.get(key) {
-            match val {
-                Value::String(s) => {
-                    let t = s.trim();
-                    if t.is_empty() {
-                        continue;
-                    }
-                    if t.ends_with('%') {
-                        return t.to_string();
-                    }
-                    if let Ok(num) = t.parse::<f64>() {
-                        let pct = if num > 0.0 && num <= 1.0 && t.contains('.') {
-                            num * 100.0
-                        } else {
-                            num
-                        };
-                        return format!("{:.0}%", pct.clamp(0.0, 100.0));
-                    }
-                    return t.to_string();
-                }
-                Value::Number(n) => {
-                    if let Some(num) = n.as_f64() {
-                        let pct = if num > 0.0 && num <= 1.0 && !n.is_u64() {
-                            num * 100.0
-                        } else {
-                            num
-                        };
-                        return format!("{:.0}%", pct.clamp(0.0, 100.0));
-                    }
-                }
-                _ => {}
-            }
-        }
-    }
-    String::new()
-}
-
-fn is_truthy_flag(obj: &serde_json::Map<String, Value>, keys: &[&str]) -> bool {
-    for key in keys {
-        if let Some(val) = obj.get(*key) {
-            match val {
-                Value::Bool(true) => return true,
-                Value::Number(n) if n.as_i64() == Some(1) => return true,
-                Value::String(s)
-                    if matches!(s.trim().to_ascii_lowercase().as_str(), "1" | "true") =>
-                {
-                    return true;
-                }
-                _ => {}
-            }
-        }
-    }
-    false
-}
-
-fn build_course_from_json_object(
-    obj: &serde_json::Map<String, Value>,
-    parent_key: &str,
-    source_url: &str,
-) -> Option<CourseItem> {
-    let raw_title = get_string_field(obj, &["courseName", "courseTitle", "name", "title"]);
-    if raw_title.chars().count() > 120 {
-        return None;
-    }
-
-    let parent_lower = parent_key.to_ascii_lowercase();
-    let source_lower = source_url.to_ascii_lowercase();
-
-    // Check direct URL fields first
-    let mut url = None;
-    for key in [
-        "studyUrl",
-        "playUrl",
-        "pcUrl",
-        "courseUrl",
-        "linkUrl",
-        "videoUrl",
-        "jumpUrl",
-        "h5Url",
-        "newCourseUrl",
-        "learnUrl",
-        "studentUrl",
-        "coursePlayUrl",
-        "detailUrl",
-        "webUrl",
-        "href",
-        "url",
-    ] {
-        if let Some(raw) = obj.get(key).and_then(|v| v.as_str()) {
-            if let Some(norm) = normalize_zhs_url(raw) {
-                url = Some(norm);
-                break;
-            }
-        }
-    }
-
-    let has_course_marker = obj.contains_key("courseName")
-        || obj.contains_key("courseTitle")
-        || obj.contains_key("recruitAndCourseId")
-        || obj.contains_key("courseId")
-        || obj.contains_key("courseType")
-        || obj.contains_key("teacherName")
-        || obj.contains_key("schoolName")
-        || parent_lower.contains("course");
-
-    // Fallback 1: AI 智慧课 (ai-smart-course-student-pro.zhihuishu.com)
-    if url.is_none() {
-        let course_id = get_string_field(obj, &["courseId", "aiCourseId"]);
-        let class_id = get_string_field(obj, &["classId", "recruitId"]);
-        let ai_hint = format!(
-            "{} {} {} {} {}",
-            get_string_field(obj, &["courseType"]),
-            get_string_field(obj, &["typeName"]),
-            get_string_field(obj, &["courseModel"]),
-            parent_lower,
-            source_lower
-        )
-        .to_ascii_lowercase();
-        let is_ai_smart = obj.contains_key("aiCourseId")
-            || ai_hint.contains("ai-smart")
-            || ai_hint.contains("aicourse")
-            || ai_hint.contains("ai_course")
-            || ai_hint.contains("ai智慧")
-            || ai_hint.contains("ai 智慧")
-            || ai_hint.contains("querystudentaicourselist")
-            || ai_hint
-                .split(|c: char| !c.is_ascii_alphabetic())
-                .any(|t| t == "ai");
-        if !course_id.is_empty() && !class_id.is_empty() && is_ai_smart {
-            url = Some(format!(
-                "https://ai-smart-course-student-pro.zhihuishu.com/learnPage?courseId={course_id}&classId={class_id}"
-            ));
-        }
-    }
-
-    // Fallback 2: construct playable URL from Zhihuishu's encrypted secret / recruitAndCourseId
-    if url.is_none() && has_course_marker {
-        let secret = get_string_field(obj, &["secret", "recruitAndCourseId", "secretStr"]);
-        if !secret.is_empty()
-            && secret.len() >= 4
-            && !secret.chars().any(char::is_whitespace)
-        {
-            let is_fusion_flag = is_truthy_flag(obj, &["fusionCourseFlag", "isFusion", "fusionFlag"]);
-            let course_type_num = obj
-                .get("courseType")
-                .and_then(|v| {
-                    v.as_i64()
-                        .or_else(|| v.as_str().and_then(|s| s.trim().parse::<i64>().ok()))
-                })
-                .unwrap_or(0);
-            let mode_hint = format!(
-                "{} {} {} {} {} {} {} {}",
-                get_string_field(obj, &["courseType"]),
-                get_string_field(obj, &["shareType"]),
-                get_string_field(obj, &["courseModel"]),
-                get_string_field(obj, &["typeName"]),
-                get_string_field(obj, &["courseTag"]),
-                raw_title,
-                parent_lower,
-                source_lower
-            )
-            .to_ascii_lowercase();
-            let is_fusion = is_fusion_flag
-                || course_type_num == 4
-                || mode_hint.contains("fusion")
-                || mode_hint.contains("融合");
-            let constructed = if is_fusion {
-                format!("https://fusioncourseh5.zhihuishu.com/stuStudy?recruitAndCourseId={secret}")
-            } else {
-                format!("https://studyvideoh5.zhihuishu.com/stuStudy?recruitAndCourseId={secret}")
-            };
-            url = Some(constructed);
-        }
-    }
-
-    // Fallback 3: 校内学分课 / 翻转课 (hike.zhihuishu.com)
-    if url.is_none() && has_course_marker {
-        let course_id = get_string_field(obj, &["courseId"]);
-        let pc_url_lower = get_string_field(obj, &["pcUrl", "studyUrl", "url"]).to_ascii_lowercase();
-        let is_hike = parent_lower.contains("startinng")
-            || parent_lower.contains("hike")
-            || parent_lower.contains("aided")
-            || parent_lower.contains("schoolcourse")
-            || parent_lower.contains("creditcourse")
-            || source_lower.contains("hikeservice.zhihuishu.com")
-            || source_lower.contains("hike.zhihuishu.com")
-            || source_lower.contains("/aided/")
-            || obj.contains_key("courseNature")
-            || obj.contains_key("aidedTeaching")
-            || pc_url_lower.contains("hike");
-        if !course_id.is_empty() && is_hike {
-            url = Some(format!(
-                "https://hike.zhihuishu.com/aidedteaching/sourceLearning/sourceLearning?courseId={course_id}"
-            ));
-        }
-    }
-
-    let final_url = url?;
-    let course_type = infer_course_type_label(&final_url).to_string();
-    let title = if raw_title.is_empty() {
-        course_type.clone()
-    } else {
-        raw_title
-    };
-    let teacher = get_string_field(
-        obj,
-        &[
-            "teacherName",
-            "speakerName",
-            "mainTeacher",
-            "lecturerName",
-            "masterTeacherName",
-            "teacherNames",
-            "teacher",
-        ],
-    );
-    let school = get_string_field(
-        obj,
-        &["schoolName", "collegeName", "universityName", "orgName", "school"],
-    );
-    let progress = format_progress_value(obj);
-
-    Some(CourseItem {
-        id: format!("auto-{}", short_hash(&final_url)),
-        title,
-        url: final_url,
-        enabled: true,
-        teacher,
-        school,
-        progress,
-        course_type,
-        auto_detected: true,
-    })
-}
-
 fn short_hash(input: &str) -> String {
     let mut h: u64 = 0xcbf29ce484222325;
     for b in input.as_bytes() {
@@ -1233,168 +884,20 @@ fn short_hash(input: &str) -> String {
     format!("{h:016x}")
 }
 
-fn is_user_profile_context(source_url: &str, parent_key: &str) -> bool {
-    let url_lower = source_url.trim().to_ascii_lowercase();
-    let parent_lower = parent_key.trim().to_ascii_lowercase();
-    let is_course_endpoint = !url_lower.is_empty()
-        && [
-            "course",
-            "share",
-            "recommend",
-            "banner",
-            "hot",
-            "teacher",
-            "schoollist",
-        ]
-        .iter()
-        .any(|bad| url_lower.contains(bad));
-    if is_course_endpoint {
-        return false;
-    }
-    let url_is_profile = !url_lower.is_empty()
-        && [
-            "getloginuserinfo",
-            "userinfo",
-            "loginuser",
-            "studentinfo",
-            "getloginschoolinfo",
-            "accountinfo",
-        ]
-        .iter()
-        .any(|good| url_lower.contains(good));
-    let parent_is_profile = matches!(
-        parent_lower.as_str(),
-        "userinfo" | "loginuser" | "loginuserinfo" | "studentinfo" | "accountinfo" | "user"
-    );
-    url_is_profile || parent_is_profile
-}
-
-fn extract_courses_and_profile_from_json_with_context(
-    val: &Value,
-    parent_key: &str,
-    source_url: &str,
-    courses: &mut Vec<CourseItem>,
-    display_name: &mut String,
-    school_name: &mut String,
-) {
-    match val {
-        Value::Array(arr) => {
-            for item in arr {
-                extract_courses_and_profile_from_json_with_context(
-                    item,
-                    parent_key,
-                    source_url,
-                    courses,
-                    display_name,
-                    school_name,
-                );
-            }
-        }
-        Value::Object(map) => {
-            let built_course = build_course_from_json_object(map, parent_key, source_url);
-            let looks_like_course = built_course.is_some()
-                || map.contains_key("courseName")
-                || map.contains_key("courseTitle")
-                || map.contains_key("recruitAndCourseId")
-                || map.contains_key("secret")
-                || map.contains_key("courseId");
-            if let Some(course) = built_course {
-                courses.push(course);
-            } else if !looks_like_course && is_user_profile_context(source_url, parent_key) {
-                if display_name.is_empty() {
-                    let candidate =
-                        get_string_field(map, &["realName", "nickName", "userName", "studentName"]);
-                    if !candidate.is_empty() && candidate.chars().count() <= 32 {
-                        *display_name = candidate;
-                    }
-                }
-                if school_name.is_empty() {
-                    let sch = get_string_field(map, &["schoolName", "collegeName", "universityName"]);
-                    if !sch.is_empty() && sch.chars().count() <= 48 {
-                        *school_name = sch;
-                    }
-                }
-            }
-
-            for (k, v) in map {
-                if should_skip_course_container_key(k) {
-                    continue;
-                }
-                match v {
-                    Value::Array(_) | Value::Object(_) => {
-                        extract_courses_and_profile_from_json_with_context(
-                            v,
-                            k,
-                            source_url,
-                            courses,
-                            display_name,
-                            school_name,
-                        );
-                    }
-                    Value::String(s)
-                        if matches!(k.as_str(), "result" | "data" | "rt" | "content") =>
-                    {
-                        let trimmed = s.trim();
-                        if (trimmed.starts_with('{') && trimmed.ends_with('}'))
-                            || (trimmed.starts_with('[') && trimmed.ends_with(']'))
-                        {
-                            if let Ok(nested) = serde_json::from_str::<Value>(trimmed) {
-                                extract_courses_and_profile_from_json_with_context(
-                                    &nested,
-                                    k,
-                                    source_url,
-                                    courses,
-                                    display_name,
-                                    school_name,
-                                );
-                            }
-                        }
-                    }
-                    _ => {}
-                }
-            }
-        }
-        _ => {}
-    }
-}
-
-#[cfg(test)]
-fn extract_courses_and_profile_from_json(
-    val: &Value,
-    courses: &mut Vec<CourseItem>,
-    display_name: &mut String,
-    school_name: &mut String,
-) {
-    extract_courses_and_profile_from_json_with_context(
-        val,
-        "",
-        "",
-        courses,
-        display_name,
-        school_name,
-    );
-}
-
-fn dedupe_discovered_courses(raw: Vec<CourseItem>) -> Vec<CourseItem> {
+/// 合并来自 Python 后端的两组已规范化课程列表（如直拉 API 与 CDP 提取），按 URL 去重并保留更完整的元数据。
+fn merge_backend_courses(primary: Vec<CourseItem>, secondary: Vec<CourseItem>) -> Vec<CourseItem> {
     let mut by_url: HashMap<String, CourseItem> = HashMap::new();
     let mut order: Vec<String> = Vec::new();
-    for mut item in raw {
-        let Some(norm_url) = normalize_zhs_url(&item.url) else {
+    for item in primary.into_iter().chain(secondary) {
+        let url = item.url.trim().to_string();
+        if url.is_empty() {
             continue;
-        };
-        item.url = norm_url.clone();
-        item.title = item.title.trim().to_string();
-        item.teacher = item.teacher.trim().to_string();
-        item.school = item.school.trim().to_string();
-        item.progress = item.progress.trim().to_string();
-        if item.course_type.trim().is_empty() {
-            item.course_type = infer_course_type_label(&norm_url).to_string();
         }
-        if item.title.is_empty() {
-            item.title = item.course_type.clone();
-        }
-        if let Some(existing) = by_url.get_mut(&norm_url) {
-            if is_generic_course_title(&existing.title) && !is_generic_course_title(&item.title) {
+        if let Some(existing) = by_url.get_mut(&url) {
+            let existing_is_fallback =
+                existing.title.is_empty() || existing.title == existing.course_type;
+            let item_is_real = !item.title.is_empty() && item.title != item.course_type;
+            if existing_is_fallback && item_is_real {
                 existing.title = item.title;
             }
             if existing.teacher.is_empty() && !item.teacher.is_empty() {
@@ -1410,8 +913,8 @@ fn dedupe_discovered_courses(raw: Vec<CourseItem>) -> Vec<CourseItem> {
                 existing.course_type = item.course_type;
             }
         } else {
-            order.push(norm_url.clone());
-            by_url.insert(norm_url, item);
+            order.push(url.clone());
+            by_url.insert(url, item);
         }
     }
     order
@@ -1627,9 +1130,7 @@ fn run_login_autofill(cdp: &mut CdpClient, req: &LoginRequest) -> Result<Value, 
 fn collect_captured_responses(
     cdp: &mut CdpClient,
     include_unfinished: bool,
-    discovered: &mut Vec<CourseItem>,
-    display_name: &mut String,
-    school_name: &mut String,
+    captured: &mut Vec<Value>,
 ) {
     let pending: Vec<(String, String)> = cdp
         .responses
@@ -1647,23 +1148,34 @@ fn collect_captured_responses(
             if !(trimmed.starts_with('{') || trimmed.starts_with('[')) {
                 continue;
             }
-            if let Ok(json_val) = serde_json::from_str::<Value>(trimmed) {
-                extract_courses_and_profile_from_json_with_context(
-                    &json_val,
-                    "",
-                    &source_url,
-                    discovered,
-                    display_name,
-                    school_name,
-                );
-            }
+            captured.push(json!({
+                "url": source_url,
+                "body": trimmed,
+            }));
         }
     }
+}
+
+fn extract_courses_via_backend(
+    app: &AppHandle,
+    backend: &BackendManager,
+    responses: &[Value],
+    dom_courses: &[Value],
+    dom_user_name: &str,
+) -> Result<ApiCoursesResponse, String> {
+    let payload = json!({
+        "responses": responses,
+        "domCourses": dom_courses,
+        "domUserName": dom_user_name,
+    });
+    let resp = backend.post_json(Some(app), "/api/courses/extract", &payload, 30)?;
+    Ok(parse_backend_courses_response(&resp))
 }
 
 fn discover_courses_in_current_session(
     cdp: &mut CdpClient,
     app: &AppHandle,
+    backend: &BackendManager,
     cancel_flag: &AtomicBool,
 ) -> Result<(Vec<CourseItem>, String, String), String> {
     emit_status(
@@ -1678,6 +1190,7 @@ fn discover_courses_in_current_session(
     let mut school_name = String::new();
 
     for attempt in 0..2 {
+        let mut captured_responses: Vec<Value> = Vec::new();
         if attempt == 0 {
             let current_url = cdp
                 .eval_js("window.location.href")
@@ -1700,13 +1213,7 @@ fn discover_courses_in_current_session(
                 return Err("已取消操作".to_string());
             }
             cdp.drain_events(Duration::from_millis(400));
-            collect_captured_responses(
-                cdp,
-                false,
-                &mut discovered,
-                &mut display_name,
-                &mut school_name,
-            );
+            collect_captured_responses(cdp, false, &mut captured_responses);
             let page_ready = cdp
                 .eval_js(
                     r#"(() => ({
@@ -1725,7 +1232,14 @@ fn discover_courses_in_current_session(
                 .unwrap_or(false);
             if page_ready {
                 ready_ticks += 1;
-                if ready_ticks >= 3 && (!discovered.is_empty() || ready_ticks >= 5) {
+                let has_course_resp = captured_responses.iter().any(|entry| {
+                    entry
+                        .get("url")
+                        .and_then(|v| v.as_str())
+                        .map(|u| u.to_ascii_lowercase().contains("course"))
+                        .unwrap_or(false)
+                });
+                if ready_ticks >= 3 && (has_course_resp || ready_ticks >= 5) {
                     break;
                 }
             }
@@ -1736,57 +1250,42 @@ fn discover_courses_in_current_session(
         let _ = cdp.eval_js(ZHS_TAB_SWITCH_JS);
         cdp.drain_events(Duration::from_millis(1200));
 
-        // Layer 1: Parse all captured Zhihuishu JSON API responses (including any newly triggered by tab clicks)
-        collect_captured_responses(
-            cdp,
-            true,
-            &mut discovered,
-            &mut display_name,
-            &mut school_name,
-        );
+        // Layer 1: Collect all captured Zhihuishu JSON API responses (including any newly triggered by tab clicks)
+        collect_captured_responses(cdp, true, &mut captured_responses);
 
         // Layer 2: Inspect DOM links, Vue 2 & Vue 3 reactive state, and user header
         let dom_val = cdp
             .eval_js(ZHS_DOM_EXTRACT_JS)
             .unwrap_or(Value::Null);
 
-        if let Some(arr) = dom_val.get("courses").and_then(|v| v.as_array()) {
-            for item in arr {
-                if let Some(map) = item.as_object() {
-                    let raw_url = get_string_field(map, &["url"]);
-                    let Some(norm_url) = normalize_zhs_url(&raw_url) else {
-                        continue;
-                    };
-                    let course_type = infer_course_type_label(&norm_url).to_string();
-                    let raw_title = get_string_field(map, &["title"]);
-                    let title = if is_generic_course_title(&raw_title) {
-                        course_type.clone()
-                    } else {
-                        raw_title
-                    };
-                    let progress = format_progress_value(map);
-                    discovered.push(CourseItem {
-                        id: format!("auto-{}", short_hash(&norm_url)),
-                        title,
-                        url: norm_url,
-                        enabled: true,
-                        teacher: get_string_field(map, &["teacher"]),
-                        school: get_string_field(map, &["school"]),
-                        progress,
-                        course_type,
-                        auto_detected: true,
-                    });
-                }
-            }
-        }
+        let dom_courses: Vec<Value> = dom_val
+            .get("courses")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+        let dom_user_name = dom_val
+            .get("userName")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim();
 
-        if display_name.is_empty() {
-            if let Some(name) = dom_val.get("userName").and_then(|v| v.as_str()) {
-                let trimmed = name.trim();
-                if !trimmed.is_empty() {
-                    display_name = trimmed.to_string();
-                }
+        // Delegate parsing, hostname validation, classification & deduping to Python SSOT
+        if let Ok(extracted) = extract_courses_via_backend(
+            app,
+            backend,
+            &captured_responses,
+            &dom_courses,
+            dom_user_name,
+        ) {
+            discovered = merge_backend_courses(discovered, extracted.courses);
+            if display_name.is_empty() && !extracted.display_name.is_empty() {
+                display_name = extracted.display_name;
             }
+            if school_name.is_empty() && !extracted.school_name.is_empty() {
+                school_name = extracted.school_name;
+            }
+        } else if display_name.is_empty() && !dom_user_name.is_empty() {
+            display_name = dom_user_name.to_string();
         }
 
         if !discovered.is_empty() {
@@ -1794,7 +1293,7 @@ fn discover_courses_in_current_session(
         }
     }
 
-    Ok((dedupe_discovered_courses(discovered), display_name, school_name))
+    Ok((discovered, display_name, school_name))
 }
 
 fn mask_account(raw: &str) -> String {
@@ -1840,28 +1339,28 @@ fn parse_backend_courses_response(resp: &Value) -> ApiCoursesResponse {
             let Some(map) = item.as_object() else {
                 continue;
             };
-            let raw_url = get_string_field(map, &["url"]);
-            let Some(norm_url) = normalize_zhs_url(&raw_url) else {
+            let url = get_string_field(map, &["url"]);
+            if url.is_empty() {
                 continue;
-            };
+            }
             let course_type = {
                 let raw_ct = get_string_field(map, &["courseType", "course_type"]);
                 if raw_ct.is_empty() {
-                    infer_course_type_label(&norm_url).to_string()
+                    "智慧树课程".to_string()
                 } else {
                     raw_ct
                 }
             };
             let raw_title = get_string_field(map, &["title"]);
-            let title = if is_generic_course_title(&raw_title) {
+            let title = if raw_title.is_empty() {
                 course_type.clone()
             } else {
                 raw_title
             };
             courses.push(CourseItem {
-                id: format!("auto-{}", short_hash(&norm_url)),
+                id: format!("auto-{}", short_hash(&url)),
                 title,
-                url: norm_url,
+                url,
                 enabled: true,
                 teacher: get_string_field(map, &["teacher"]),
                 school: get_string_field(map, &["school"]),
@@ -1878,7 +1377,7 @@ fn parse_backend_courses_response(resp: &Value) -> ApiCoursesResponse {
 
     ApiCoursesResponse {
         session_valid,
-        courses: dedupe_discovered_courses(courses),
+        courses: merge_backend_courses(courses, Vec::new()),
         display_name,
         school_name,
         cookies: refreshed_cookies,
@@ -2557,14 +2056,14 @@ pub fn execute_zhs_login(
 
         // Logged in! Collect cookies & discover courses via browser + direct Zhihuishu APIs
         let (browser_courses, mut detected_name, mut detected_school) =
-            discover_courses_in_current_session(&mut cdp, app, &cancel_flag)?;
+            discover_courses_in_current_session(&mut cdp, app, backend, &cancel_flag)?;
 
         let mut cookies = cdp.get_zhihuishu_cookies()?;
         if cookies.is_empty() {
             return Err("登录成功但未获取到智慧树 Cookie，请重试".to_string());
         }
 
-        let mut combined_courses = Vec::new();
+        let mut api_courses = Vec::new();
         let api_result =
             fetch_courses_via_backend_api(app, backend, &cookies, &effective_proxy);
         if cancel_flag.load(Ordering::SeqCst) {
@@ -2572,7 +2071,7 @@ pub fn execute_zhs_login(
         }
         if let Ok(api_res) = api_result {
             cookies = merge_cookies(&cookies, &api_res.cookies);
-            combined_courses.extend(api_res.courses);
+            api_courses = api_res.courses;
             // 优先采用官方 getLoginUserInfo / CASLOGC 返回的本人姓名与学校，避免首页其他接口误覆盖
             if !api_res.display_name.is_empty() {
                 detected_name = api_res.display_name;
@@ -2581,8 +2080,7 @@ pub fn execute_zhs_login(
                 detected_school = api_res.school_name;
             }
         }
-        combined_courses.extend(browser_courses);
-        let discovered_courses = dedupe_discovered_courses(combined_courses);
+        let discovered_courses = merge_backend_courses(api_courses, browser_courses);
 
         finalize_session_result(
             app,
@@ -2625,65 +2123,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn extracts_shared_and_fusion_courses_from_zhihuishu_json() {
-        let payload = json!({
-            "code": 200,
-            "result": {
-                "userInfo": {
-                    "realName": "张三",
-                    "schoolName": "示范大学"
-                },
-                "courseOpenDtos": [
-                    {
-                        "courseName": "高等数学（上）",
-                        "teacherName": "李教授",
-                        "schoolName": "示范大学",
-                        "progress": "62%",
-                        "secret": "abcdef1234567890"
-                    },
-                    {
-                        "courseName": "人工智能通识",
-                        "teacherName": "王老师",
-                        "fusionCourseFlag": 1,
-                        "studyProcess": 35,
-                        "secret": "fusion9876543210"
-                    },
-                    {
-                        "courseName": "AI 创新实践",
-                        "studyUrl": "https://wisdom-mooc.zhihuishu.com/study/999",
-                        "progress": "100%"
-                    }
-                ]
-            }
-        });
-
-        let mut courses = Vec::new();
-        let mut name = String::new();
-        let mut school = String::new();
-        extract_courses_and_profile_from_json(&payload, &mut courses, &mut name, &mut school);
-
-        assert_eq!(name, "张三");
-        assert_eq!(school, "示范大学");
-        assert_eq!(courses.len(), 3);
-        assert_eq!(
-            courses[0].url,
-            "https://studyvideoh5.zhihuishu.com/stuStudy?recruitAndCourseId=abcdef1234567890"
-        );
-        assert_eq!(courses[0].course_type, "智慧共享课");
-        assert_eq!(courses[0].progress, "62%");
-
-        assert_eq!(
-            courses[1].url,
-            "https://fusioncourseh5.zhihuishu.com/stuStudy?recruitAndCourseId=fusion9876543210"
-        );
-        assert_eq!(courses[1].course_type, "融合共享课");
-        assert_eq!(courses[1].progress, "35%");
-
-        assert_eq!(courses[2].url, "https://wisdom-mooc.zhihuishu.com/study/999");
-        assert_eq!(courses[2].course_type, "AI 慕课");
-    }
-
-    #[test]
     fn normalizes_cdp_cookies_filtering_domains_and_expired() {
         let future = (now_epoch_secs() + 86400) as f64;
         let past = (now_epoch_secs().saturating_sub(3600)) as f64;
@@ -2720,126 +2159,35 @@ mod tests {
     }
 
     #[test]
-    fn extracts_hike_ai_smart_non_coursename_and_skips_recommend_or_ended() {
-        let long_cn_title = "习近平新时代中国特色社会主义思想概论与当代青年历史使命深度专题研学实践课程与跨学科综合素养提升训练营（2026秋季强化班）";
-        assert!(long_cn_title.len() > 140);
-        assert!(long_cn_title.chars().count() < 120);
-
-        let payload = json!({
-            "code": 200,
-            "result": {
-                "startInngcourseList": [
-                    {
-                        "courseId": 2048991,
-                        "courseName": long_cn_title,
-                        "teacherName": "陈教授",
-                        "schoolName": "示范大学",
-                        "studyRate": "48%"
-                    }
-                ],
-                "aiCourseList": [
-                    {
-                        "courseId": "9001",
-                        "classId": "8002",
-                        "courseTitle": "AI 智慧微积分",
-                        "teacher": "周老师",
-                        "progress": 0.75
-                    }
-                ],
-                "otherList": [
-                    {
-                        "title": "协议相对地址课程",
-                        "studyUrl": "//wisdom-mooc.zhihuishu.com/play/555#/"
-                    }
-                ],
-                "endCourseList": [
-                    {
-                        "courseId": 999999,
-                        "courseName": "已完结旧课"
-                    }
-                ],
-                "recommendCourseList": [
-                    {
-                        "courseName": "推荐广告课程",
-                        "secret": "rec12345678"
-                    }
-                ]
-            }
-        });
-
-        let mut courses = Vec::new();
-        let mut name = String::new();
-        let mut school = String::new();
-        extract_courses_and_profile_from_json_with_context(
-            &payload,
-            "",
-            "https://hikeservice.zhihuishu.com/student/course/aided/getMyCourseList",
-            &mut courses,
-            &mut name,
-            &mut school,
-        );
-
-        assert_eq!(courses.len(), 3);
-        let hike = courses
-            .iter()
-            .find(|c| {
-                c.url == "https://hike.zhihuishu.com/aidedteaching/sourceLearning/sourceLearning?courseId=2048991"
-            })
-            .expect("hike course should be extracted");
-        assert_eq!(hike.title, long_cn_title);
-        assert_eq!(hike.progress, "48%");
-
-        let ai = courses
-            .iter()
-            .find(|c| {
-                c.url == "https://ai-smart-course-student-pro.zhihuishu.com/learnPage?courseId=9001&classId=8002"
-            })
-            .expect("ai smart course should be extracted");
-        assert_eq!(ai.title, "AI 智慧微积分");
-        assert_eq!(ai.progress, "75%");
-
-        let mooc = courses
-            .iter()
-            .find(|c| c.url == "https://wisdom-mooc.zhihuishu.com/play/555")
-            .expect("protocol-relative course should be extracted");
-        assert_eq!(mooc.title, "协议相对地址课程");
-    }
-
-    #[test]
-    fn dedupe_prefers_real_title_over_generic_and_normalizes_hash_suffix() {
-        let raw = vec![
-            CourseItem {
-                id: "1".into(),
-                title: "进入学习".into(),
-                url: "https://studyvideoh5.zhihuishu.com/stuStudy?recruitAndCourseId=abc12345#/".into(),
-                enabled: true,
-                teacher: "".into(),
-                school: "".into(),
-                progress: "".into(),
-                course_type: "智慧共享课".into(),
-                auto_detected: true,
-            },
-            CourseItem {
-                id: "2".into(),
-                title: "数据结构与算法".into(),
-                url: "https://studyvideoh5.zhihuishu.com/stuStudy?recruitAndCourseId=abc12345".into(),
-                enabled: true,
-                teacher: "刘教授".into(),
-                school: "示范大学".into(),
-                progress: "88%".into(),
-                course_type: "智慧共享课".into(),
-                auto_detected: true,
-            },
-        ];
-        let deduped = dedupe_discovered_courses(raw);
-        assert_eq!(deduped.len(), 1);
-        assert_eq!(deduped[0].title, "数据结构与算法");
-        assert_eq!(deduped[0].teacher, "刘教授");
-        assert_eq!(deduped[0].progress, "88%");
-        assert_eq!(
-            deduped[0].url,
-            "https://studyvideoh5.zhihuishu.com/stuStudy?recruitAndCourseId=abc12345"
-        );
+    fn merge_backend_courses_prefers_real_title_and_richer_metadata() {
+        let primary = vec![CourseItem {
+            id: "1".into(),
+            title: "智慧共享课".into(),
+            url: "https://studyvideoh5.zhihuishu.com/stuStudy?recruitAndCourseId=abc12345".into(),
+            enabled: true,
+            teacher: "".into(),
+            school: "".into(),
+            progress: "".into(),
+            course_type: "智慧共享课".into(),
+            auto_detected: true,
+        }];
+        let secondary = vec![CourseItem {
+            id: "2".into(),
+            title: "数据结构与算法".into(),
+            url: "https://studyvideoh5.zhihuishu.com/stuStudy?recruitAndCourseId=abc12345".into(),
+            enabled: true,
+            teacher: "刘教授".into(),
+            school: "示范大学".into(),
+            progress: "88%".into(),
+            course_type: "智慧共享课".into(),
+            auto_detected: true,
+        }];
+        let merged = merge_backend_courses(primary, secondary);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].title, "数据结构与算法");
+        assert_eq!(merged[0].teacher, "刘教授");
+        assert_eq!(merged[0].school, "示范大学");
+        assert_eq!(merged[0].progress, "88%");
     }
 
     #[test]
@@ -2981,105 +2329,6 @@ mod tests {
         assert!(merged[1].http_only);
         assert!(merged[1].secure);
         assert_eq!(merged[1].same_site.as_deref(), Some("None"));
-    }
-
-    #[test]
-    fn extracts_shared_course_from_detail_url_without_ai_false_positive() {
-        let payload = json!({
-            "mainCourseList": [
-                {
-                    "courseId": 101,
-                    "recruitId": 202,
-                    "secret": "shareDetailSec1",
-                    "courseName": "大学英语"
-                }
-            ],
-            "aiCourseList": [
-                {
-                    "courseId": 303,
-                    "classId": 404,
-                    "secret": "aiSecretIgnored",
-                    "courseName": "AI 智慧物理"
-                }
-            ]
-        });
-        let mut courses = Vec::new();
-        let mut name = String::new();
-        let mut school = String::new();
-        extract_courses_and_profile_from_json_with_context(
-            &payload,
-            "",
-            "https://onlineservice-api.zhihuishu.com/courseDetail",
-            &mut courses,
-            &mut name,
-            &mut school,
-        );
-        let shared = courses
-            .iter()
-            .find(|c| c.title == "大学英语")
-            .expect("shared course extracted");
-        assert_eq!(
-            shared.url,
-            "https://studyvideoh5.zhihuishu.com/stuStudy?recruitAndCourseId=shareDetailSec1"
-        );
-        let ai = courses
-            .iter()
-            .find(|c| c.title == "AI 智慧物理")
-            .expect("ai course extracted");
-        assert_eq!(
-            ai.url,
-            "https://ai-smart-course-student-pro.zhihuishu.com/learnPage?courseId=303&classId=404"
-        );
-    }
-
-    #[test]
-    fn ignores_course_endpoint_nested_school_and_only_reads_user_profile_school() {
-        let course_resp = json!({
-            "code": 200,
-            "result": {
-                "schoolInfo": {
-                    "schoolName": "错误的外校开课单位"
-                },
-                "courseOpenDtos": [
-                    {
-                        "courseName": "共享通识课",
-                        "secret": "sec123456",
-                        "schoolName": "清华大学"
-                    }
-                ]
-            }
-        });
-        let mut courses = Vec::new();
-        let mut name = String::new();
-        let mut school = String::new();
-        extract_courses_and_profile_from_json_with_context(
-            &course_resp,
-            "",
-            "https://onlineservice-api.zhihuishu.com/gateway/t/v1/student/course/share/queryShareCourseInfo",
-            &mut courses,
-            &mut name,
-            &mut school,
-        );
-        assert_eq!(courses.len(), 1);
-        assert!(school.is_empty(), "course endpoint must not set user school_name");
-
-        let user_resp = json!({
-            "code": 200,
-            "result": {
-                "realName": "王五",
-                "schoolName": "真实就读大学"
-            }
-        });
-        extract_courses_and_profile_from_json_with_context(
-            &user_resp,
-            "",
-            "https://onlineservice-api.zhihuishu.com/gateway/f/v1/login/getLoginUserInfo",
-            &mut courses,
-            &mut name,
-            &mut school,
-        );
-        assert_eq!(name, "王五");
-        assert_eq!(school, "真实就读大学");
     }
 
     #[test]

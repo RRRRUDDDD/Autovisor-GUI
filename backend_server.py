@@ -1551,8 +1551,13 @@ class BackendRequestHandler(BaseHTTPRequestHandler):
                 return
 
         try:
-            # 题库缓存导入包含全部历史题目, 单独放宽上限; 其他接口保持 2MB 保护
-            body_limit = 20 * 1024 * 1024 if path == "/api/cache/import" else 2 * 1024 * 1024
+            # 题库缓存导入包含全部历史题目，课程提取包含 CDP 捕获响应，单独放宽上限；其他接口保持 2MB 保护
+            if path == "/api/cache/import":
+                body_limit = 20 * 1024 * 1024
+            elif path == "/api/courses/extract":
+                body_limit = 10 * 1024 * 1024
+            else:
+                body_limit = 2 * 1024 * 1024
             body = self._read_json_body(max_bytes=body_limit)
         except Exception as exc:
             self._send_json(HTTPStatus.BAD_REQUEST, {"error": f"无效请求体: {exc}"})
@@ -1819,6 +1824,107 @@ class BackendRequestHandler(BaseHTTPRequestHandler):
                         "schoolName": fetched.school_name,
                         "sources": fetched.sources,
                         "cookies": fetched.cookies,
+                    },
+                )
+            except ValueError as exc:
+                self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+            except Exception as exc:
+                self._send_json(HTTPStatus.BAD_GATEWAY, {"error": str(exc)})
+            return
+
+        if path == "/api/courses/extract":
+            from modules.course_fetcher import (
+                dedupe_courses,
+                extract_courses_from_captured,
+                fetch_courses_via_api,
+            )
+
+            responses = body.get("responses")
+            if responses is None:
+                responses = []
+            elif not isinstance(responses, list):
+                self._send_json(
+                    HTTPStatus.BAD_REQUEST, {"error": "responses 参数格式无效"}
+                )
+                return
+
+            dom_courses = body.get("domCourses")
+            if dom_courses is None:
+                dom_courses = []
+            elif not isinstance(dom_courses, list):
+                self._send_json(
+                    HTTPStatus.BAD_REQUEST, {"error": "domCourses 参数格式无效"}
+                )
+                return
+
+            extra_courses = body.get("courses")
+            if extra_courses is None:
+                extra_courses = []
+            elif not isinstance(extra_courses, list):
+                self._send_json(
+                    HTTPStatus.BAD_REQUEST, {"error": "courses 参数格式无效"}
+                )
+                return
+
+            raw_cookies = body.get("cookies")
+            if raw_cookies is not None and not isinstance(raw_cookies, list):
+                self._send_json(
+                    HTTPStatus.BAD_REQUEST, {"error": "cookies 参数格式无效"}
+                )
+                return
+
+            dom_user_name = str(body.get("domUserName") or "").strip()
+            proxy = str(body.get("proxy") or "").strip()
+            fetch_api = (
+                bool(body.get("fetchApi"))
+                if "fetchApi" in body
+                else bool(raw_cookies)
+            )
+
+            try:
+                captured_courses, display_name, school_name = (
+                    extract_courses_from_captured(
+                        responses,
+                        dom_courses,
+                        dom_user_name=dom_user_name,
+                        extra_courses=extra_courses,
+                    )
+                )
+                session_valid = bool(captured_courses)
+                refreshed_cookies: list[dict] = []
+                combined_courses = list(captured_courses)
+
+                if fetch_api and raw_cookies:
+                    fetched = fetch_courses_via_api(raw_cookies, proxy=proxy)
+                    session_valid = bool(fetched.session_valid or session_valid)
+                    refreshed_cookies = list(fetched.cookies or [])
+                    if fetched.display_name:
+                        display_name = fetched.display_name
+                    if fetched.school_name:
+                        school_name = fetched.school_name
+                    combined_courses = dedupe_courses(
+                        list(fetched.courses) + captured_courses
+                    )
+
+                self._send_json(
+                    HTTPStatus.OK,
+                    {
+                        "ok": True,
+                        "sessionValid": session_valid,
+                        "courses": [
+                            {
+                                "title": c.title,
+                                "url": c.url,
+                                "courseType": c.course_type,
+                                "teacher": c.teacher,
+                                "school": c.school,
+                                "progress": c.progress,
+                            }
+                            for c in combined_courses
+                        ],
+                        "displayName": display_name,
+                        "schoolName": school_name,
+                        "cookies": refreshed_cookies,
                     },
                 )
             except ValueError as exc:

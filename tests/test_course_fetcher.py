@@ -800,6 +800,175 @@ class CourseFetcherTests(unittest.TestCase):
         self.assertEqual(len(res.courses), 1)
         self.assertEqual(res.courses[0].school, "清华大学")
 
+    def test_extract_courses_and_profile_ignores_course_endpoint_school(self):
+        from modules.course_fetcher import extract_courses_and_profile_from_json
+
+        course_resp = {
+            "code": 200,
+            "result": {
+                "schoolInfo": {"schoolName": "错误的外校开课单位"},
+                "courseOpenDtos": [
+                    {
+                        "courseName": "共享通识课",
+                        "secret": "sec123456",
+                        "schoolName": "清华大学",
+                    }
+                ],
+            },
+        }
+        courses, name, school = extract_courses_and_profile_from_json(
+            course_resp,
+            source_url="https://onlineservice-api.zhihuishu.com/gateway/t/v1/student/course/share/queryShareCourseInfo",
+        )
+        self.assertEqual(len(courses), 1)
+        self.assertEqual(name, "")
+        self.assertEqual(school, "")
+
+        user_resp = {
+            "code": 200,
+            "result": {"realName": "王五", "schoolName": "真实就读大学"},
+        }
+        _, name2, school2 = extract_courses_and_profile_from_json(
+            user_resp,
+            source_url="https://onlineservice-api.zhihuishu.com/gateway/f/v1/login/getLoginUserInfo",
+        )
+        self.assertEqual(name2, "王五")
+        self.assertEqual(school2, "真实就读大学")
+
+    def test_extract_courses_from_captured_merges_responses_dom_and_validates_host(self):
+        from modules.course_fetcher import extract_courses_from_captured
+
+        responses = [
+            {
+                "url": "https://onlineservice-api.zhihuishu.com/gateway/f/v1/login/getLoginUserInfo",
+                "body": json.dumps(
+                    {
+                        "code": 200,
+                        "result": {"realName": "张三", "schoolName": "示范大学"},
+                    }
+                ),
+            },
+            {
+                "url": "https://onlineservice-api.zhihuishu.com/gateway/t/v1/student/course/share/queryShareCourseInfo",
+                "body": json.dumps(
+                    {
+                        "result": {
+                            "courseOpenDtos": [
+                                {
+                                    "courseName": "进入学习",
+                                    "secret": "abcdef1234",
+                                    "progress": 50,
+                                }
+                            ]
+                        }
+                    }
+                ),
+            },
+        ]
+        dom_courses = [
+            {
+                "url": "http://studyvideoh5.zhihuishu.com/stuStudy?recruitAndCourseId=abcdef1234#/",
+                "title": "数据结构与算法",
+                "teacher": "刘教授",
+            },
+            {
+                "url": "https://evil.example.com/?x=studyvideoh5.zhihuishu.com",
+                "title": "钓鱼链接应被过滤",
+            },
+        ]
+        courses, name, school = extract_courses_from_captured(
+            responses, dom_courses, dom_user_name="备选名称"
+        )
+        self.assertEqual(name, "张三")
+        self.assertEqual(school, "示范大学")
+        self.assertEqual(len(courses), 1)
+        self.assertEqual(courses[0].title, "数据结构与算法")
+        self.assertEqual(courses[0].teacher, "刘教授")
+        self.assertEqual(courses[0].progress, "50%")
+        self.assertEqual(
+            courses[0].url,
+            "https://studyvideoh5.zhihuishu.com/stuStudy?recruitAndCourseId=abcdef1234",
+        )
+
+    def test_append_courses_to_config_normalizes_urls_before_dedupe(self):
+        courses = [
+            FetchedCourse(
+                title="已存在课程不同写法",
+                url="http://studyvideoh5.zhihuishu.com/stuStudy?recruitAndCourseId=dup1#/",
+                course_type="智慧共享课",
+            ),
+            FetchedCourse(
+                title="新课程",
+                url="//wisdom-mooc.zhihuishu.com/play/new1#/",
+                course_type="AI 慕课",
+            ),
+            FetchedCourse(
+                title="新课程重复",
+                url="https://wisdom-mooc.zhihuishu.com/play/new1",
+                course_type="AI 慕课",
+            ),
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            ini_path = os.path.join(tmp, "config.ini")
+            with open(ini_path, "w", encoding="utf-8") as f:
+                f.write(
+                    "[course-url]\n"
+                    "URL1 = https://studyvideoh5.zhihuishu.com/stuStudy?recruitAndCourseId=dup1\n"
+                )
+            added = append_courses_to_config(ini_path, courses)
+            self.assertEqual(added, 1)
+            with open(ini_path, "r", encoding="utf-8") as f:
+                content = f.read()
+            self.assertIn("URL2 = https://wisdom-mooc.zhihuishu.com/play/new1", content)
+            self.assertNotIn("URL3 =", content)
+
+    def test_fetch_courses_from_page_tries_api_first_without_waiting(self):
+        import asyncio
+        from unittest.mock import patch
+        from modules.course_fetcher import ApiCourseFetchResult, fetch_courses_from_page
+
+        class _FakeContext:
+            async def cookies(self):
+                return [{"name": "CASTGC", "value": "tgt", "domain": ".zhihuishu.com"}]
+
+        class _FakePage:
+            def __init__(self):
+                self.context = _FakeContext()
+                self.goto_called = False
+                self.wait_called = False
+
+            def on(self, *_args, **_kwargs):
+                pass
+
+            def remove_listener(self, *_args, **_kwargs):
+                pass
+
+            async def goto(self, *_args, **_kwargs):
+                self.goto_called = True
+
+            async def wait_for_timeout(self, *_args, **_kwargs):
+                self.wait_called = True
+
+        page = _FakePage()
+        fake_res = ApiCourseFetchResult(
+            courses=[
+                FetchedCourse(
+                    title="高等数学",
+                    url="https://studyvideoh5.zhihuishu.com/stuStudy?recruitAndCourseId=fast1",
+                    course_type="智慧共享课",
+                )
+            ],
+            session_valid=True,
+        )
+        with patch("modules.course_fetcher.fetch_courses_via_api", return_value=fake_res) as m_api:
+            result = asyncio.run(fetch_courses_from_page(page, wait_seconds=5.0))
+
+        m_api.assert_called_once()
+        self.assertFalse(page.goto_called)
+        self.assertFalse(page.wait_called)
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0].title, "高等数学")
+
 
 if __name__ == "__main__":
     unittest.main()
