@@ -1041,7 +1041,33 @@ fn build_course_from_json_object(
         || obj.contains_key("schoolName")
         || parent_lower.contains("course");
 
-    // Fallback 1: construct playable URL from Zhihuishu's encrypted secret / recruitAndCourseId
+    // Fallback 1: AI 智慧课 (ai-smart-course-student-pro.zhihuishu.com)
+    if url.is_none() {
+        let course_id = get_string_field(obj, &["courseId", "aiCourseId"]);
+        let class_id = get_string_field(obj, &["classId", "recruitId"]);
+        let ai_hint = format!(
+            "{} {} {} {} {}",
+            get_string_field(obj, &["courseType"]),
+            get_string_field(obj, &["typeName"]),
+            get_string_field(obj, &["courseModel"]),
+            parent_lower,
+            source_lower
+        )
+        .to_ascii_lowercase();
+        let is_ai_smart = obj.contains_key("aiCourseId")
+            || ai_hint.contains("ai-smart")
+            || ai_hint.contains("aicourse")
+            || ai_hint.contains("ai智慧")
+            || ai_hint.contains("ai 智慧")
+            || (ai_hint.contains("ai") && !ai_hint.contains("aided"));
+        if !course_id.is_empty() && !class_id.is_empty() && is_ai_smart {
+            url = Some(format!(
+                "https://ai-smart-course-student-pro.zhihuishu.com/learnPage?courseId={course_id}&classId={class_id}"
+            ));
+        }
+    }
+
+    // Fallback 2: construct playable URL from Zhihuishu's encrypted secret / recruitAndCourseId
     if url.is_none() && has_course_marker {
         let secret = get_string_field(obj, &["secret", "recruitAndCourseId", "secretStr"]);
         if !secret.is_empty()
@@ -1078,32 +1104,6 @@ fn build_course_from_json_object(
                 format!("https://studyvideoh5.zhihuishu.com/stuStudy?recruitAndCourseId={secret}")
             };
             url = Some(constructed);
-        }
-    }
-
-    // Fallback 2: AI 智慧课 (ai-smart-course-student-pro.zhihuishu.com)
-    if url.is_none() {
-        let course_id = get_string_field(obj, &["courseId", "aiCourseId"]);
-        let class_id = get_string_field(obj, &["classId", "recruitId"]);
-        let ai_hint = format!(
-            "{} {} {} {} {}",
-            get_string_field(obj, &["courseType"]),
-            get_string_field(obj, &["typeName"]),
-            get_string_field(obj, &["courseModel"]),
-            parent_lower,
-            source_lower
-        )
-        .to_ascii_lowercase();
-        let is_ai_smart = obj.contains_key("aiCourseId")
-            || ai_hint.contains("ai-smart")
-            || ai_hint.contains("aicourse")
-            || ai_hint.contains("ai智慧")
-            || ai_hint.contains("ai 智慧")
-            || (ai_hint.contains("ai") && !ai_hint.contains("aided"));
-        if !course_id.is_empty() && !class_id.is_empty() && is_ai_smart {
-            url = Some(format!(
-                "https://ai-smart-course-student-pro.zhihuishu.com/learnPage?courseId={course_id}&classId={class_id}"
-            ));
         }
     }
 
@@ -1716,6 +1716,229 @@ fn mask_account(raw: &str) -> String {
     }
 }
 
+struct ApiCoursesResponse {
+    session_valid: bool,
+    courses: Vec<CourseItem>,
+    display_name: String,
+    school_name: String,
+    cookies: Vec<PlaywrightCookie>,
+}
+
+fn parse_backend_courses_response(resp: &Value) -> ApiCoursesResponse {
+    let session_valid = resp
+        .get("sessionValid")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let display_name = resp
+        .get("displayName")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    let school_name = resp
+        .get("schoolName")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    let mut courses = Vec::new();
+    if let Some(arr) = resp.get("courses").and_then(|v| v.as_array()) {
+        for item in arr {
+            let Some(map) = item.as_object() else {
+                continue;
+            };
+            let raw_url = get_string_field(map, &["url"]);
+            let Some(norm_url) = normalize_zhs_url(&raw_url) else {
+                continue;
+            };
+            let course_type = {
+                let raw_ct = get_string_field(map, &["courseType", "course_type"]);
+                if raw_ct.is_empty() {
+                    infer_course_type_label(&norm_url).to_string()
+                } else {
+                    raw_ct
+                }
+            };
+            let raw_title = get_string_field(map, &["title"]);
+            let title = if is_generic_course_title(&raw_title) {
+                course_type.clone()
+            } else {
+                raw_title
+            };
+            courses.push(CourseItem {
+                id: format!("auto-{}", short_hash(&norm_url)),
+                title,
+                url: norm_url,
+                enabled: true,
+                teacher: get_string_field(map, &["teacher"]),
+                school: get_string_field(map, &["school"]),
+                progress: get_string_field(map, &["progress"]),
+                course_type,
+                auto_detected: true,
+            });
+        }
+    }
+    let refreshed_cookies: Vec<PlaywrightCookie> = resp
+        .get("cookies")
+        .and_then(|v| serde_json::from_value(v.clone()).ok())
+        .unwrap_or_default();
+
+    ApiCoursesResponse {
+        session_valid,
+        courses: dedupe_discovered_courses(courses),
+        display_name,
+        school_name,
+        cookies: refreshed_cookies,
+    }
+}
+
+fn fetch_courses_via_backend_api(
+    app: &AppHandle,
+    backend: &BackendManager,
+    cookies: &[PlaywrightCookie],
+    proxy: &str,
+) -> Result<ApiCoursesResponse, String> {
+    let payload = json!({
+        "cookies": cookies,
+        "proxy": proxy,
+    });
+    let resp = backend.post_json(Some(app), "/api/courses/fetch", &payload, 30)?;
+    Ok(parse_backend_courses_response(&resp))
+}
+
+fn merge_cookies(base: &[PlaywrightCookie], updates: &[PlaywrightCookie]) -> Vec<PlaywrightCookie> {
+    if updates.is_empty() {
+        return base.to_vec();
+    }
+    let mut out = base.to_vec();
+    for upd in updates {
+        let upd_domain = upd.domain.trim().to_ascii_lowercase();
+        let upd_path = if upd.path.is_empty() { "/" } else { upd.path.as_str() };
+        if let Some(slot) = out.iter_mut().find(|c| {
+            c.name == upd.name
+                && c.domain.trim().to_ascii_lowercase() == upd_domain
+                && (if c.path.is_empty() { "/" } else { c.path.as_str() }) == upd_path
+        }) {
+            *slot = upd.clone();
+        } else {
+            out.push(upd.clone());
+        }
+    }
+    out
+}
+
+#[allow(clippy::too_many_arguments)]
+fn finalize_session_result(
+    app: &AppHandle,
+    base_dir: &Path,
+    req: &LoginRequest,
+    is_cookie_mode: bool,
+    browser_override: Option<(String, String)>,
+    cookies: &[PlaywrightCookie],
+    discovered_courses: Vec<CourseItem>,
+    detected_name: String,
+    detected_school: String,
+) -> Result<SessionResult, String> {
+    save_cookies_atomic(base_dir, cookies)?;
+
+    let mut cfg = load_config_from_dir(base_dir).unwrap_or_default();
+    if let Some((driver, browser_exe)) = browser_override {
+        cfg.driver = driver;
+        cfg.exe_path = browser_exe;
+    }
+    if req.mode == "phone" && req.remember_credentials {
+        cfg.username = req.username.trim().to_string();
+        cfg.password = req.password.clone();
+    }
+    if !discovered_courses.is_empty() {
+        cfg.courses = merge_discovered_courses(&cfg.courses, discovered_courses);
+    }
+    let saved_cfg = save_config_to_dir(base_dir, &cfg)?;
+
+    let mut prefs = load_prefs();
+    let prev_session = prefs.session.clone();
+    let account = if req.mode == "student" && !req.student_id.trim().is_empty() {
+        req.student_id.trim().to_string()
+    } else if req.mode == "phone" && !req.username.trim().is_empty() {
+        mask_account(&req.username)
+    } else if is_cookie_mode {
+        prev_session
+            .as_ref()
+            .map(|s| s.account.clone())
+            .unwrap_or_default()
+    } else {
+        String::new()
+    };
+
+    let school_name = if !req.school_name.trim().is_empty() {
+        req.school_name.trim().to_string()
+    } else if !detected_school.is_empty() {
+        detected_school
+    } else {
+        prev_session
+            .as_ref()
+            .map(|s| s.school_name.clone())
+            .unwrap_or_default()
+    };
+
+    let school_id = if !req.school_id.trim().is_empty() {
+        req.school_id.trim().to_string()
+    } else {
+        prev_session
+            .as_ref()
+            .map(|s| s.school_id.clone())
+            .unwrap_or_default()
+    };
+
+    let login_mode = if is_cookie_mode {
+        prev_session
+            .as_ref()
+            .map(|s| s.login_mode.clone())
+            .filter(|m| !m.is_empty())
+            .unwrap_or_else(|| "cookie".to_string())
+    } else {
+        req.mode.clone()
+    };
+
+    let display_name = if !detected_name.is_empty() {
+        detected_name
+    } else if !account.is_empty() {
+        account.clone()
+    } else {
+        prev_session
+            .as_ref()
+            .map(|s| s.display_name.clone())
+            .filter(|d| !d.is_empty())
+            .unwrap_or_else(|| "智慧树学员".to_string())
+    };
+
+    let profile = SessionProfile {
+        logged_in: true,
+        display_name,
+        account,
+        login_mode,
+        school_name,
+        school_id,
+        last_synced_at: Some(now_epoch_secs()),
+    };
+
+    prefs.session = Some(profile.clone());
+    let _ = save_prefs(&prefs);
+
+    emit_status(
+        app,
+        "done",
+        &format!("已同步 {} 门课程", saved_cfg.courses.len()),
+        false,
+    );
+
+    Ok(SessionResult {
+        profile,
+        courses: saved_cfg.courses,
+        cookie_count: cookies.len(),
+    })
+}
+
 pub fn execute_zhs_login(
     app: &AppHandle,
     manager: &ZhsSessionManager,
@@ -1723,16 +1946,79 @@ pub fn execute_zhs_login(
     base_dir: &Path,
     req: LoginRequest,
 ) -> Result<SessionResult, String> {
-    let (driver, browser_exe, browser_name) = resolve_session_browser(base_dir, &req.browser_exe)?;
     let is_cookie_mode = req.mode == "cookie";
     let auto_captcha = load_config_from_dir(base_dir)
         .map(|cfg| cfg.enable_auto_captcha)
         .unwrap_or(true);
 
+    let effective_proxy = if !req.proxy.trim().is_empty() {
+        req.proxy.trim().to_string()
+    } else {
+        load_config_from_dir(base_dir)
+            .map(|c| c.proxy)
+            .unwrap_or_default()
+    };
+
     let saved_cookies = if is_cookie_mode {
         Some(load_saved_cookies(base_dir)?)
     } else {
         None
+    };
+
+    // Fast path for cookie restore / refresh: call Zhihuishu course APIs directly via Python backend.
+    let mut valid_api_fallback: Option<(ApiCoursesResponse, Vec<PlaywrightCookie>)> = None;
+    if let Some(ref existing_cookies) = saved_cookies {
+        emit_status(
+            app,
+            "fetching_courses",
+            "正在校验登录状态并同步智慧树课程队列...",
+            false,
+        );
+        if let Ok(api_res) =
+            fetch_courses_via_backend_api(app, backend, existing_cookies, &effective_proxy)
+        {
+            if api_res.session_valid {
+                let merged_cookies = merge_cookies(existing_cookies, &api_res.cookies);
+                if !api_res.courses.is_empty() {
+                    let browser_override = resolve_session_browser(base_dir, &req.browser_exe)
+                        .ok()
+                        .map(|(d, exe, _)| (d, exe));
+                    return finalize_session_result(
+                        app,
+                        base_dir,
+                        &req,
+                        true,
+                        browser_override,
+                        &merged_cookies,
+                        api_res.courses,
+                        api_res.display_name,
+                        api_res.school_name,
+                    );
+                }
+                valid_api_fallback = Some((api_res, merged_cookies));
+            }
+        }
+    }
+
+    let (driver, browser_exe, browser_name) = match resolve_session_browser(base_dir, &req.browser_exe)
+    {
+        Ok(resolved) => resolved,
+        Err(err) => {
+            if let Some((api_res, merged_cookies)) = valid_api_fallback {
+                return finalize_session_result(
+                    app,
+                    base_dir,
+                    &req,
+                    true,
+                    None,
+                    &merged_cookies,
+                    api_res.courses,
+                    api_res.display_name,
+                    api_res.school_name,
+                );
+            }
+            return Err(err);
+        }
     };
 
     let _profile_guard = TempProfileGuard::create()?;
@@ -1744,14 +2030,6 @@ pub fn execute_zhs_login(
         format!("正在启动本机 {browser_name} 进行登录...")
     };
     emit_status(app, "launching", &launch_msg, false);
-
-    let effective_proxy = if !req.proxy.trim().is_empty() {
-        req.proxy.trim().to_string()
-    } else {
-        load_config_from_dir(base_dir)
-            .map(|c| c.proxy)
-            .unwrap_or_default()
-    };
 
     let initial_url = if is_cookie_mode {
         "about:blank"
@@ -2089,117 +2367,62 @@ pub fn execute_zhs_login(
             }
         }
 
-        // Logged in! Collect cookies & discover courses
-        let (discovered_courses, detected_name, detected_school) =
+        // Logged in! Collect cookies & discover courses via browser + direct Zhihuishu APIs
+        let (browser_courses, mut detected_name, mut detected_school) =
             discover_courses_in_current_session(&mut cdp, app, manager)?;
 
-        let cookies = cdp.get_zhihuishu_cookies()?;
+        let mut cookies = cdp.get_zhihuishu_cookies()?;
         if cookies.is_empty() {
             return Err("登录成功但未获取到智慧树 Cookie，请重试".to_string());
         }
-        save_cookies_atomic(base_dir, &cookies)?;
 
-        // Merge with existing courses & save config.ini + gui_courses.json
-        let mut cfg = load_config_from_dir(base_dir).unwrap_or_default();
-        cfg.driver = driver;
-        cfg.exe_path = browser_exe;
-        if req.mode == "phone" && req.remember_credentials {
-            cfg.username = req.username.trim().to_string();
-            cfg.password = req.password.clone();
+        let mut combined_courses = Vec::new();
+        if let Ok(api_res) =
+            fetch_courses_via_backend_api(app, backend, &cookies, &effective_proxy)
+        {
+            cookies = merge_cookies(&cookies, &api_res.cookies);
+            combined_courses.extend(api_res.courses);
+            if detected_name.is_empty() && !api_res.display_name.is_empty() {
+                detected_name = api_res.display_name;
+            }
+            if detected_school.is_empty() && !api_res.school_name.is_empty() {
+                detected_school = api_res.school_name;
+            }
         }
-        if !discovered_courses.is_empty() {
-            cfg.courses = merge_discovered_courses(&cfg.courses, discovered_courses);
-        }
-        let saved_cfg = save_config_to_dir(base_dir, &cfg)?;
+        combined_courses.extend(browser_courses);
+        let discovered_courses = dedupe_discovered_courses(combined_courses);
 
-        // Save session profile metadata (never storing password)
-        let mut prefs = load_prefs();
-        let prev_session = prefs.session.clone();
-        let account = if req.mode == "student" && !req.student_id.trim().is_empty() {
-            req.student_id.trim().to_string()
-        } else if req.mode == "phone" && !req.username.trim().is_empty() {
-            mask_account(&req.username)
-        } else if is_cookie_mode {
-            prev_session
-                .as_ref()
-                .map(|s| s.account.clone())
-                .unwrap_or_default()
-        } else {
-            String::new()
-        };
-
-        let school_name = if !req.school_name.trim().is_empty() {
-            req.school_name.trim().to_string()
-        } else if !detected_school.is_empty() {
-            detected_school
-        } else {
-            prev_session
-                .as_ref()
-                .map(|s| s.school_name.clone())
-                .unwrap_or_default()
-        };
-
-        let school_id = if !req.school_id.trim().is_empty() {
-            req.school_id.trim().to_string()
-        } else {
-            prev_session
-                .as_ref()
-                .map(|s| s.school_id.clone())
-                .unwrap_or_default()
-        };
-
-        let login_mode = if is_cookie_mode {
-            prev_session
-                .as_ref()
-                .map(|s| s.login_mode.clone())
-                .filter(|m| !m.is_empty())
-                .unwrap_or_else(|| "cookie".to_string())
-        } else {
-            req.mode.clone()
-        };
-
-        let display_name = if !detected_name.is_empty() {
-            detected_name
-        } else if !account.is_empty() {
-            account.clone()
-        } else {
-            prev_session
-                .as_ref()
-                .map(|s| s.display_name.clone())
-                .filter(|d| !d.is_empty())
-                .unwrap_or_else(|| "智慧树学员".to_string())
-        };
-
-        let profile = SessionProfile {
-            logged_in: true,
-            display_name,
-            account,
-            login_mode,
-            school_name,
-            school_id,
-            last_synced_at: Some(now_epoch_secs()),
-        };
-
-        prefs.session = Some(profile.clone());
-        let _ = save_prefs(&prefs);
-
-        emit_status(
+        finalize_session_result(
             app,
-            "done",
-            &format!("已同步 {} 门课程", saved_cfg.courses.len()),
-            false,
-        );
-
-        Ok(SessionResult {
-            profile,
-            courses: saved_cfg.courses,
-            cookie_count: cookies.len(),
-        })
+            base_dir,
+            &req,
+            is_cookie_mode,
+            Some((driver.clone(), browser_exe.clone())),
+            &cookies,
+            discovered_courses,
+            detected_name,
+            detected_school,
+        )
     })();
 
     manager.finish();
     let _ = child.kill();
     let _ = child.wait();
+    if result.is_err() {
+        if let Some((api_res, merged_cookies)) = valid_api_fallback {
+            return finalize_session_result(
+                app,
+                base_dir,
+                &req,
+                true,
+                Some((driver, browser_exe)),
+                &merged_cookies,
+                api_res.courses,
+                api_res.display_name,
+                api_res.school_name,
+            );
+        }
+    }
     result
 }
 
@@ -2430,5 +2653,74 @@ mod tests {
         let encoded = "eyJjb3Vyc2VOYW1lIjoi6auY562J5pWw5a2mIn0=";
         let decoded = decode_base64_utf8(encoded).expect("valid utf8 base64");
         assert_eq!(decoded, r#"{"courseName":"高等数学"}"#);
+    }
+
+    #[test]
+    fn parses_backend_courses_response_and_merges_cookies() {
+        let resp = json!({
+            "ok": true,
+            "sessionValid": true,
+            "displayName": "王小明",
+            "schoolName": "哈尔滨工程大学",
+            "courses": [
+                {
+                    "title": "大学物理思维导引（下）",
+                    "url": "https://studyvideoh5.zhihuishu.com/stuStudy?recruitAndCourseId=abc123",
+                    "courseType": "智慧共享课",
+                    "teacher": "姜海丽",
+                    "school": "哈尔滨工程大学",
+                    "progress": "95.5%"
+                },
+                {
+                    "title": "劳动教育",
+                    "url": "https://hike.zhihuishu.com/aidedteaching/sourceLearning/sourceLearning?courseId=11497949",
+                    "courseType": "翻转 / 智慧课",
+                    "teacher": "曾富珍",
+                    "progress": "0%"
+                }
+            ],
+            "cookies": [
+                {
+                    "name": "SESSION",
+                    "value": "new-online-sess",
+                    "domain": "onlineservice-api.zhihuishu.com",
+                    "path": "/"
+                }
+            ]
+        });
+        let parsed = parse_backend_courses_response(&resp);
+        assert!(parsed.session_valid);
+        assert_eq!(parsed.display_name, "王小明");
+        assert_eq!(parsed.school_name, "哈尔滨工程大学");
+        assert_eq!(parsed.courses.len(), 2);
+        assert_eq!(parsed.courses[0].course_type, "智慧共享课");
+        assert_eq!(parsed.courses[1].course_type, "翻转 / 智慧课");
+
+        let base = vec![
+            PlaywrightCookie {
+                name: "SESSION".into(),
+                value: "old-online-sess".into(),
+                domain: "onlineservice-api.zhihuishu.com".into(),
+                path: "/".into(),
+                expires: None,
+                http_only: true,
+                secure: true,
+                same_site: None,
+            },
+            PlaywrightCookie {
+                name: "SESSION".into(),
+                value: "hike-sess".into(),
+                domain: "hikeservice.zhihuishu.com".into(),
+                path: "/".into(),
+                expires: None,
+                http_only: true,
+                secure: true,
+                same_site: None,
+            },
+        ];
+        let merged = merge_cookies(&base, &parsed.cookies);
+        assert_eq!(merged.len(), 2);
+        assert_eq!(merged[0].value, "new-online-sess");
+        assert_eq!(merged[1].value, "hike-sess");
     }
 }

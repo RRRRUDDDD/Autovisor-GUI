@@ -17,6 +17,8 @@ from modules.zhs_api import (
 
 SUCCESS_PAYLOADS = {
     "home": {"code": 0},
+    "home_share": {"code": 200},
+    "home_ai": {"status": "200", "rt": []},
     "zhidao": {"code": 0},
     "ai_exam": {"code": 0},
     "ai_exam_submit": {},
@@ -73,7 +75,7 @@ class StrategyQueryTests(unittest.TestCase):
         return client
 
     def test_all_named_strategies_encrypt_with_their_key_and_validate(self):
-        self.assertEqual(len(zhs_api.STRATEGIES), 7)
+        self.assertEqual(len(zhs_api.STRATEGIES), 9)
         for name, strategy in zhs_api.STRATEGIES.items():
             with self.subTest(strategy=name):
                 client = self._client(FakeResponse(SUCCESS_PAYLOADS[name]))
@@ -288,6 +290,44 @@ class CasSsoTests(unittest.TestCase):
 
         client = self._client([FakeResponse({}, status_code=502)])
         self.assertEqual(client.verify_session_status(), SessionStatus.UNAVAILABLE)
+
+    def test_build_session_preserves_multi_domain_cookies(self):
+        cookies = [
+            {
+                "name": "SESSION",
+                "value": "online-sess",
+                "domain": "onlineservice-api.zhihuishu.com",
+                "path": "/",
+            },
+            {
+                "name": "SESSION",
+                "value": "hike-sess",
+                "domain": "hikeservice.zhihuishu.com",
+                "path": "/",
+            },
+            {
+                "name": "CASLOGC",
+                "value": "%7B%22uuid%22%3A%22u-xyz%22%2C%22realName%22%3A%22%E5%BC%A0%E4%B8%89%22%7D",
+                "domain": ".zhihuishu.com",
+                "path": "/",
+            },
+        ]
+        session = zhs_api.build_session(cookies)
+        self.assertEqual(
+            session.cookies.get("SESSION", domain="onlineservice-api.zhihuishu.com"),
+            "online-sess",
+        )
+        self.assertEqual(
+            session.cookies.get("SESSION", domain="hikeservice.zhihuishu.com"),
+            "hike-sess",
+        )
+        self.assertEqual(
+            session.cookies.get("exitRecod_u-xyz", domain=".zhihuishu.com"),
+            "2",
+        )
+        info = zhs_api.extract_caslogc_info(session.cookies)
+        self.assertEqual(info.get("uuid"), "u-xyz")
+        self.assertEqual(info.get("realName"), "张三")
 
 
 if __name__ == "__main__":

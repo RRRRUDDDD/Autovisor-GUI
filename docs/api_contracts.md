@@ -8,7 +8,9 @@
 
 | 策略名 | 密钥名 | `dateFormate` | 成功判定 | `content_type` | 特殊行为 |
 | --- | --- | --- | --- | --- | --- |
-| `home` | `HOME` | 是 | `code == 0` | form | 首页/课程列表（Autovisor 新增） |
+| `home` | `HOME` | 是 | `code == 0` | form | 首页/课程列表通用（Autovisor 新增） |
+| `home_share` | `HOME` | 是 | `code == 200` | form | 共享课列表 `queryShareCourseInfo` |
+| `home_ai` | `HOME` | 是 | 仅 HTTP 2xx（业务层校验 `status == "200"` 或 `code in (0, 200)`） | form | AI 智慧课列表 `queryStudentAICourseList` |
 | `zhidao` | `VIDEO` | 是 | `code == 0` | form | `code == -12` 抛 `CaptchaRequiredError` |
 | `ai_exam` | `EXAM` | 是 | `code == 0` | form | AI 作业/考试（`studentexamtest`） |
 | `ai_exam_submit` | `EXAM` | 是 | 仅 HTTP 2xx（无返回体） | form | AI 综合考试 `submit` |

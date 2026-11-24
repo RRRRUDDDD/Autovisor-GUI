@@ -1299,6 +1299,59 @@ class BackendRequestHandler(BaseHTTPRequestHandler):
             self._send_json(HTTPStatus.OK, {"ok": True, "cancelled": cancelled})
             return
 
+        if path == "/api/courses/fetch":
+            from modules.course_fetcher import fetch_courses_via_api
+
+            proxy = str(body.get("proxy") or "").strip()
+            raw_cookies = body.get("cookies")
+            if raw_cookies is None:
+                cookie_path = os.path.join(
+                    self.server.manager.data_dir, "data", "cookies.json"
+                )
+                try:
+                    with open(cookie_path, "r", encoding="utf-8") as file:
+                        raw_cookies = json.load(file)
+                except OSError:
+                    raw_cookies = []
+                except ValueError as exc:
+                    self._send_json(
+                        HTTPStatus.BAD_REQUEST,
+                        {"error": f"本地 Cookie 文件格式无效: {exc}"},
+                    )
+                    return
+            if not isinstance(raw_cookies, list):
+                self._send_json(
+                    HTTPStatus.BAD_REQUEST, {"error": "cookies 参数格式无效"}
+                )
+                return
+            try:
+                fetched = fetch_courses_via_api(raw_cookies, proxy=proxy)
+                self._send_json(
+                    HTTPStatus.OK,
+                    {
+                        "ok": True,
+                        "sessionValid": fetched.session_valid,
+                        "courses": [
+                            {
+                                "title": c.title,
+                                "url": c.url,
+                                "courseType": c.course_type,
+                                "teacher": c.teacher,
+                                "school": c.school,
+                                "progress": c.progress,
+                            }
+                            for c in fetched.courses
+                        ],
+                        "displayName": fetched.display_name,
+                        "schoolName": fetched.school_name,
+                        "sources": fetched.sources,
+                        "cookies": fetched.cookies,
+                    },
+                )
+            except Exception as exc:
+                self._send_json(HTTPStatus.BAD_GATEWAY, {"error": str(exc)})
+            return
+
         if path == "/api/update/check":
             from modules import updater
 

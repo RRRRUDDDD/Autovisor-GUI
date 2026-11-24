@@ -82,6 +82,8 @@ class QueryStrategy:
 STRATEGIES: dict[str, QueryStrategy] = {
     # 首页/课程列表: Autovisor 新增, zhs 的 STRATEGIES 中不存在.
     "home": QueryStrategy(zhidao_crypto.HOME_KEY),
+    "home_share": QueryStrategy(zhidao_crypto.HOME_KEY, ok_value=200),
+    "home_ai": QueryStrategy(zhidao_crypto.HOME_KEY, ok_field=None),
     "zhidao": QueryStrategy(
         zhidao_crypto.VIDEO_KEY, captcha_on_minus_12=True
     ),
@@ -108,6 +110,30 @@ def get_strategy(name: str) -> QueryStrategy:
         raise ValueError(f"未知的智慧树接口策略: {name}") from exc
 
 
+def extract_caslogc_info(cookies) -> dict:
+    """从 Cookie 列表 / 字典 / CookieJar 中解析 CASLOGC JSON 载荷 (uuid / realName 等)."""
+    raw = ""
+    if isinstance(cookies, dict):
+        raw = str(cookies.get("CASLOGC") or "")
+    else:
+        for cookie in cookies or []:
+            if isinstance(cookie, dict):
+                if cookie.get("name") == "CASLOGC" and cookie.get("value"):
+                    raw = str(cookie.get("value"))
+                    break
+            else:
+                if getattr(cookie, "name", None) == "CASLOGC" and getattr(cookie, "value", None):
+                    raw = str(getattr(cookie, "value"))
+                    break
+    if not raw:
+        return {}
+    try:
+        parsed = json.loads(unquote(raw))
+    except (ValueError, TypeError):
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
 def build_session(cookies, proxy: str = "", user_agent: str = "") -> requests.Session:
     """用浏览器导出的 Cookie 构造带代理/重试的 requests 会话."""
     session = create_retry_session(proxy, headers=dict(DEFAULT_HEADERS))
@@ -120,15 +146,18 @@ def build_session(cookies, proxy: str = "", user_agent: str = "") -> requests.Se
         value = cookie.get("value")
         if not name or value is None:
             continue
-        session.cookies.set(name, value)
-    try:
-        raw = session.cookies.get("CASLOGC")
-        if raw:
-            uuid = json.loads(unquote(raw)).get("uuid")
-            if uuid:
-                session.cookies.set(f"exitRecod_{uuid}", "2")
-    except (ValueError, TypeError):
-        pass
+        kwargs = {}
+        domain = str(cookie.get("domain") or "").strip()
+        if domain:
+            kwargs["domain"] = domain
+        path = str(cookie.get("path") or "").strip()
+        if path:
+            kwargs["path"] = path
+        session.cookies.set(name, value, **kwargs)
+    caslogc = extract_caslogc_info(session.cookies)
+    uuid = str(caslogc.get("uuid") or "").strip()
+    if uuid:
+        session.cookies.set(f"exitRecod_{uuid}", "2", domain=".zhihuishu.com", path="/")
     return session
 
 
@@ -257,6 +286,14 @@ class ZhsApiClient:
                 self.session.get(target, allow_redirects=True, timeout=REQUEST_TIMEOUT)
                 return target, status
         return None, status
+
+    def ensure_service_sso(self, service: str) -> bool:
+        """通过 CAS 为指定 service 换票并种下会话 Cookie, 返回是否成功."""
+        try:
+            ticket_url, _ = self._cas_login(service)
+            return bool(ticket_url)
+        except requests.exceptions.RequestException:
+            return False
 
     def ensure_exam_sso(self, force: bool = False) -> None:
         """确保 studentexam-api 会话可用: 通过 CAS 换票种下会话 Cookie.

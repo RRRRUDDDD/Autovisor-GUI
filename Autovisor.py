@@ -593,7 +593,14 @@ def sync_zhs_client_cookies(client, cookies) -> None:
         name = cookie.get("name")
         value = cookie.get("value")
         if name and value is not None:
-            session.cookies.set(name, value)
+            kwargs = {}
+            domain = str(cookie.get("domain") or "").strip()
+            if domain:
+                kwargs["domain"] = domain
+            path = str(cookie.get("path") or "").strip()
+            if path:
+                kwargs["path"] = path
+            session.cookies.set(name, value, **kwargs)
     reset = getattr(client, "reset_exam_sso", None)
     if callable(reset):
         reset()
@@ -1272,8 +1279,12 @@ async def run_fetch_courses(config, write_config: bool = False) -> int:
         page, context = session.page, session.context
         try:
             await ensure_login(context, page, cookies, config)
-            logger.info("正在从智慧树学生主页读取课程列表...")
-            courses = await fetch_courses_from_page(page, logger=logger)
+            logger.info("正在从智慧树接口与学生主页读取课程列表...")
+            courses = await fetch_courses_from_page(
+                page,
+                logger=logger,
+                proxy=str(getattr(config, "proxy", "") or "").strip(),
+            )
             await persist_login_cookies(context)
         finally:
             await session.close()
