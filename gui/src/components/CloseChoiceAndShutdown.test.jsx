@@ -164,8 +164,8 @@ describe('SettingsView close behavior & shutdown on complete integration', () =>
       cookieExists: true,
       cookieCount: 5,
       cookieModifiedAt: null,
-      version: '1.0.0',
-      backendVersion: '3.19.0(Autovisor GUI Edition)',
+      version: '1.1.0',
+      backendVersion: '3.20.0(Autovisor GUI Edition)',
       closeBehavior: 'ask',
       detectedBrowsers: [],
       session: {

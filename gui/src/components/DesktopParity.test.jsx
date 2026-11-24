@@ -137,8 +137,8 @@ describe('Desktop Parity features (Phases 1-6)', () => {
         runtime={{
           backendPhase: 'ready',
           platform: 'macos',
-          version: '1.0.0',
-          backendVersion: '3.19.0(Autovisor GUI Edition)',
+          version: '1.1.0',
+          backendVersion: '3.20.0(Autovisor GUI Edition)',
           baseDir: '/Users/demo/Library/Application Support/com.autovisor.gui/userdata',
           configPath: '/Users/demo/Library/Application Support/com.autovisor.gui/userdata/config.ini',
           logsDir: '/Users/demo/Library/Application Support/com.autovisor.gui/userdata/logs',

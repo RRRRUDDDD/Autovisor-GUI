@@ -1617,7 +1617,7 @@ const SettingsView = ({
                 <div className="flex flex-wrap items-center gap-2">
                   <h2 className="text-base font-semibold text-on-surface">运行环境与版本</h2>
                   <span className="rounded-full bg-surface-container-highest px-2.5 py-0.5 font-mono text-xs font-medium text-on-surface-variant">
-                    v{runtime?.version || '1.0.0'}
+                    v{runtime?.version || '1.1.0'}
                   </span>
                   {runtime?.backendVersion && (
                     <span className="rounded-full bg-surface-container-highest px-2.5 py-0.5 font-mono text-xs font-medium text-on-surface-variant">
