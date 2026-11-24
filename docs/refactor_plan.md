@@ -52,11 +52,11 @@ cargo test --manifest-path gui/src-tauri/Cargo.toml
 - [x] **T2.6** 异步阻塞与资源泄漏治理：OpenCV 验证码迁入 `to_thread`、`exam_ctx`/`zhs_api` 锁拆分与 Session 关闭、`Autovisor.py` 任务跟踪、`task_monitor` 取消处理、`updater.py` 去除静默 TLS 降级
 
 ### Phase 3：跨端单一真相源（SSOT）与领域模块去重
-- [ ] **T3.1** 课程解析下沉 Python：删掉 `zhs_session.rs` ~550 行重复解析，统一走 Python 后端接口
-- [ ] **T3.2** 统一配置与 LLM 厂商真相源：对齐 7 处三端漂移，补齐 `docs/ipc_contracts.md`
-- [ ] **T3.3** 抽离答题公共基础设施：`text_utils.py`、`answer_parser.py`、`answer_service.py`、共享 Playwright 测验 DOM 辅助
-- [ ] **T3.4** 抽离验证码公共层：`captcha_common.py` + `captcha_router.py`，打破三文件循环导入并走代理下载
-- [ ] **T3.5** `AnswerBank` / `AnswerCache` 收敛为 SQLite 单一数据源（取消逐题全量写 JSON）
+- [x] **T3.1** 课程解析下沉 Python：删掉 `zhs_session.rs` ~550 行重复解析，统一走 Python 后端接口
+- [x] **T3.2** 统一配置与 LLM 厂商真相源：对齐 7 处三端漂移，补齐 `docs/ipc_contracts.md`
+- [x] **T3.3** 抽离答题公共基础设施：`text_utils.py`、`answer_parser.py`、`answer_service.py`、共享 Playwright 测验 DOM 辅助
+- [x] **T3.4** 抽离验证码公共层：`captcha_common.py` + `captcha_router.py`，打破三文件循环导入并走代理下载
+- [x] **T3.5** `AnswerBank` / `AnswerCache` 收敛为 SQLite 单一数据源（取消逐题全量写 JSON）
 
 ### Phase 4：巨型文件拆分、凭据加密与工程护栏
 - [ ] **T4.1** 拆分 Python 巨型入口：`Autovisor.py`、`backend_server.py`、`llm.py`、`exam_ctx.py`、`course_fetcher.py`、`popups.py`
