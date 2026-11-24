@@ -28,7 +28,7 @@ if (-not $SkipBackendBuild -or -not (Test-Path (Join-Path $BackendDist "autoviso
     Push-Location $RepoRoot
     try {
         if (Get-Command uv -ErrorAction SilentlyContinue) {
-            uv run --with pyinstaller==6.13.0 python build_backend.py
+            uv run --with pyinstaller==6.22.3 python build_backend.py
         } else {
             $VenvPy = Join-Path $RepoRoot ".venv\Scripts\python.exe"
             if (Test-Path $VenvPy) {

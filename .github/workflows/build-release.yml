@@ -204,7 +204,7 @@ jobs:
 
       - name: Build and verify frozen Python backend
         run: |
-          uv run --with pyinstaller==6.13.0 python build_backend.py
+          uv run --with pyinstaller==6.22.3 python build_backend.py
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
           $requiredPaths = @(
@@ -338,7 +338,7 @@ jobs:
       - name: Build and verify frozen Python backend
         run: |
           set -euo pipefail
-          uv run --with pyinstaller==6.13.0 python build_backend.py
+          uv run --with pyinstaller==6.22.3 python build_backend.py
           test -x dist/autovisor-backend/autovisor-backend
           test -d dist/autovisor-backend/internal/numpy
           test -d dist/autovisor-backend/internal/cv2
@@ -446,7 +446,7 @@ jobs:
       - name: Build and verify frozen Python backend
         run: |
           set -euo pipefail
-          uv run --with pyinstaller==6.13.0 python build_backend.py
+          uv run --with pyinstaller==6.22.3 python build_backend.py
           test -x dist/autovisor-backend/autovisor-backend
           test -d dist/autovisor-backend/internal/numpy
           test -d dist/autovisor-backend/internal/cv2

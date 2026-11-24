@@ -79,6 +79,11 @@ def main(argv=None) -> int:
         installer.validate_python_version()
         loaded = installer.load_preinstalled_modules()
         if not loaded or len(loaded) < 2:
+            for dep in ("numpy", "cv2"):
+                try:
+                    __import__(dep)
+                except Exception:
+                    sys.stderr.write(f"导入 {dep} 失败:\n{traceback.format_exc()}\n")
             sys.stderr.write("内置验证码依赖校验失败：未能直接导入 numpy / cv2\n")
             return 1
         np_mod, cv2_mod = loaded[0], loaded[1]
