@@ -5,9 +5,14 @@ import re
 from functools import lru_cache
 from types import ModuleType
 
-from playwright.async_api import Page
-from playwright._impl._errors import TimeoutError
+from playwright.async_api import Page, TimeoutError
 
+from modules.captcha_common import (
+    decode_image_bytes,
+    get_mouse as _mouse,
+    image_to_display_point,
+    iter_targets as _sync_iter_targets,
+)
 from modules.logger import Logger
 
 logger = Logger()
@@ -132,6 +137,11 @@ def _font_candidates() -> tuple[str, ...]:
         r"C:\Windows\Fonts\arialbd.ttf",
         "/System/Library/Fonts/Supplemental/Arial Bold.ttf",
         "/Library/Fonts/Arial Bold.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+        "/usr/share/fonts/dejavu/DejaVuSans-Bold.ttf",
+        "/usr/share/fonts/truetype/noto/NotoSans-Bold.ttf",
+        "/usr/share/fonts/noto/NotoSans-Bold.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
     )
 
 
@@ -375,16 +385,12 @@ def find_click_point(image, instruction: str, np, cv2):
 
 
 def decode_png(data, np, cv2):
-    array = np.frombuffer(data, np.uint8)
-    return cv2.imdecode(array, cv2.IMREAD_COLOR)
+    return decode_image_bytes(data, np, cv2, unchanged=False)
 
 
 async def _iter_targets(page: Page):
-    yield page
-    for frame in getattr(page, "frames", []):
-        if frame is page or getattr(page, "main_frame", None) is frame:
-            continue
-        yield frame
+    for target in _sync_iter_targets(page):
+        yield target
 
 
 async def resolve_click_captcha_target(page: Page):
@@ -458,20 +464,14 @@ async def find_puzzle_image(target):
     return best
 
 
-def _mouse(target):
-    mouse = getattr(target, "mouse", None)
-    if mouse is not None:
-        return mouse
-    return target.page.mouse
-
-
 async def click_image_point(target, image_locator, pixel_x, pixel_y, image_shape):
     box = await image_locator.bounding_box()
     if not box:
         return False
     height, width = image_shape[:2]
-    css_x = pixel_x * box["width"] / width
-    css_y = pixel_y * box["height"] / height
+    css_x, css_y = image_to_display_point(
+        (pixel_x, pixel_y), width, height, box["width"], box["height"]
+    )
     await _mouse(target).click(box["x"] + css_x, box["y"] + css_y)
     return True
 
@@ -497,9 +497,9 @@ async def solve_click_captcha(page: Page, modules: list[ModuleType], attempts: i
     target = await resolve_click_captcha_target(page)
     if target is None:
         return False
-    from modules.tencent_slider import has_slider_thumb
+    from modules.captcha_router import is_tencent_slider_target
 
-    if await has_slider_thumb(target):
+    if await is_tencent_slider_target(target):
         # 腾讯滑块与点选共用 tcaptcha iframe, 这里让给滑块模块处理。
         logger.debug("检测到腾讯滑块验证, 跳过点选流程.")
         return False

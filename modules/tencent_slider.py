@@ -8,12 +8,20 @@ import time
 from types import ModuleType
 from urllib.parse import unquote_to_bytes, urljoin
 
-import requests
-from playwright._impl._errors import TimeoutError
-from playwright.async_api import Page
+from playwright.async_api import Page, TimeoutError
 
+from modules.captcha_common import (
+    decode_image_bytes,
+    drag_element_horizontally,
+    fetch_image_bytes,
+    gen_track,
+    get_mouse as _mouse,
+    is_failure_tip,
+    iter_targets as _iter_targets,
+    page_of as _page_of,
+    visible_locator as _visible_locator,
+)
 from modules.logger import Logger
-from modules.slider import _mouse, _page_of, gen_track, is_failure_tip
 
 logger = Logger()
 
@@ -56,14 +64,6 @@ GAP_SCORE_THRESHOLD = 0.06
 # 拼图块初始位置理论上在背景图内部; 超出这个范围说明取错了元素, 不再补偿。
 PIECE_OFFSET_LIMIT_PX = 120.0
 _BACKGROUND_URL_RE = re.compile(r"""url\(["']?([^"')]+)["']?\)""")
-_FETCH_IMAGE_JS = """async (url) => {
-    const resp = await fetch(url);
-    const buffer = await resp.arrayBuffer();
-    const bytes = new Uint8Array(buffer);
-    let binary = '';
-    for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
-    return btoa(binary);
-}"""
 
 
 def parse_background_url(style_value: str) -> str | None:
@@ -161,30 +161,6 @@ def locate_gap(background, piece, np, cv2) -> tuple[float, float, float]:
     _, score, _, location = cv2.minMaxLoc(result)
     # 匹配点是模板(含透明边距)的左上角, 换算回拼图可见轮廓的左上角。
     return float(location[0] + offset_x), float(location[1] + offset_y), float(score)
-
-
-def _iter_targets(page: Page):
-    yield page
-    for frame in getattr(page, "frames", []):
-        if frame is page or getattr(frame, "parent_frame", None) is None:
-            continue
-        yield frame
-
-
-async def _visible_locator(target, selector):
-    try:
-        locator = target.locator(selector)
-        count = await locator.count()
-    except Exception:
-        return None
-    for index in range(count):
-        candidate = locator.nth(index)
-        try:
-            if await candidate.is_visible():
-                return candidate
-        except Exception:
-            continue
-    return None
 
 
 async def _fallback_thumb(target):
@@ -392,40 +368,14 @@ async def _element_media(target, locator) -> tuple[bytes | None, str]:
 
 
 async def _fetch_image_bytes(target, url: str) -> bytes | None:
-    if not url:
-        return None
-    page = _page_of(target)
-    data = None
-    if not url.startswith("blob:"):
-        try:
-            response = await page.request.get(url, timeout=15000)
-            if response.ok:
-                data = await response.body()
-        except Exception:
-            data = None
-    if data is None:
-        # 在验证码 iframe 内同源 fetch, 可复用 Cookie 且规避跨域限制。
-        try:
-            encoded = await target.evaluate(_FETCH_IMAGE_JS, url)
-            data = base64.b64decode(encoded)
-        except Exception:
-            data = None
-    if data is None and not url.startswith("blob:"):
-        try:
-            data = await asyncio.to_thread(lambda: requests.get(url, timeout=15).content)
-        except Exception:
-            return None
-    return data
+    return await fetch_image_bytes(target, url, allow_eval_fetch=True)
 
 
 async def _load_image(target, locator, np, cv2):
     data, url = await _element_media(target, locator)
     if data is None:
         data = await _fetch_image_bytes(target, url)
-    if not data:
-        return None
-    array = np.frombuffer(data, np.uint8)
-    return cv2.imdecode(array, cv2.IMREAD_UNCHANGED)
+    return decode_image_bytes(data, np, cv2, unchanged=True)
 
 
 def _resize_piece(image, expected_width: float, np, cv2):
@@ -471,26 +421,13 @@ async def _measure_gap(target, background, piece, background_box, piece_box, mod
 
 
 async def _drag(target, thumb, distance: float) -> None:
-    box = await thumb.bounding_box()
-    if not box:
-        raise TimeoutError("tencent slider thumb not found")
-    mouse = _mouse(target)
-    start_x = box["x"] + box["width"] / 2
-    start_y = box["y"] + box["height"] / 2
-    await mouse.move(start_x - random.uniform(30, 70), start_y + random.uniform(-6, 6))
-    await asyncio.sleep(random.uniform(0.08, 0.16))
-    await mouse.move(start_x, start_y)
-    await asyncio.sleep(random.uniform(0.10, 0.20))
-    await mouse.down()
-    await asyncio.sleep(random.uniform(0.08, 0.16))
-
-    x = start_x
-    for dx, dy, delay in gen_track(distance):
-        x += dx
-        await mouse.move(x, start_y + dy)
-        await asyncio.sleep(delay / 1000)
-    await asyncio.sleep(random.uniform(0.08, 0.15))
-    await mouse.up()
+    await drag_element_horizontally(
+        target,
+        thumb,
+        distance,
+        approach_range=(30.0, 70.0),
+        not_found_message="tencent slider thumb not found",
+    )
 
 
 async def _success_ticket(target) -> bool:

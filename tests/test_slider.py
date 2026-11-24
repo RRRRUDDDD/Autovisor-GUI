@@ -74,5 +74,64 @@ class CalibrationTests(unittest.TestCase):
         self.assertLessEqual(GAP_BIAS_PX, 24)
 
 
+class CaptchaCommonAndRouterTests(unittest.TestCase):
+    def test_no_global_cv2_np_and_no_circular_imports(self):
+        import ast
+        from pathlib import Path
+        from modules import captcha_common, captcha_router, click_captcha, slider, tencent_slider
+
+        self.assertFalse(hasattr(slider, "cv2"))
+        self.assertFalse(hasattr(slider, "np"))
+        self.assertIs(slider.gen_track, captcha_common.gen_track)
+        self.assertIs(tencent_slider.gen_track, captcha_common.gen_track)
+        self.assertTrue(callable(captcha_router.solve_slider_captcha))
+        self.assertTrue(callable(captcha_router.solve_any_captcha))
+
+        root = Path(__file__).resolve().parents[1] / "modules"
+        ts_src = (root / "tencent_slider.py").read_text(encoding="utf-8")
+        cc_src = (root / "click_captcha.py").read_text(encoding="utf-8")
+        sl_src = (root / "slider.py").read_text(encoding="utf-8")
+        self.assertNotIn("modules.slider", ts_src)
+        self.assertNotIn("modules.tencent_slider", cc_src)
+        self.assertNotIn("modules.tencent_slider", sl_src)
+        self.assertNotIn("global cv2", sl_src)
+        # Verify Linux font fallbacks exist in click_captcha
+        fonts = click_captcha._font_candidates()
+        self.assertTrue(any("DejaVuSans-Bold" in f for f in fonts))
+        self.assertTrue(any("NotoSans-Bold" in f for f in fonts))
+        ast.parse(sl_src)
+
+    def test_fetch_image_bytes_uses_configured_proxy_on_requests_fallback(self):
+        import asyncio
+        from unittest.mock import patch
+        from modules import captcha_common
+
+        captured = {}
+
+        class _FakeResp:
+            content = b"PNG-BYTES"
+
+        def _fake_get(url, **kwargs):
+            captured["url"] = url
+            captured["kwargs"] = kwargs
+            return _FakeResp()
+
+        captcha_common.set_captcha_proxy("http://127.0.0.1:7890")
+        try:
+            with patch("modules.captcha_common.requests.get", side_effect=_fake_get):
+                data = asyncio.run(
+                    captcha_common.fetch_image_bytes(None, "https://cdn.example.com/bg.png")
+                )
+        finally:
+            captcha_common.set_captcha_proxy("")
+
+        self.assertEqual(data, b"PNG-BYTES")
+        self.assertEqual(captured["url"], "https://cdn.example.com/bg.png")
+        self.assertEqual(
+            captured["kwargs"].get("proxies"),
+            {"http": "http://127.0.0.1:7890", "https": "http://127.0.0.1:7890"},
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

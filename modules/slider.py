@@ -5,10 +5,21 @@ import random
 import time
 from types import ModuleType
 
-import requests
-from playwright.async_api import Page
-from playwright._impl._errors import TimeoutError
+from playwright.async_api import Page, TimeoutError
 
+from modules.captcha_common import (
+    FAILURE_WORDS,
+    decode_image_bytes,
+    drag_element_horizontally,
+    fetch_image_bytes,
+    gen_track,
+    get_mouse as _mouse,
+    image_to_display_point,
+    is_failure_tip,
+    iter_targets,
+    page_of as _page_of,
+    visible_locator,
+)
 from modules.logger import Logger
 
 YIDUN_PUZZLE_SELECTOR = ".yidun_bgimg, img.yidun_bg-img"
@@ -32,76 +43,52 @@ SLIDER_APPEAR_SELECTOR = (
 # 易盾判定窗口中央(偏 0 或 +32 均失败), 组件尺寸变化时需要重新校准。
 GAP_BIAS_PX = 16
 MAX_ATTEMPTS = 4
-FAILURE_WORDS = ("失败", "重试", "错误")
 
-# 定义全局变量
-cv2: ModuleType
-np: ModuleType
 logger = Logger()
 
 
-def image_to_display_point(point, image_width, image_height, display_width, display_height):
-    """将 OpenCV 原图像素坐标转换为浏览器 CSS 显示坐标。"""
-    return (
-        point[0] * display_width / image_width,
-        point[1] * display_height / image_height,
-    )
+async def download_image(url: str, page=None, *, np=None, cv2=None, proxy: str | None = None):
+    """代理感知地下载易盾验证码图片并解码为 OpenCV 图像。"""
+    if np is None or cv2 is None:
+        import cv2 as _cv2
+        import numpy as _np
 
-
-async def download_image(url, page=None):
-    """下载验证码图片; 优先走浏览器请求以复用 Cookie 和 UA。"""
-    data = None
-    if page is not None:
-        try:
-            response = await page.request.get(url, timeout=15000)
-            if response.ok:
-                data = await response.body()
-        except Exception:
-            data = None
-    if data is None:
-        data = await asyncio.to_thread(lambda: requests.get(url, timeout=15).content)
-    # 图片字节需要先转为 NumPy 数组，再交给 OpenCV 解码。
-    image_array = np.frombuffer(data, np.uint8)
-    return cv2.imdecode(image_array, cv2.IMREAD_COLOR)
+        np = np or _np
+        cv2 = cv2 or _cv2
+    data = await fetch_image_bytes(page, url, allow_eval_fetch=False, proxy=proxy)
+    return decode_image_bytes(data, np, cv2, unchanged=False)
 
 
 # 对背景图提取边缘，减少颜色和纹理对匹配的干扰。
-def process_background_image(image):
+def process_background_image(image, cv2=None):
+    if cv2 is None:
+        import cv2 as _cv2
+
+        cv2 = _cv2
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
     denoised = cv2.fastNlMeansDenoising(gray, None, 10, 7, 21)
     _, binary = cv2.threshold(denoised, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    edges = cv2.Canny(binary, 500, 900, apertureSize=3)
-    return edges
+    return cv2.Canny(binary, 500, 900, apertureSize=3)
 
 
-def process_block_image(image):
+def process_block_image(image, cv2=None):
+    if cv2 is None:
+        import cv2 as _cv2
+
+        cv2 = _cv2
     # 拼图块亮度方向与背景不同，因此先反色再提取边缘。
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
     inverted = cv2.bitwise_not(gray)
     _, binary = cv2.threshold(inverted, 240, 255, cv2.THRESH_BINARY_INV)
-    edges = cv2.Canny(binary, 500, 900, apertureSize=3)
-    return edges
-
-
-def _mouse(target):
-    mouse = getattr(target, "mouse", None)
-    if mouse is not None:
-        return mouse
-    return target.page.mouse
-
-
-def _page_of(target):
-    return getattr(target, "page", target)
+    return cv2.Canny(binary, 500, 900, apertureSize=3)
 
 
 async def resolve_captcha_target(page: Page):
     """返回包含易盾拼图的 page/frame; 找不到时返回 None。"""
-    if await page.locator(YIDUN_PUZZLE_SELECTOR).count() > 0:
-        return page
-    for frame in getattr(page, "frames", []):
+    for target in iter_targets(page):
         try:
-            if await frame.locator(YIDUN_PUZZLE_SELECTOR).count() > 0:
-                return frame
+            if await target.locator(YIDUN_PUZZLE_SELECTOR).count() > 0:
+                return target
         except Exception:
             continue
     return None
@@ -116,8 +103,7 @@ def unsupported_mode_label(class_name: str) -> str | None:
 
 
 async def describe_unsupported_mode(page: Page) -> str | None:
-    targets = [page, *getattr(page, "frames", [])]
-    for target in targets:
+    for target in iter_targets(page):
         try:
             roots = target.locator(".yidun")
             for index in range(await roots.count()):
@@ -133,16 +119,7 @@ async def describe_unsupported_mode(page: Page) -> str | None:
 
 
 async def _visible_locator(target, selector):
-    locator = target.locator(selector)
-    count = await locator.count()
-    for index in range(count):
-        candidate = locator.nth(index)
-        try:
-            if await candidate.is_visible():
-                return candidate
-        except Exception:
-            continue
-    return locator.first if count else None
+    return await visible_locator(target, selector, fallback_first=True)
 
 
 async def _puzzle_visible(target) -> bool:
@@ -156,21 +133,22 @@ async def _puzzle_visible(target) -> bool:
     return False
 
 
-async def captcha_visible(page: Page) -> bool:
-    """登录页是否仍有验证码浮层(含暂不支持的易盾形态与腾讯验证码)。"""
-    if await _puzzle_visible(page):
-        return True
-    for frame in getattr(page, "frames", []):
+async def yidun_captcha_visible(page: Page) -> bool:
+    """页面是否存在易盾验证码浮层（含暂不支持的易盾形态）。"""
+    for target in iter_targets(page):
         try:
-            if await _puzzle_visible(frame):
+            if await _puzzle_visible(target):
                 return True
         except Exception:
             continue
-    if await describe_unsupported_mode(page):
-        return True
-    from modules.tencent_slider import tencent_captcha_visible
+    return bool(await describe_unsupported_mode(page))
 
-    return await tencent_captcha_visible(page)
+
+async def captcha_visible(page: Page) -> bool:
+    """兼容入口：登录页是否仍有验证码浮层(含易盾与腾讯验证码)。"""
+    from modules.captcha_router import captcha_visible as _router_captcha_visible
+
+    return await _router_captcha_visible(page)
 
 
 async def _wait_puzzle_ready(target, timeout_ms: int = 5000) -> None:
@@ -207,13 +185,6 @@ async def _visible_tip(target) -> str:
         return "; ".join(texts)
     except Exception:
         return ""
-
-
-def is_failure_tip(text: str) -> bool:
-    if not text:
-        return False
-    # 初始提示「向右拖动滑块填充拼图」包含"滑块"但不算失败。
-    return any(word in text for word in FAILURE_WORDS)
 
 
 async def _wait_verify_result(target, timeout_ms: int = 3500) -> bool:
@@ -256,17 +227,23 @@ async def _refresh_puzzle(target) -> None:
     await _wait_puzzle_ready(target)
 
 
-def _match_yidun_gap(bg_img, block_img):
+def _match_yidun_gap(bg_img, block_img, cv2):
     """在后台线程执行 OpenCV 边缘提取与模板匹配，避免阻塞 asyncio 事件循环。"""
-    bg_edges = process_background_image(bg_img)
-    block_edges = process_block_image(block_img)
+    bg_edges = process_background_image(bg_img, cv2=cv2)
+    block_edges = process_block_image(block_img, cv2=cv2)
     result = cv2.matchTemplate(bg_edges, block_edges, cv2.TM_CCOEFF_NORMED)
     _, score, _, max_loc = cv2.minMaxLoc(result)
     return float(score), max_loc
 
 
 # 主函数，结合页面加载和图片处理
-async def progress_img(page: Page):
+async def progress_img(page: Page, modules: list[ModuleType] | None = None):
+    if modules is not None:
+        np_mod, cv2_mod = modules
+    else:
+        import cv2 as cv2_mod
+        import numpy as np_mod
+
     # 等待易盾验证码加载完成，避免读取到空图片或旧图片。
     loading = page.locator("div.yidun--loading").first
     try:
@@ -286,21 +263,20 @@ async def progress_img(page: Page):
     if not bg_url or not block_url or not bg_box:
         raise TimeoutError("yidun puzzle images not ready")
     image_size = await bg_locator.evaluate(
-        'image => ({width: image.naturalWidth, height: image.naturalHeight})'
+        "image => ({width: image.naturalWidth, height: image.naturalHeight})"
     )
 
     browser_page = _page_of(page)
-    bg_img = await download_image(bg_url, browser_page)
-    block_img = await download_image(block_url, browser_page)
+    bg_img = await download_image(bg_url, browser_page, np=np_mod, cv2=cv2_mod)
+    block_img = await download_image(block_url, browser_page, np=np_mod, cv2=cv2_mod)
     if bg_img is None or block_img is None:
         raise TimeoutError("yidun puzzle decode failed")
 
     # 匹配结果仍是原图坐标，后面必须转换到浏览器显示坐标。
-    score, max_loc = await asyncio.to_thread(_match_yidun_gap, bg_img, block_img)
+    score, max_loc = await asyncio.to_thread(_match_yidun_gap, bg_img, block_img, cv2_mod)
     if score < 0.05:
         raise TimeoutError(f"yidun puzzle match too weak: {score:.3f}")
 
-    # 例如当前页面是 480x240 原图显示为 400x200，缩放比例为 0.8333。
     natural_width = image_size.get("width") or bg_img.shape[1]
     natural_height = image_size.get("height") or bg_img.shape[0]
     display_point = image_to_display_point(
@@ -315,100 +291,29 @@ async def progress_img(page: Page):
     return round(display_point[0], 3), round(display_point[1], 3)
 
 
-def gen_track(distance, duration_ms=None, rng=random):
-    """生成拟人滑动轨迹: 先加速后减速, 末端轻微过冲再回正。
-
-    返回 [(dx, dy, delay_ms)], dx 之和恰好等于 distance。
-    """
-    distance = float(distance)
-    if duration_ms is None:
-        duration_ms = rng.uniform(520, 780) + min(220.0, abs(distance) * 0.35)
-    steps = max(10, min(46, int(abs(distance) / 2.4) + rng.randint(6, 12)))
-    overshoot = rng.uniform(1.5, 3.5)
-
-    points = []
-    for index in range(1, steps + 1):
-        t = index / steps
-        points.append(distance * (1 - (1 - t) ** 3))
-    points[-1] = distance + overshoot
-    for index in range(1, 4):
-        points.append(distance + overshoot * (1 - index / 3))
-
-    track = []
-    previous = 0.0
-    for index, position in enumerate(points):
-        dx = position - previous
-        previous = position
-        dy = 0.0 if index == 0 or index == len(points) - 1 else rng.uniform(-1.2, 1.2)
-        delay = (duration_ms / len(points)) * rng.uniform(0.7, 1.35)
-        track.append((dx, dy, max(6.0, delay)))
-    return track
-
-
 async def move_slider(page: Page, distance, bias=GAP_BIAS_PX):
-    """按浏览器显示坐标拖动滑块。
-
-    bias 是易盾判定的经验补偿(缺口坐标 -> 鼠标位移), 随组件版本变化需重新校准。
-    轨迹带逐步延时和纵向抖动, 避免瞬移轨迹被行为检测判失败。
-    """
-    slider = await _visible_locator(page, "div.yidun_slider")
-    if slider is None:
+    """按浏览器显示坐标拖动滑块。"""
+    slider_el = await _visible_locator(page, "div.yidun_slider")
+    if slider_el is None:
         raise TimeoutError("yidun slider not found")
-    box = await slider.bounding_box()
-    if not box:
-        raise TimeoutError("yidun slider not found")
-
-    mouse = _mouse(page)
-    start_x = box["x"] + box["width"] / 2
-    start_y = box["y"] + box["height"] / 2
-    # 先把鼠标自然移到按钮附近, 再对准中心和按下, 让行为轨迹像真人。
-    await mouse.move(start_x - random.uniform(40, 80), start_y + random.uniform(-6, 6))
-    await asyncio.sleep(random.uniform(0.08, 0.16))
-    await mouse.move(start_x, start_y)
-    await asyncio.sleep(random.uniform(0.10, 0.20))
-    await mouse.down()
-    await asyncio.sleep(random.uniform(0.08, 0.16))
-
-    x = start_x
-    for dx, dy, delay in gen_track(distance + bias):
-        x += dx
-        await mouse.move(x, start_y + dy)
-        await asyncio.sleep(delay / 1000)
-    await asyncio.sleep(random.uniform(0.08, 0.15))
-    await mouse.up()
+    await drag_element_horizontally(
+        page,
+        slider_el,
+        float(distance) + float(bias),
+        approach_range=(40.0, 80.0),
+        not_found_message="yidun slider not found",
+    )
 
 
-async def _resolve_slider_target(page: Page):
-    """返回 (provider, target); 易盾与腾讯滑块都未出现时返回 (None, None)。"""
-    target = await resolve_captcha_target(page)
-    if target is not None:
-        return "yidun", target
-    from modules.tencent_slider import resolve_tencent_slider_target
-
-    target = await resolve_tencent_slider_target(page)
-    if target is not None:
-        return "tencent", target
-    return None, None
-
-
-async def _describe_other_mode(page: Page) -> str | None:
-    label = await describe_unsupported_mode(page)
-    if label:
-        return f"易盾「{label}」"
-    from modules.tencent_slider import describe_tencent_mode, resolve_tencent_captcha_target
-
-    target = await resolve_tencent_captcha_target(page)
-    if target is None:
-        return None
-    label = await describe_tencent_mode(target)
-    return f"腾讯「{label}」" if label else None
-
-
-async def _solve_yidun(target, max_attempts: int) -> bool:
+async def solve_yidun(
+    target,
+    modules: list[ModuleType],
+    max_attempts: int = MAX_ATTEMPTS,
+) -> bool:
     for attempt in range(1, max_attempts + 1):
         try:
             await _wait_puzzle_ready(target)
-            gap_x, _ = await progress_img(target)
+            gap_x, _ = await progress_img(target, modules=modules)
             # 重试时轻微左右试探, 规避识别端与判定窗口的系统性偏差。
             bias = GAP_BIAS_PX if attempt == 1 else GAP_BIAS_PX + random.choice((-2, 0, 2))
             logger.debug(f"滑块缺口识别: x={gap_x:.1f}px, 拖动补偿={bias}px")
@@ -419,7 +324,6 @@ async def _solve_yidun(target, max_attempts: int) -> bool:
                 logger.event("滑块验证", 结果="通过", 尝试=attempt, 缺口=f"{gap_x:.1f}px")
                 return True
             if not await _puzzle_visible(target):
-                # 判定超时与浮层关闭同时发生时, 以关闭为准。
                 logger.info("滑块验证已通过.")
                 logger.event("滑块验证", 结果="通过", 尝试=attempt, 缺口=f"{gap_x:.1f}px")
                 return True
@@ -441,38 +345,12 @@ async def slider_verify(
     appear_timeout_ms: int = LOGIN_APPEAR_TIMEOUT_MS,
     max_attempts: int = MAX_ATTEMPTS,
 ) -> bool:
-    global cv2, np
-    np, cv2 = modules
-    if not cv2 or not np:
-        logger.warn("OpenCV或Numpy导入失败,无法开启自动滑块验证.")
-        return False
+    """兼容入口：委托给 captcha_router.solve_slider_captcha 统一调度易盾与腾讯滑块。"""
+    from modules.captcha_router import solve_slider_captcha
 
-    provider, target = await _resolve_slider_target(page)
-    if target is None:
-        label = await _describe_other_mode(page)
-        if label:
-            logger.warn(f"检测到{label}验证,只能自动通过滑块拼图,请手动完成.", shift=True)
-            logger.event("滑块验证", 结果="不支持", 类型=label)
-            return False
-        logger.debug("等待登录滑块出现...")
-        try:
-            await page.wait_for_selector(
-                SLIDER_APPEAR_SELECTOR, state="visible", timeout=appear_timeout_ms
-            )
-        except TimeoutError:
-            return False
-        provider, target = await _resolve_slider_target(page)
-        if target is None:
-            label = await _describe_other_mode(page)
-            if label:
-                logger.warn(
-                    f"检测到{label}验证,只能自动通过滑块拼图,请手动完成.", shift=True
-                )
-                logger.event("滑块验证", 结果="不支持", 类型=label)
-            return False
-
-    if provider == "tencent":
-        from modules.tencent_slider import solve_tencent_slider
-
-        return await solve_tencent_slider(target, modules, max_attempts=max_attempts)
-    return await _solve_yidun(target, max_attempts)
+    return await solve_slider_captcha(
+        page,
+        modules,
+        appear_timeout_ms=appear_timeout_ms,
+        max_attempts=max_attempts,
+    )
