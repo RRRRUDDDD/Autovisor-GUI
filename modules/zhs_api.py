@@ -77,6 +77,7 @@ class QueryStrategy:
     ok_value: object = 0
     captcha_on_minus_12: bool = False
     raw_response: bool = False
+    allow_retry: bool = True
 
 
 STRATEGIES: dict[str, QueryStrategy] = {
@@ -89,7 +90,7 @@ STRATEGIES: dict[str, QueryStrategy] = {
     ),
     "ai_exam": QueryStrategy(zhidao_crypto.EXAM_KEY),
     "ai_exam_submit": QueryStrategy(
-        zhidao_crypto.EXAM_KEY, ok_field=None, raw_response=True
+        zhidao_crypto.EXAM_KEY, ok_field=None, raw_response=True, allow_retry=False
     ),
     "ai_task": QueryStrategy(
         zhidao_crypto.AI_KEY, content_type="json", ok_value=200
@@ -209,11 +210,81 @@ class ZhsApiClient:
         self.session = build_session(
             cookies, proxy, user_agent, total_retries=total_retries
         )
+        # 仅保护 Cookie / SSO 状态变更与快照克隆，不在普通网络 I/O 期间持锁
         self.lock = threading.RLock()
         self._exam_sso_ready = False
+        self._no_retry_session: requests.Session | None = None
+
+    def close(self) -> None:
+        with self.lock:
+            no_retry = self._no_retry_session
+            self._no_retry_session = None
+            session = self.session
+        for sess in (no_retry, session):
+            close_fn = getattr(sess, "close", None)
+            if callable(close_fn):
+                try:
+                    close_fn()
+                except Exception:
+                    pass
+
+    def __enter__(self) -> "ZhsApiClient":
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        self.close()
 
     def reset_exam_sso(self) -> None:
-        self._exam_sso_ready = False
+        with self.lock:
+            self._exam_sso_ready = False
+
+    def sync_cookies(self, cookies) -> None:
+        """在锁保护下刷新底层会话 Cookie 并重置 SSO 状态."""
+        with self.lock:
+            session = self.session
+            if session is not None and getattr(session, "cookies", None) is not None:
+                for cookie in cookies or []:
+                    if isinstance(cookie, dict):
+                        set_cookie_dict(session.cookies, cookie)
+            self._exam_sso_ready = False
+
+    def clone_session(self, *, total_retries: int = 3) -> requests.Session:
+        """克隆独立 requests.Session（拷贝 Cookie/Headers/代理），供长耗时的 AI/解析通道隔离使用."""
+        with self.lock:
+            source = self.session
+            if not isinstance(source, requests.Session):
+                return source
+            headers = dict(source.headers)
+            cookies_snapshot = list(source.cookies)
+        cloned = create_retry_session(
+            self.proxy, total_retries=total_retries, headers=headers
+        )
+        for cookie in cookies_snapshot:
+            try:
+                cloned.cookies.set_cookie(cookie)
+            except Exception:
+                cloned.cookies.set(
+                    cookie.name,
+                    cookie.value,
+                    domain=getattr(cookie, "domain", ""),
+                    path=getattr(cookie, "path", "/"),
+                )
+        return cloned
+
+    def _get_no_retry_session(self):
+        """惰性创建禁用重试的独立 Session（共享 CookieJar），供非幂等交卷接口使用."""
+        with self.lock:
+            if not isinstance(self.session, requests.Session):
+                return self.session
+            if self._no_retry_session is None:
+                sess = create_retry_session(
+                    self.proxy,
+                    total_retries=0,
+                    headers=dict(self.session.headers),
+                )
+                sess.cookies = self.session.cookies
+                self._no_retry_session = sess
+            return self._no_retry_session
 
     # ------------------------------------------------------------------ query
     def query(
@@ -224,6 +295,7 @@ class ZhsApiClient:
         method: str = "POST",
         *,
         extra_fields: dict | None = None,
+        allow_retry: bool | None = None,
     ) -> dict:
         """按命名策略加密提交并校验返回码.
 
@@ -236,6 +308,7 @@ class ZhsApiClient:
             data,
             method=method,
             extra_fields=extra_fields,
+            allow_retry=allow_retry,
         )
 
     def execute(
@@ -247,8 +320,10 @@ class ZhsApiClient:
         method: str = "POST",
         extra_fields: dict | None = None,
         timeout: int | None = None,
+        allow_retry: bool | None = None,
     ) -> dict:
         effective_timeout = self.timeout if timeout is None else timeout
+        effective_retry = strategy.allow_retry if allow_retry is None else bool(allow_retry)
         payload = dict(data)
         timestamp = None
         if strategy.set_timestamp:
@@ -265,18 +340,18 @@ class ZhsApiClient:
             form.update(extra_fields)
 
         method = (method or "POST").upper()
-        with self.lock:
-            if method == "GET":
-                response = self.session.get(url, params=form, timeout=effective_timeout)
-            elif strategy.content_type == "json":
-                response = self.session.post(
-                    url,
-                    data=json.dumps(form),
-                    headers={"Content-Type": "application/json;charset=UTF-8"},
-                    timeout=effective_timeout,
-                )
-            else:
-                response = self.session.post(url, data=form, timeout=effective_timeout)
+        session = self.session if effective_retry else self._get_no_retry_session()
+        if method == "GET":
+            response = session.get(url, params=form, timeout=effective_timeout)
+        elif strategy.content_type == "json":
+            response = session.post(
+                url,
+                data=json.dumps(form),
+                headers={"Content-Type": "application/json;charset=UTF-8"},
+                timeout=effective_timeout,
+            )
+        else:
+            response = session.post(url, data=form, timeout=effective_timeout)
 
         response.raise_for_status()
         if strategy.raw_response:
@@ -360,11 +435,10 @@ class ZhsApiClient:
             return SessionStatus.EXPIRED
 
         try:
-            with self.lock:
-                response = self.session.get(
-                    f"{LOGIN_INFO_URL}?time={int(time.time() * 1000)}",
-                    timeout=GET_TIMEOUT,
-                )
+            response = self.session.get(
+                f"{LOGIN_INFO_URL}?time={int(time.time() * 1000)}",
+                timeout=GET_TIMEOUT,
+            )
         except requests.exceptions.RequestException:
             return SessionStatus.UNAVAILABLE
 

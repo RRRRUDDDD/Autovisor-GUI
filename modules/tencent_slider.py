@@ -451,8 +451,12 @@ async def _measure_gap(target, background, piece, background_box, piece_box, mod
         raise TimeoutError("tencent captcha image size invalid")
 
     scale = background_box["width"] / background_width
-    piece_image = _resize_piece(piece_image, piece_box["width"] / scale, np, cv2)
-    gap_x, _gap_y, score = locate_gap(background_image, piece_image, np, cv2)
+    piece_image = await asyncio.to_thread(
+        _resize_piece, piece_image, piece_box["width"] / scale, np, cv2
+    )
+    gap_x, _gap_y, score = await asyncio.to_thread(
+        locate_gap, background_image, piece_image, np, cv2
+    )
     if score < GAP_SCORE_THRESHOLD:
         raise TimeoutError(f"tencent gap match too weak: {score:.3f}")
 

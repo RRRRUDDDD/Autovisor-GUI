@@ -131,6 +131,19 @@ el => {
 }
 """
 
+JS_HAS_IMAGE = r"""
+el => {
+  return [...el.querySelectorAll("img")].some(i => {
+    const src = (i.getAttribute("src") || i.getAttribute("data-src") || "").trim();
+    if (!src) return false;
+    const r = i.getBoundingClientRect();
+    const w = r.width || i.naturalWidth || 0;
+    const h = r.height || i.naturalHeight || 0;
+    return w >= 24 || h >= 24;
+  });
+}
+"""
+
 JS_FILL = r"""
 (el, value) => {
   const box = el.querySelector("textarea, input[type=text], [contenteditable=true]");
@@ -277,6 +290,13 @@ async def _question_type(handle) -> str:
 async def _has_answer(handle) -> bool:
     try:
         return bool(await handle.evaluate(JS_HAS_ANSWER))
+    except Exception:
+        return False
+
+
+async def _has_dom_image(handle) -> bool:
+    try:
+        return bool(await handle.evaluate(JS_HAS_IMAGE))
     except Exception:
         return False
 
@@ -429,17 +449,17 @@ async def _goto_next(page, current_sig: str | None = None) -> tuple[bool, bool]:
     return False, True
 
 
-async def _save_or_submit(page, auto_submit: bool) -> None:
+async def _save_or_submit(page, auto_submit: bool) -> bool:
     if auto_submit:
         if not await _click_text(page, _SUBMIT_TEXTS):
             logger.warn("作业/考试页未找到提交按钮, 请手动提交.")
             logger.event("作业提交", 结果="未找到按钮")
-            return
+            return False
         await page.wait_for_timeout(1200)
         await _confirm(page)
         logger.info("作业/考试页已点击提交并处理确认弹窗.")
         logger.event("作业提交", 结果="已提交")
-        return
+        return True
     if await _click_text(page, _SAVE_TEXTS):
         await page.wait_for_timeout(800)
         await _confirm(page)
@@ -448,6 +468,7 @@ async def _save_or_submit(page, auto_submit: bool) -> None:
     else:
         logger.info("作业/考试作答完成, 请核对后自行提交.")
         logger.event("作业提交", 结果="未提交")
+    return False
 
 
 _API_KIND_FLAGS = {
@@ -583,47 +604,76 @@ async def _try_zhidao_api(page, config, params: dict) -> dict:
     store = AiQuestionStore()
     course_id = params.get("courseId", "")
 
-    if params["kind"] == "dohomework":
-        threshold = getattr(config, "homeworkThreshold", 100)
-        max_redo = getattr(config, "homeworkMaxRedo", 3)
-        worker = ZhidaoHomeworkWorker(
-            ZhidaoHomeworkApi(client),
+    import threading
+
+    cancel_event = getattr(config, "_cancel_event", None) if config is not None else None
+    if cancel_event is None:
+        cancel_event = threading.Event()
+
+    with client:
+        if params["kind"] == "dohomework":
+            threshold = getattr(config, "homeworkThreshold", 100)
+            max_redo = getattr(config, "homeworkMaxRedo", 3)
+            analysis_api = AiAnalysisApi(
+                session=client.clone_session(), proxy=proxy, owns_session=True
+            )
+            worker = ZhidaoHomeworkWorker(
+                ZhidaoHomeworkApi(client),
+                course_id=course_id,
+                store=store,
+                analysis_api=analysis_api,
+                auto_submit=auto_submit,
+                target_score=float(threshold or 0),
+                max_rounds=int(max_redo or 0),
+                cancel_event=cancel_event,
+            )
+            try:
+                return await asyncio.to_thread(
+                    worker.run,
+                    recruit_id=params.get("recruitId", ""),
+                    course_id=course_id,
+                    homework_id=params.get("examId", ""),
+                    stu_exam_id=params.get("stuExamId", ""),
+                    exam_id=params.get("examId", ""),
+                    school_id=params.get("schoolId", ""),
+                )
+            except asyncio.CancelledError:
+                cancel_event.set()
+                raise
+            finally:
+                worker.close()
+                analysis_api.close()
+
+        worker = ZhidaoExamWorker(
+            ZhidaoExamApi(client),
             course_id=course_id,
             store=store,
-            analysis_api=AiAnalysisApi(session=client.session, proxy=proxy),
             auto_submit=auto_submit,
-            target_score=float(threshold or 0),
-            max_rounds=int(max_redo or 0),
+            cancel_event=cancel_event,
         )
-        return await asyncio.to_thread(
-            worker.run,
-            recruit_id=params.get("recruitId", ""),
-            course_id=course_id,
-            homework_id=params.get("examId", ""),
-            stu_exam_id=params.get("stuExamId", ""),
-            exam_id=params.get("examId", ""),
-            school_id=params.get("schoolId", ""),
-        )
-
-    worker = ZhidaoExamWorker(
-        ZhidaoExamApi(client),
-        course_id=course_id,
-        store=store,
-        auto_submit=auto_submit,
-    )
-    return await asyncio.to_thread(
-        worker.run,
-        recruit_id=params.get("recruitId", ""),
-        course_id=course_id,
-        exam_id=params.get("examId", ""),
-        student_exam_id=params.get("stuExamId", ""),
-        school_id=params.get("schoolId", ""),
-    )
+        try:
+            return await asyncio.to_thread(
+                worker.run,
+                recruit_id=params.get("recruitId", ""),
+                course_id=course_id,
+                exam_id=params.get("examId", ""),
+                student_exam_id=params.get("stuExamId", ""),
+                school_id=params.get("schoolId", ""),
+            )
+        except asyncio.CancelledError:
+            cancel_event.set()
+            raise
+        finally:
+            worker.close()
 
 
-async def auto_answer_homework(page, config=None, *, skip_api: bool = False) -> dict:
+async def auto_answer_homework(
+    page, config=None, *, skip_api: bool = False, api_answered_text: bool = False
+) -> dict:
     """对当前智慧树作业/考试页作答; 接口明文优先, 视觉模型兜底。"""
     stats = {"ok": 0, "fill": 0, "fail": 0, "submitted": False}
+    force_redo = bool(getattr(config, "forceRedoAnswered", False))
+    just_answered_text_via_api = bool(api_answered_text)
 
     params = {}
     if not skip_api:
@@ -659,6 +709,7 @@ async def auto_answer_homework(page, config=None, *, skip_api: bool = False) -> 
             logger.info("接口检测到图片题, 回退视觉模型逐题作答.")
             answered = int(api_stats.get("answered", 0) or 0)
             if answered:
+                just_answered_text_via_api = True
                 try:
                     await page.reload(wait_until="domcontentloaded", timeout=30000)
                 except Exception as exc:
@@ -702,17 +753,22 @@ async def auto_answer_homework(page, config=None, *, skip_api: bool = False) -> 
                 break
             seen.add(dom_sig)
         if await _has_answer(question):
-            if not dom_sig:
-                seen.add(f"answered:{index}")
-            logger.info(f"第{index}题 已有答案（接口已保存）, 跳过视觉识别.")
-            logger.event("作业答题", 题号=index, 结果="已作答跳过")
-            advanced, had_next = await _goto_next(page, dom_sig or None)
-            if advanced:
-                continue
-            if had_next and not (total and len(seen) >= total):
-                stuck = True
-                logger.warn("点击下一题后题目未切换, 停止作答.")
-            break
+            should_skip_saved = (not force_redo) or (
+                just_answered_text_via_api and not await _has_dom_image(question)
+            )
+            if should_skip_saved:
+                if not dom_sig:
+                    seen.add(f"answered:{index}")
+                logger.info(f"第{index}题 已有答案（接口已保存）, 跳过视觉识别.")
+                logger.event("作业答题", 题号=index, 结果="已作答跳过")
+                advanced, had_next = await _goto_next(page, dom_sig or None)
+                if advanced:
+                    continue
+                if had_next and not (total and len(seen) >= total):
+                    stuck = True
+                    logger.warn("点击下一题后题目未切换, 停止作答.")
+                break
+            logger.info(f"第{index}题 已有保存答案，已开启「重新作答」，继续重新作答.")
         qtype = await _question_type(question)
         options = await _visible_options(question)
         await _wait_question_images(question)
@@ -798,8 +854,8 @@ async def auto_answer_homework(page, config=None, *, skip_api: bool = False) -> 
         await _save_or_submit(page, False)
         stats["submitted"] = False
     else:
-        await _save_or_submit(page, auto_submit)
-        stats["submitted"] = bool(auto_submit and not stuck)
+        submitted = await _save_or_submit(page, auto_submit)
+        stats["submitted"] = bool(submitted)
     logger.event("作业答题汇总", **stats, 自动提交=auto_submit, 已提交=stats["submitted"])
     return stats
 

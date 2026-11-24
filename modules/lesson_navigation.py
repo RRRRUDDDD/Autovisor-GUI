@@ -233,6 +233,51 @@ async def lesson_key(lesson: Locator, catalog: CatalogSelectors) -> str:
     )
 
 
+async def batch_catalog_status(
+    page: Page, catalog: CatalogSelectors
+) -> list[tuple[str, int]]:
+    """单次 evaluate_all 批量采集目录全部课时的 (key, progress)，避免逐行 DOM 往返。"""
+    raw_items = await page.locator(catalog.item).evaluate_all(
+        """(rows, config) => rows.map((el, index) => {
+            const title = el.querySelector(config.title);
+            const identity = el.getAttribute('data-id') || el.id || '';
+            const key = JSON.stringify([
+                index,
+                identity,
+                (title ? title.textContent : '').trim().replace(/\\s+/g, ' '),
+            ]);
+            if (config.finish && el.querySelector(config.finish)) {
+                return { key, finished: true, rawProgress: 100 };
+            }
+            if (!config.progress) {
+                return { key, finished: false, rawProgress: 0 };
+            }
+            const progressEl = el.querySelector(config.progress);
+            if (!progressEl) {
+                return { key, finished: false, rawProgress: 0 };
+            }
+            const rawProgress = config.progressAttr
+                ? progressEl.getAttribute(config.progressAttr)
+                : progressEl.textContent;
+            return { key, finished: false, rawProgress };
+        })""",
+        {
+            "title": catalog.title,
+            "finish": catalog.finish,
+            "progress": catalog.progress,
+            "progressAttr": catalog.progress_attribute,
+        },
+    )
+    results: list[tuple[str, int]] = []
+    for item in raw_items or []:
+        if not isinstance(item, dict):
+            continue
+        key = str(item.get("key") or "")
+        progress = 100 if item.get("finished") else parse_progress_value(item.get("rawProgress"))
+        results.append((key, progress))
+    return results
+
+
 class LessonChanged(Exception):
     """用户或网站已切到别的课时；主循环应采用新课时，不能继续读旧进度。"""
 

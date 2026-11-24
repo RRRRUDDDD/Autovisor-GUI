@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import random
 import re
+import threading
 import time
 
 from modules import llm
@@ -400,6 +401,7 @@ class ZhidaoHomeworkWorker:
         max_rounds=3,
         sleep=time.sleep,
         question_bank=None,
+        cancel_event: threading.Event | None = None,
     ):
         self.api = api
         self.course_id = str(course_id)
@@ -415,10 +417,37 @@ class ZhidaoHomeworkWorker:
         self.sleep = sleep
         self.question_bank = question_bank
         self._question_bank_ready = question_bank is not None
+        self._owns_question_bank = False
+        self.cancel_event = cancel_event
         self._ai_user_id = None
         self._recruit_id = str(recruit_id or "")
         self._llm_disabled = False
         self._llm_warned = False
+
+    def close(self) -> None:
+        if self._owns_question_bank and self.question_bank is not None:
+            close_fn = getattr(self.question_bank, "close", None)
+            if callable(close_fn):
+                try:
+                    close_fn()
+                except Exception:
+                    pass
+            self._owns_question_bank = False
+
+    def __enter__(self) -> "ZhidaoHomeworkWorker":
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        self.close()
+
+    def _is_cancelled(self) -> bool:
+        return self.cancel_event is not None and self.cancel_event.is_set()
+
+    def _wait_sleep(self, seconds: float) -> bool:
+        if self.cancel_event is not None and self.sleep is time.sleep:
+            return self.cancel_event.wait(seconds)
+        self.sleep(seconds)
+        return self._is_cancelled()
 
     # ------------------------------------------------------------- answering
     def _get_question_bank(self):
@@ -429,9 +458,11 @@ class ZhidaoHomeworkWorker:
             api_client = getattr(self.api, "client", None)
             proxy = getattr(api_client, "proxy", "") if api_client is not None else ""
             self.question_bank = QuestionBankClient.from_config(proxy=proxy)
+            self._owns_question_bank = self.question_bank is not None
         except Exception as exc:
             logger.debug(f"初始化外部题库失败: {exc}")
             self.question_bank = None
+            self._owns_question_bank = False
         return self.question_bank
 
     def _bank_reference(self, question: dict) -> str:
@@ -521,6 +552,8 @@ class ZhidaoHomeworkWorker:
             )
             excluded_set = set(excluded)
             for _attempt in range(ROLLBACK_RETRIES):
+                if self._is_cancelled():
+                    return [], "取消"
                 try:
                     reply = self._ask(prompt)
                 except llm.NonRetryableLLMError as exc:
@@ -546,6 +579,8 @@ class ZhidaoHomeworkWorker:
             wrong_signatures = {tuple(sorted(combo)) for combo in combos}
         last: tuple[list, str] = ([], "")
         for _attempt in range(ROLLBACK_RETRIES):
+            if self._is_cancelled():
+                return [], "取消"
             try:
                 reply = self._ask(prompt)
             except llm.NonRetryableLLMError as exc:
@@ -796,6 +831,8 @@ class ZhidaoHomeworkWorker:
         info = review.get("info") or {}
         qid_by_eid = review.get("qid_by_eid") or {}
         for question in questions:
+            if self._is_cancelled():
+                break
             eid = question.get("eid")
             question_id = (
                 qid_by_eid.get(str(eid))
@@ -881,6 +918,8 @@ class ZhidaoHomeworkWorker:
         seen: set[tuple[str, str]] = set()
         page_num = 0
         for _ in range(max_pages):
+            if self._is_cancelled():
+                break
             payload = self.api.get_student_homework(
                 recruit_id=effective_recruit,
                 course_id=effective_course,
@@ -918,6 +957,9 @@ class ZhidaoHomeworkWorker:
         for item in self.scan(
             flag=flag, recruit_id=effective_recruit, course_id=course_id
         ):
+            if self._is_cancelled():
+                logger.warn("知到作业收到取消信号, 停止剩余作业.")
+                break
             exam_id = item.get("examId", "")
             stu_exam_id = item.get("studentExamId", "")
             exam_name = item.get("examName", "")
@@ -1122,15 +1164,25 @@ class ZhidaoHomeworkWorker:
 
         limit = self._round_limit(payload)
         while True:
+            if self._is_cancelled():
+                logger.warn("知到作业收到取消信号, 提前退出当前作业.")
+                return stats
             stats["rounds"] += 1
             answered = 0
             for question in questions:
+                if self._is_cancelled():
+                    stats["answered"] = answered
+                    logger.warn("知到作业收到取消信号, 提前退出答题循环.")
+                    return stats
                 existing = self._find_row(question, exam_key, course_id)
                 remembered = self._remember_question(question, exam_key, course_id)
                 row = self._merge_row(remembered, existing)
                 values, source = self._answer_question(question, row)
                 if source in ("题库", "随机", "排除法"):
-                    self.sleep(random.uniform(1.5, 3.0))
+                    if self._wait_sleep(random.uniform(1.5, 3.0)):
+                        stats["answered"] = answered
+                        logger.warn("知到作业收到取消信号, 提前退出答题循环.")
+                        return stats
                 self._save_answer(
                     question=question,
                     values=values,
@@ -1147,6 +1199,9 @@ class ZhidaoHomeworkWorker:
                 )
             stats["answered"] = answered
 
+            if self._is_cancelled():
+                logger.warn("知到作业收到取消信号, 放弃自动提交.")
+                return stats
             if not self.auto_submit:
                 logger.info("作业答案已保存, 等待用户手动提交.")
                 return stats
@@ -1190,6 +1245,10 @@ class ZhidaoHomeworkWorker:
                 questions=questions,
             )
             self._apply_review(questions, review, exam_key, course_id=course_id)
+
+            if self._is_cancelled():
+                logger.warn("知到作业收到取消信号, 停止重置与下一轮重做.")
+                break
 
             if stats["rounds"] >= limit:
                 break

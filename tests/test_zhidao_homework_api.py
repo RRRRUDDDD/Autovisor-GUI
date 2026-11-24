@@ -245,6 +245,11 @@ class AnswerFormatTests(unittest.TestCase):
     def test_extract_score(self):
         self.assertEqual(extract_score({"rt": {"score": "87.5"}}), 87.5)
         self.assertEqual(extract_score({"score": 60}), 60.0)
+        self.assertEqual(extract_score({"rt": {"examScore": 80}}), 80.0)
+        self.assertEqual(extract_score({"rt": {"userScore": "92.5"}}), 92.5)
+        # 未判分试卷只有满分 totalScore 时，严禁误判为已拿满分
+        self.assertIsNone(extract_score({"rt": {"score": None, "totalScore": 100}}))
+        self.assertIsNone(extract_score({"totalScore": 100}))
         self.assertIsNone(extract_score({"rt": {}}))
         self.assertIsNone(extract_score(None))
 

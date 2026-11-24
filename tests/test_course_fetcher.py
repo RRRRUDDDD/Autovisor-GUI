@@ -729,6 +729,77 @@ class CourseFetcherTests(unittest.TestCase):
         for _url, t in timeouts:
             self.assertEqual(t, 8)
 
+    def test_fetch_courses_via_api_does_not_use_shared_course_school_as_user_school(self):
+        import threading
+        from requests.cookies import RequestsCookieJar
+        from modules.course_fetcher import (
+            AI_COURSE_LIST_URL,
+            LOGIN_USER_INFO_URL,
+            SHARE_COURSE_LIST_URL,
+            fetch_courses_via_api,
+        )
+        from modules.zhs_api import ZhsApiClient
+
+        class _Resp:
+            def __init__(self, payload):
+                self._payload = payload
+                self.status_code = 200
+                self.headers = {}
+                self.text = json.dumps(payload, ensure_ascii=False)
+
+            def json(self):
+                return self._payload
+
+            def raise_for_status(self):
+                return None
+
+        class _Sess:
+            def __init__(self):
+                self.cookies = RequestsCookieJar()
+                self.headers = {}
+
+            def get(self, url, params=None, timeout=None, allow_redirects=True):
+                if url.startswith(LOGIN_USER_INFO_URL):
+                    # 用户信息未返回 schoolName
+                    return _Resp({"code": 200, "result": {"uuid": "u-no-school", "realName": "赵六"}})
+                return _Resp({"code": 200, "result": {}})
+
+            def post(self, url, data=None, headers=None, timeout=None):
+                if url == SHARE_COURSE_LIST_URL:
+                    return _Resp(
+                        {
+                            "code": 200,
+                            "result": {
+                                "totalCount": 1,
+                                "courseOpenDtos": [
+                                    {
+                                        "courseName": "外校共享通识课",
+                                        "secret": "extsec1234",
+                                        "schoolName": "清华大学",
+                                    }
+                                ],
+                            },
+                        }
+                    )
+                if url == AI_COURSE_LIST_URL:
+                    return _Resp({"status": "200", "rt": []})
+                return _Resp({"code": 200})
+
+        client = ZhsApiClient.__new__(ZhsApiClient)
+        client.session = _Sess()
+        client.lock = threading.RLock()
+        client.timeout = 8
+        client.proxy = ""
+        client.ensure_service_sso = lambda _svc: True
+
+        res = fetch_courses_via_api([], client=client)
+        self.assertTrue(res.session_valid)
+        self.assertEqual(res.display_name, "赵六")
+        # 绝不能把共享课开课学校（清华大学）当成学生本人的学校
+        self.assertEqual(res.school_name, "")
+        self.assertEqual(len(res.courses), 1)
+        self.assertEqual(res.courses[0].school, "清华大学")
+
 
 if __name__ == "__main__":
     unittest.main()

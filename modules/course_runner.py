@@ -7,6 +7,7 @@ from playwright.async_api import Page, TimeoutError
 from modules.course_playback import elapsed_minutes, learn_lesson, review_lesson
 from modules.lesson_navigation import (
     CatalogSelectors,
+    batch_catalog_status,
     detect_catalog,
     lesson_progress,
     wait_for_lesson_active,
@@ -18,6 +19,45 @@ from modules.lesson_navigation import (
 from modules.popups import dismiss_course_popups
 from modules.tasks import has_visible_verification, wait_until_verification_hidden
 from modules.utils import get_filtered_class, get_lesson_name, get_video_attr
+
+_ORIG_LESSON_KEY = lesson_key
+_ORIG_LESSON_PROGRESS = lesson_progress
+_ORIG_GET_FILTERED_CLASS = get_filtered_class
+
+
+async def _read_catalog_keys_and_pending(
+    page: Page,
+    rows: list,
+    catalog: CatalogSelectors,
+    *,
+    learning: bool,
+    reviewed: set,
+) -> tuple[list[str], list[int]]:
+    """优先单次 evaluate_all 批量采集目录状态；测试替身或 DOM 变动时回退逐行读取。"""
+    if (
+        lesson_key is _ORIG_LESSON_KEY
+        and lesson_progress is _ORIG_LESSON_PROGRESS
+        and get_filtered_class is _ORIG_GET_FILTERED_CLASS
+        and callable(getattr(page, "locator", None))
+    ):
+        statuses = await batch_catalog_status(page, catalog)
+        if len(statuses) == len(rows):
+            keys = [item[0] for item in statuses]
+            if learning:
+                pending = [idx for idx, (_, prog) in enumerate(statuses) if prog < 100]
+            else:
+                pending = [idx for idx, (key, _) in enumerate(statuses) if key not in reviewed]
+            return keys, pending
+
+    keys = [await lesson_key(row, catalog) for row in rows]
+    pending = []
+    for index, row in enumerate(rows):
+        if learning:
+            if await lesson_progress(row, catalog) < 100:
+                pending.append(index)
+        elif keys[index] not in reviewed:
+            pending.append(index)
+    return keys, pending
 from modules.video_state import COURSE_VIDEO_SELECTOR, has_valid_duration
 from modules.fusion_adapter import FusionAdapter
 
@@ -143,14 +183,9 @@ async def run_course(
             await asyncio.sleep(1)
             continue
         try:
-            keys = [await lesson_key(row, catalog) for row in rows]
-            pending = []
-            for index, row in enumerate(rows):
-                if learning:
-                    if await lesson_progress(row, catalog) < 100:
-                        pending.append(index)
-                elif keys[index] not in reviewed:
-                    pending.append(index)
+            keys, pending = await _read_catalog_keys_and_pending(
+                page, rows, catalog, learning=learning, reviewed=reviewed
+            )
         except TimeoutError:
             logger.event("等待课程目录", interval=60, 结果="目录节点正在更新")
             await asyncio.sleep(1)

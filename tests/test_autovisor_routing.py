@@ -1,7 +1,7 @@
 import asyncio
 import unittest
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import ANY, AsyncMock, MagicMock, patch
 
 import Autovisor
 from modules.url_router import (
@@ -189,7 +189,9 @@ class FormalExamRouteTests(unittest.IsolatedAsyncioTestCase):
                 "examPaperId": "400",
             },
         )
-        ctx_cls.from_task.assert_called_once_with(api, task, auto_submit=True)
+        ctx_cls.from_task.assert_called_once_with(
+            api, task, auto_submit=True, cancel_event=ANY
+        )
         self.assertEqual(stats, {"success": True, "answered": 5, "total": 5})
 
     async def test_test_detail_auto_submit_false_saved_all_succeeds(self):
@@ -327,7 +329,9 @@ class FormalExamRouteTests(unittest.IsolatedAsyncioTestCase):
         enum_nodes.assert_not_awaited()
         runner_cls.assert_not_called()
         build_api.assert_awaited_once()
-        run_formal.assert_called_once_with(api, "100", "200", False, logger)
+        run_formal.assert_called_once_with(
+            api, "100", "200", False, logger, cancel_event=ANY
+        )
         self.assertEqual(summary["formal_exams"], formal_result)
 
     async def test_formal_exam_runs_when_nodes_are_empty(self):
@@ -354,7 +358,9 @@ class FormalExamRouteTests(unittest.IsolatedAsyncioTestCase):
         enum_nodes.assert_awaited_once()
         runner_cls.assert_not_called()
         build_api.assert_awaited_once()
-        run_formal.assert_called_once_with(api, "100", "200", True, logger)
+        run_formal.assert_called_once_with(
+            api, "100", "200", True, logger, cancel_event=ANY
+        )
         self.assertEqual(summary["formal_exams"], formal_result)
 
 
@@ -504,8 +510,10 @@ class ZhidaoSharedCourseAssessmentTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(summary["homework"]["done"], 3)
         self.assertEqual(summary["homework"]["failed"], 0)
         self.assertEqual(hw_worker.run.call_count, 3)
-        # 图片题作业应打开直达页并跳过 API 直接走视觉模型
-        vision_handler.assert_awaited_once_with(page, config=cfg, skip_api=True)
+        # 图片题作业应打开直达页并跳过 API 直接走视觉模型（API 已作答纯文本题时透传 api_answered_text=True）
+        vision_handler.assert_awaited_once_with(
+            page, config=cfg, skip_api=True, api_answered_text=True
+        )
         page.goto.assert_awaited_once()
         self.assertIn("/dohomework/458533/S2/E2/1000013343/1847/0", page.goto.await_args.args[0])
 
@@ -549,7 +557,9 @@ class ZhidaoSharedCourseAssessmentTests(unittest.IsolatedAsyncioTestCase):
         page.reload.assert_awaited_once_with(
             wait_until="domcontentloaded", timeout=30000
         )
-        vision_handler.assert_awaited_once_with(page, config=cfg, skip_api=True)
+        vision_handler.assert_awaited_once_with(
+            page, config=cfg, skip_api=True, api_answered_text=False
+        )
 
     async def test_assessment_stage_does_not_scan_flag_2_when_auto_submit_false(self):
         logger = MagicMock()

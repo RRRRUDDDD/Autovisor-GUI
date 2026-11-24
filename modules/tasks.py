@@ -110,6 +110,8 @@ async def task_monitor(tasks: list[asyncio.Task]) -> None:
         for i, task in enumerate(tasks):
             if task.done() and task not in checked_tasks:
                 checked_tasks.add(task)
+                if task.cancelled():
+                    continue
                 exc = task.exception()
                 func_name = task.get_coro().__name__
                 if exc is not None:
@@ -404,16 +406,21 @@ async def _skip_questions_loop(
                             from modules.quiz_page import make_zhidao_answerer
 
                             answerer = await make_zhidao_answerer(page, config)
-                        if answerer is not None:
-                            llm_answered = bool(
-                                await answer_with_llm(
-                                    page, None, choices, answerer=answerer
+                        try:
+                            if answerer is not None:
+                                llm_answered = bool(
+                                    await answer_with_llm(
+                                        page, None, choices, answerer=answerer
+                                    )
                                 )
-                            )
-                        else:
-                            llm_answered = bool(
-                                await answer_with_llm(page, None, choices)
-                            )
+                            else:
+                                llm_answered = bool(
+                                    await answer_with_llm(page, None, choices)
+                                )
+                        finally:
+                            close_fn = getattr(answerer, "close", None)
+                            if callable(close_fn):
+                                close_fn()
                 except Exception as exc:
                     logger.debug(f"新版弹题大模型作答未命中: {logger.summarize_exception(exc)}")
                 if intercepted:
@@ -455,95 +462,100 @@ async def _skip_questions_loop(
                     from modules.quiz_page import make_zhidao_answerer
 
                     answerer = await make_zhidao_answerer(page, config)
-                answered = 0
-                llm_count = 0
-                intercept_count = 0
-                fallback_count = 0
-                skipped_count = 0
-                for idx, ques in enumerate(total_ques, 1):
-                    await ques.click(timeout=500)
-                    if not await page.query_selector(".answer"):
-                        choices = await page.query_selector_all(".topic-item")
-                        # 优先接口拦截答案, 再走 AI, 最后回退默认行为(点前两个选项)
-                        intercepted = await click_intercepted_answers(
-                            page, interceptor, choices
-                        )
-                        if intercepted:
-                            intercept_count += 1
-                            logger.info(
-                                f"课中弹题第 {idx}/{len(total_ques)} 题(接口答案拦截): 已按服务端答案点选"
+                try:
+                    answered = 0
+                    llm_count = 0
+                    intercept_count = 0
+                    fallback_count = 0
+                    skipped_count = 0
+                    for idx, ques in enumerate(total_ques, 1):
+                        await ques.click(timeout=500)
+                        if not await page.query_selector(".answer"):
+                            choices = await page.query_selector_all(".topic-item")
+                            # 优先接口拦截答案, 再走 AI, 最后回退默认行为(点前两个选项)
+                            intercepted = await click_intercepted_answers(
+                                page, interceptor, choices
                             )
-                            logger.event(
-                                "课中答题",
-                                序号=f"{idx}/{len(total_ques)}",
-                                方式="接口答案拦截",
-                            )
-                        ai_ok = False
-                        if not intercepted:
-                            ai_ok = (
-                                await answer_with_llm(page, ques, choices, answerer=answerer)
-                                if answerer is not None
-                                else await answer_with_llm(page, ques, choices)
-                            )
-                        if intercepted:
-                            pass
-                        elif ai_ok:
-                            llm_count += 1
-                        else:
-                            q_title = ""
-                            try:
-                                title_el = await page.query_selector(".topic-title")
-                                if title_el:
-                                    q_title = " ".join((await title_el.inner_text()).split())
-                            except Exception:
+                            if intercepted:
+                                intercept_count += 1
+                                logger.info(
+                                    f"课中弹题第 {idx}/{len(total_ques)} 题(接口答案拦截): 已按服务端答案点选"
+                                )
+                                logger.event(
+                                    "课中答题",
+                                    序号=f"{idx}/{len(total_ques)}",
+                                    方式="接口答案拦截",
+                                )
+                            ai_ok = False
+                            if not intercepted:
+                                ai_ok = (
+                                    await answer_with_llm(page, ques, choices, answerer=answerer)
+                                    if answerer is not None
+                                    else await answer_with_llm(page, ques, choices)
+                                )
+                            if intercepted:
                                 pass
-                            picked_texts = []
-                            for each in choices[:2]:
+                            elif ai_ok:
+                                llm_count += 1
+                            else:
+                                q_title = ""
                                 try:
-                                    opt_text = " ".join((await each.inner_text()).split())
-                                    if opt_text:
-                                        picked_texts.append(opt_text[:40])
+                                    title_el = await page.query_selector(".topic-title")
+                                    if title_el:
+                                        q_title = " ".join((await title_el.inner_text()).split())
                                 except Exception:
                                     pass
-                                await each.click(timeout=500)
-                                await page.wait_for_timeout(100)
-                            fallback_count += 1
-                            picked_summary = "; ".join(picked_texts) or f"前 {min(len(choices), 2)} 项"
-                            title_summary = (q_title[:48] + "...") if len(q_title) > 48 else q_title
-                            if title_summary:
-                                logger.info(
-                                    f"课中弹题第 {idx}/{len(total_ques)} 题(默认选择): "
-                                    f"题目「{title_summary}」 -> {picked_summary}"
+                                picked_texts = []
+                                for each in choices[:2]:
+                                    try:
+                                        opt_text = " ".join((await each.inner_text()).split())
+                                        if opt_text:
+                                            picked_texts.append(opt_text[:40])
+                                    except Exception:
+                                        pass
+                                    await each.click(timeout=500)
+                                    await page.wait_for_timeout(100)
+                                fallback_count += 1
+                                picked_summary = "; ".join(picked_texts) or f"前 {min(len(choices), 2)} 项"
+                                title_summary = (q_title[:48] + "...") if len(q_title) > 48 else q_title
+                                if title_summary:
+                                    logger.info(
+                                        f"课中弹题第 {idx}/{len(total_ques)} 题(默认选择): "
+                                        f"题目「{title_summary}」 -> {picked_summary}"
+                                    )
+                                else:
+                                    logger.info(
+                                        f"课中弹题第 {idx}/{len(total_ques)} 题(默认选择): {picked_summary}"
+                                    )
+                                logger.event(
+                                    "课中答题",
+                                    序号=f"{idx}/{len(total_ques)}",
+                                    方式="默认选择",
+                                    题目=q_title[:80] if q_title else None,
+                                    选项=picked_summary,
                                 )
-                            else:
-                                logger.info(
-                                    f"课中弹题第 {idx}/{len(total_ques)} 题(默认选择): {picked_summary}"
-                                )
-                            logger.event(
-                                "课中答题",
-                                序号=f"{idx}/{len(total_ques)}",
-                                方式="默认选择",
-                                题目=q_title[:80] if q_title else None,
-                                选项=picked_summary,
-                            )
-                        answered += 1
-                    else:
-                        skipped_count += 1
-                        logger.debug(f"课中弹题第 {idx}/{len(total_ques)} 题已作答, 跳过.")
-                logger.info(
-                    f"课中弹题处理完成: 共 {len(total_ques)} 题, "
-                    f"接口拦截 {intercept_count} 题, 大模型作答 {llm_count} 题, "
-                    f"默认选择 {fallback_count} 题, 已作答跳过 {skipped_count} 题."
-                )
-                logger.event(
-                    "课中答题",
-                    题目数=len(total_ques),
-                    已作答=answered,
-                    接口拦截=intercept_count,
-                    大模型作答=llm_count,
-                    默认选择=fallback_count,
-                    跳过=skipped_count,
-                )
+                            answered += 1
+                        else:
+                            skipped_count += 1
+                            logger.debug(f"课中弹题第 {idx}/{len(total_ques)} 题已作答, 跳过.")
+                    logger.info(
+                        f"课中弹题处理完成: 共 {len(total_ques)} 题, "
+                        f"接口拦截 {intercept_count} 题, 大模型作答 {llm_count} 题, "
+                        f"默认选择 {fallback_count} 题, 已作答跳过 {skipped_count} 题."
+                    )
+                    logger.event(
+                        "课中答题",
+                        题目数=len(total_ques),
+                        已作答=answered,
+                        接口拦截=intercept_count,
+                        大模型作答=llm_count,
+                        默认选择=fallback_count,
+                        跳过=skipped_count,
+                    )
+                finally:
+                    close_fn = getattr(answerer, "close", None)
+                    if callable(close_fn):
+                        close_fn()
             await page.press(".el-dialog", "Escape", timeout=1000)
             event_loop.set()
         except TargetClosedError:

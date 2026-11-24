@@ -176,7 +176,7 @@ class HybridRoutingTests(unittest.IsolatedAsyncioTestCase):
             # 最后一题：下一题按钮仍可见但点击不再翻页
             return False, True
 
-        save_or_submit = AsyncMock()
+        save_or_submit = AsyncMock(return_value=True)
         config = types.SimpleNamespace(
             enableHomeworkApi=False, enableFormalExamApi=False, proxy=""
         )
@@ -199,6 +199,21 @@ class HybridRoutingTests(unittest.IsolatedAsyncioTestCase):
         save_or_submit.assert_awaited_once()
         self.assertTrue(save_or_submit.await_args.args[1])
 
+    async def test_save_or_submit_returns_false_when_submit_button_missing(self):
+        class _DummyPage:
+            async def wait_for_timeout(self, _ms):
+                return None
+
+        with patch.object(homework, "_click_text", new=AsyncMock(return_value=False)):
+            self.assertFalse(await homework._save_or_submit(_DummyPage(), True))
+
+        with (
+            patch.object(homework, "_click_text", new=AsyncMock(return_value=True)),
+            patch.object(homework, "_confirm", new=AsyncMock(return_value=True)),
+        ):
+            self.assertTrue(await homework._save_or_submit(_DummyPage(), True))
+            self.assertFalse(await homework._save_or_submit(_DummyPage(), False))
+
     async def test_visual_loop_sets_submitted_false_when_stuck(self):
         class _DummyQuestion:
             def __init__(self, sig, answered):
@@ -215,7 +230,7 @@ class HybridRoutingTests(unittest.IsolatedAsyncioTestCase):
                 return None
 
         q1 = _DummyQuestion("sig-1", True)
-        save_or_submit = AsyncMock()
+        save_or_submit = AsyncMock(return_value=True)
         config = types.SimpleNamespace(
             enableHomeworkApi=False, enableFormalExamApi=False, proxy=""
         )
@@ -334,6 +349,96 @@ class HybridRoutingTests(unittest.IsolatedAsyncioTestCase):
 
         await homework._wait_question_images(_ImgQuestion(), timeout=2.0)
         self.assertEqual(calls["count"], 2)
+
+    async def test_force_redo_answered_reanswers_saved_question(self):
+        # 当页面题目已有保存答案时，默认跳过；开启 forceRedoAnswered=True 后重新识别并覆盖作答
+        class _FakeOption:
+            def __init__(self):
+                self.clicked = False
+
+            async def evaluate(self, js):
+                if js == homework.JS_OPTION_CHECKED:
+                    return self.clicked
+                return True
+
+            async def scroll_into_view_if_needed(self, **_kwargs):
+                return None
+
+            async def click(self, **_kwargs):
+                self.clicked = True
+
+        class _SavedQuestion:
+            def __init__(self, opt):
+                self.opt = opt
+                self.shot_count = 0
+
+            async def evaluate(self, js):
+                if js == homework.JS_SIGNATURE:
+                    return "anchor_q1"
+                if js == homework.JS_HAS_ANSWER:
+                    return True
+                if js == homework.JS_QUESTION_TYPE:
+                    return "single"
+                if js == homework.JS_IMAGES_READY:
+                    return True
+                if js == homework.JS_HAS_IMAGE:
+                    return True
+                return False
+
+            async def query_selector_all(self, _sel):
+                return [self.opt]
+
+            async def screenshot(self, **_kwargs):
+                self.shot_count += 1
+                return b"png-bytes"
+
+        class _FakePage:
+            url = "https://onlineexamh5new.zhihuishu.com/stuExamWeb.html#/webExamList/dohomework/1/2/3/4/5/0"
+
+            async def wait_for_load_state(self, *_args, **_kwargs):
+                return None
+
+            async def wait_for_timeout(self, _ms):
+                return None
+
+        opt_default = _FakeOption()
+        q_default = _SavedQuestion(opt_default)
+        with (
+            patch.object(homework.llm, "vision_enabled", return_value=True),
+            patch.object(homework.llm, "vision_label", return_value="gpt-4o"),
+            patch.object(homework.llm, "conf", return_value={"auto_submit": False}),
+            patch.object(homework.llm, "chat_vision_sync", return_value="A") as vision_mock,
+            patch.object(homework, "_wait_question", new=AsyncMock(return_value=q_default)),
+            patch.object(homework, "_visible_question", new=AsyncMock(return_value=q_default)),
+            patch.object(homework, "_visible_options", new=AsyncMock(return_value=[opt_default])),
+            patch.object(homework, "_question_total", new=AsyncMock(return_value=1)),
+            patch.object(homework, "_goto_next", new=AsyncMock(return_value=(False, False))),
+            patch.object(homework, "_save_or_submit", new=AsyncMock()),
+        ):
+            cfg_off = types.SimpleNamespace(forceRedoAnswered=False, proxy="")
+            stats_off = await homework.auto_answer_homework(_FakePage(), config=cfg_off, skip_api=True)
+            self.assertEqual(stats_off["ok"], 0)
+            self.assertEqual(vision_mock.call_count, 0)
+
+        opt_redo = _FakeOption()
+        q_redo = _SavedQuestion(opt_redo)
+        with (
+            patch.object(homework.llm, "vision_enabled", return_value=True),
+            patch.object(homework.llm, "vision_label", return_value="gpt-4o"),
+            patch.object(homework.llm, "conf", return_value={"auto_submit": False}),
+            patch.object(homework.llm, "chat_vision_sync", return_value="A") as vision_mock,
+            patch.object(homework, "_wait_question", new=AsyncMock(return_value=q_redo)),
+            patch.object(homework, "_visible_question", new=AsyncMock(return_value=q_redo)),
+            patch.object(homework, "_visible_options", new=AsyncMock(return_value=[opt_redo])),
+            patch.object(homework, "_question_total", new=AsyncMock(return_value=1)),
+            patch.object(homework, "_goto_next", new=AsyncMock(return_value=(False, False))),
+            patch.object(homework, "_save_or_submit", new=AsyncMock()),
+        ):
+            cfg_on = types.SimpleNamespace(forceRedoAnswered=True, proxy="")
+            stats_on = await homework.auto_answer_homework(_FakePage(), config=cfg_on, skip_api=True)
+            self.assertEqual(stats_on["ok"], 1)
+            self.assertEqual(vision_mock.call_count, 1)
+            self.assertTrue(opt_redo.clicked)
 
 
 if __name__ == "__main__":

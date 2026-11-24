@@ -531,7 +531,7 @@ def extract_score(payload) -> float | None:
     if isinstance(rt, dict):
         candidates.insert(0, rt)
     for source in candidates:
-        for key in ("score", "totalScore", "examScore"):
+        for key in ("score", "examScore", "userScore"):
             if source.get(key) is None:
                 continue
             try:

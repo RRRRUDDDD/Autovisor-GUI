@@ -256,6 +256,15 @@ async def _refresh_puzzle(target) -> None:
     await _wait_puzzle_ready(target)
 
 
+def _match_yidun_gap(bg_img, block_img):
+    """在后台线程执行 OpenCV 边缘提取与模板匹配，避免阻塞 asyncio 事件循环。"""
+    bg_edges = process_background_image(bg_img)
+    block_edges = process_block_image(block_img)
+    result = cv2.matchTemplate(bg_edges, block_edges, cv2.TM_CCOEFF_NORMED)
+    _, score, _, max_loc = cv2.minMaxLoc(result)
+    return float(score), max_loc
+
+
 # 主函数，结合页面加载和图片处理
 async def progress_img(page: Page):
     # 等待易盾验证码加载完成，避免读取到空图片或旧图片。
@@ -286,13 +295,8 @@ async def progress_img(page: Page):
     if bg_img is None or block_img is None:
         raise TimeoutError("yidun puzzle decode failed")
 
-    # 分别处理背景图和拼图块。
-    bg_edges = process_background_image(bg_img)
-    block_edges = process_block_image(block_img)
-
     # 匹配结果仍是原图坐标，后面必须转换到浏览器显示坐标。
-    result = cv2.matchTemplate(bg_edges, block_edges, cv2.TM_CCOEFF_NORMED)
-    _, score, _, max_loc = cv2.minMaxLoc(result)
+    score, max_loc = await asyncio.to_thread(_match_yidun_gap, bg_img, block_img)
     if score < 0.05:
         raise TimeoutError(f"yidun puzzle match too weak: {score:.3f}")
 

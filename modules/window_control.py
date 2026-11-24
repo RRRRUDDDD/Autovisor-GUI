@@ -379,7 +379,8 @@ async def _locate_hwnd(page: Page, backend) -> int | None:
 
     try:
         for attempt in range(TITLE_POLL_ATTEMPTS):
-            hwnd = _pick_best_hwnd(backend.find_windows_by_title(token))
+            matches = await asyncio.to_thread(backend.find_windows_by_title, token)
+            hwnd = _pick_best_hwnd(matches)
             if hwnd is not None:
                 _set_state(page, WindowState(hwnd=hwnd))
                 return hwnd

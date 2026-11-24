@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import re
 from functools import lru_cache
 from types import ModuleType
@@ -512,8 +513,10 @@ async def solve_click_captcha(page: Page, modules: list[ModuleType], attempts: i
                 logger.warn("未解析到点选验证码题目或图片.")
                 return False
             png = await image_locator.screenshot(type="png")
-            image = decode_png(png, np_mod, cv_mod)
-            point = find_click_point(image, instruction, np_mod, cv_mod)
+            image = await asyncio.to_thread(decode_png, png, np_mod, cv_mod)
+            point = await asyncio.to_thread(
+                find_click_point, image, instruction, np_mod, cv_mod
+            )
             if point is None:
                 logger.warn(f"第{attempt + 1}次点选识别失败,正在刷新...")
                 await _refresh(target)

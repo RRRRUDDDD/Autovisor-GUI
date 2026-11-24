@@ -7,6 +7,7 @@ import os
 import platform
 import re
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -55,6 +56,7 @@ from modules.login import (
 )
 from modules.logger import Logger
 from modules.notifier import Notifier
+from modules.redaction import redact_argv
 from modules.popups import dismiss_popups
 from modules.qr_login import qr_login_for_cookies
 from modules.slider import captcha_visible, slider_verify
@@ -372,6 +374,11 @@ def _formal_exam_succeeded(
     return (total == 0) or (answered >= total and failed_saves == 0)
 
 
+def _resolve_cancel_event(config) -> threading.Event:
+    ev = getattr(config, "_cancel_event", None) if config is not None else None
+    return ev if isinstance(ev, threading.Event) else threading.Event()
+
+
 async def run_formal_exam_stage(
     page: Page,
     course_url: str,
@@ -397,18 +404,31 @@ async def run_formal_exam_stage(
             payload = {}
         course_id = course_id or str(payload.get("courseId") or "")
         class_id = class_id or str(payload.get("classId") or "")
-    if api is None:
+    own_api = api is None
+    if own_api:
         api = await build_page_exam_api(page, config)
     auto_submit = bool(quiz_page.llm.conf().get("auto_submit", False))
+    cancel_event = _resolve_cancel_event(config)
     logger.section("综合考试")
-    formal = await asyncio.to_thread(
-        run_formal_exam_tasks,
-        api,
-        course_id,
-        class_id,
-        auto_submit,
-        logger,
-    )
+    try:
+        try:
+            formal = await asyncio.to_thread(
+                run_formal_exam_tasks,
+                api,
+                course_id,
+                class_id,
+                auto_submit,
+                logger,
+                cancel_event=cancel_event,
+            )
+        except asyncio.CancelledError:
+            cancel_event.set()
+            raise
+    finally:
+        if own_api:
+            close_fn = getattr(api, "close", None)
+            if callable(close_fn):
+                close_fn()
     if formal.get("found"):
         logger.event(
             "综合考试汇总",
@@ -428,62 +448,78 @@ async def run_exam_stage(
     api = None
     course_id = ""
     class_id = ""
-    if getattr(config, "enableExamApi", True):
-        logger.section("接口考试")
-        try:
-            payload = await enumerate_nodes(page, course_url)
-            course_id = str(payload.get("courseId") or "")
-            class_id = str(payload.get("classId") or "")
-            nodes = [
-                node for node in payload.get("nodes") or [] if node.get("nodeUid")
-            ]
-            if not nodes:
-                logger.warn("没有枚举到知识点, 跳过知识点接口考试.")
-            else:
-                api = await build_page_exam_api(page, config)
-                limit = getattr(config, "limitMaxTime", 0) or 0
-                deadline = time.monotonic() + limit * 60 if limit > 0 else None
-                runner = ExamRunner(
-                    course_id,
-                    class_id,
-                    api,
-                    target=int(config.masteryTarget),
-                    enable_ppt=getattr(config, "enablePptReference", True),
-                )
-                logger.info(
-                    f"开始接口考试: 知识点 {len(nodes)} 个, 目标掌握度 {int(config.masteryTarget)}%"
-                )
-                logger.event(
-                    "接口考试范围",
-                    知识点=len(nodes),
-                    目标掌握度=int(config.masteryTarget),
-                )
-                summary = await asyncio.to_thread(runner.run, nodes, deadline)
-                logger.event(
-                    "接口考试汇总",
-                    达标=len(summary.get("done") or []),
-                    跳过=len(summary.get("skipped") or []),
-                    未完成=len(summary.get("failed") or []),
-                )
-        except Exception as exc:
-            logger.log_exception("接口考试阶段失败.", exc)
+    try:
+        if getattr(config, "enableExamApi", True):
+            logger.section("接口考试")
+            try:
+                payload = await enumerate_nodes(page, course_url)
+                course_id = str(payload.get("courseId") or "")
+                class_id = str(payload.get("classId") or "")
+                nodes = [
+                    node for node in payload.get("nodes") or [] if node.get("nodeUid")
+                ]
+                if not nodes:
+                    logger.warn("没有枚举到知识点, 跳过知识点接口考试.")
+                else:
+                    api = await build_page_exam_api(page, config)
+                    limit = getattr(config, "limitMaxTime", 0) or 0
+                    deadline = time.monotonic() + limit * 60 if limit > 0 else None
+                    cancel_event = _resolve_cancel_event(config)
+                    runner = ExamRunner(
+                        course_id,
+                        class_id,
+                        api,
+                        target=int(config.masteryTarget),
+                        enable_ppt=getattr(config, "enablePptReference", True),
+                        cancel_event=cancel_event,
+                    )
+                    logger.info(
+                        f"开始接口考试: 知识点 {len(nodes)} 个, 目标掌握度 {int(config.masteryTarget)}%"
+                    )
+                    logger.event(
+                        "接口考试范围",
+                        知识点=len(nodes),
+                        目标掌握度=int(config.masteryTarget),
+                    )
+                    try:
+                        summary = await asyncio.to_thread(runner.run, nodes, deadline)
+                    except asyncio.CancelledError:
+                        cancel_event.set()
+                        raise
+                    logger.event(
+                        "接口考试汇总",
+                        达标=len(summary.get("done") or []),
+                        跳过=len(summary.get("skipped") or []),
+                        未完成=len(summary.get("failed") or []),
+                    )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.log_exception("接口考试阶段失败.", exc)
 
-    if run_formal and getattr(config, "enableFormalExamApi", True):
-        try:
-            formal = await run_formal_exam_stage(
-                page,
-                course_url,
-                config,
-                logger,
-                api=api,
-                course_id=course_id,
-                class_id=class_id,
-            )
-        except Exception as exc:
-            logger.log_exception("综合考试扫描失败.", exc)
-        else:
-            summary["formal_exams"] = formal
-    return summary
+        if run_formal and getattr(config, "enableFormalExamApi", True):
+            try:
+                formal = await run_formal_exam_stage(
+                    page,
+                    course_url,
+                    config,
+                    logger,
+                    api=api,
+                    course_id=course_id,
+                    class_id=class_id,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.log_exception("综合考试扫描失败.", exc)
+            else:
+                summary["formal_exams"] = formal
+        return summary
+    finally:
+        if api is not None:
+            close_fn = getattr(api, "close", None)
+            if callable(close_fn):
+                close_fn()
 
 
 def run_formal_exam_tasks(
@@ -492,14 +528,22 @@ def run_formal_exam_tasks(
     class_id,
     auto_submit: bool,
     logger,
+    *,
+    cancel_event: threading.Event | None = None,
 ) -> dict:
     """扫描 AI 智慧课综合/单元测试任务并逐个执行 (在线程中调用)."""
     probe = AiFormalExamCtx.from_task(
         api,
         {"courseId": course_id, "classId": class_id},
         auto_submit=auto_submit,
+        cancel_event=cancel_event,
     )
-    tasks = probe.scan_pending_tasks()
+    try:
+        tasks = probe.scan_pending_tasks()
+    finally:
+        close_fn = getattr(probe, "close", None)
+        if callable(close_fn):
+            close_fn()
     summary = {
         "found": len(tasks),
         "done": 0,
@@ -508,6 +552,9 @@ def run_formal_exam_tasks(
         "details": [],
     }
     for task in tasks:
+        if cancel_event is not None and cancel_event.is_set():
+            logger.warn("综合考试收到取消信号, 停止剩余任务.")
+            break
         task = dict(task)
         if not task.get("courseId"):
             task["courseId"] = course_id
@@ -519,7 +566,9 @@ def run_formal_exam_tasks(
             or task.get("name")
             or str(task.get("examTestId") or "")
         )
-        ctx = AiFormalExamCtx.from_task(api, task, auto_submit=auto_submit)
+        ctx = AiFormalExamCtx.from_task(
+            api, task, auto_submit=auto_submit, cancel_event=cancel_event
+        )
         try:
             submitted, answered, total = ctx.start(submit=auto_submit)
         except Exception as exc:
@@ -587,10 +636,14 @@ def sync_zhs_client_cookies(client, cookies) -> None:
     """把浏览器最新 Cookie 同步回 ZhsApiClient (人机验证后刷新会话凭证)."""
     if client is None:
         return
+    from modules.zhs_api import ZhsApiClient, set_cookie_dict
+
+    if isinstance(client, ZhsApiClient):
+        client.sync_cookies(cookies)
+        return
     session = getattr(client, "session", None)
     if session is None:
         return
-    from modules.zhs_api import set_cookie_dict
 
     for cookie in cookies or []:
         if isinstance(cookie, dict):
@@ -618,7 +671,15 @@ def resolve_zhidao_course_meta(client, recruit_and_course_id: str) -> dict:
 
 
 async def _run_zhidao_with_captcha(
-    page: Page, client, config, logger, *, label: str, captcha_url: str, run_fn
+    page: Page,
+    client,
+    config,
+    logger,
+    *,
+    label: str,
+    captcha_url: str,
+    run_fn,
+    cancel_event: threading.Event | None = None,
 ):
     """在线程中执行知到接口调用; 若触发人机验证则在浏览器中处理后重试一次."""
     from modules.zhs_api import CaptchaRequiredError
@@ -627,6 +688,10 @@ async def _run_zhidao_with_captcha(
     for attempt in range(2):
         try:
             return await asyncio.to_thread(run_fn)
+        except asyncio.CancelledError:
+            if cancel_event is not None:
+                cancel_event.set()
+            raise
         except CaptchaRequiredError as exc:
             last_error = exc
             logger.warn(f"「{label}」触发人机验证: {exc}")
@@ -650,7 +715,13 @@ async def _run_zhidao_with_captcha(
 
 
 async def _run_vision_fallback_on_url(
-    page: Page, url: str, config, logger, *, label: str
+    page: Page,
+    url: str,
+    config,
+    logger,
+    *,
+    label: str,
+    api_answered_text: bool = False,
 ) -> dict:
     """作业/考试含图片题时导航到直达页, 跳过已跑过的 API 阶段直接用视觉模型补答."""
     if not quiz_page.llm.vision_enabled():
@@ -670,7 +741,12 @@ async def _run_vision_fallback_on_url(
     except TimeoutError:
         logger.warn(f"「{label}」答题页加载较慢, 继续等待题目渲染...")
     await page.wait_for_timeout(1500)
-    return await homework.auto_answer_homework(page, config=config, skip_api=True)
+    return await homework.auto_answer_homework(
+        page,
+        config=config,
+        skip_api=True,
+        api_answered_text=api_answered_text,
+    )
 
 
 async def run_zhidao_assessment_stage(
@@ -697,6 +773,54 @@ async def run_zhidao_assessment_stage(
         return {}
 
     client = await build_page_zhs_client(page, config)
+    resources = [client]
+    try:
+        return await _run_zhidao_assessment_with_client(
+            page,
+            course_url,
+            recruit_secret,
+            config,
+            logger,
+            client=client,
+            do_hw=do_hw,
+            do_exam=do_exam,
+            resources=resources,
+        )
+    finally:
+        for res in reversed(resources):
+            close_fn = getattr(res, "close", None)
+            if callable(close_fn):
+                try:
+                    close_fn()
+                except Exception:
+                    pass
+
+
+async def _run_zhidao_assessment_with_client(
+    page: Page,
+    course_url: str,
+    recruit_secret: str,
+    config,
+    logger,
+    *,
+    client,
+    do_hw: bool,
+    do_exam: bool,
+    resources: list,
+) -> dict:
+    from modules.ai_analysis_api import AiAnalysisApi
+    from modules.zhidao_exam_api import ZhidaoExamApi, is_exam_started
+    from modules.zhidao_exam_worker import ZhidaoExamWorker
+    from modules.zhidao_homework_api import (
+        ZhidaoHomeworkApi,
+        build_exam_page_url,
+        check_time_window,
+    )
+    from modules.zhidao_homework_worker import (
+        ZhidaoHomeworkWorker,
+        should_redo_submitted,
+    )
+
     try:
         meta = await _run_zhidao_with_captcha(
             page,
@@ -726,6 +850,7 @@ async def run_zhidao_assessment_stage(
 
     proxy = str(getattr(config, "proxy", "") or "").strip()
     auto_submit = bool(quiz_page.llm.conf().get("auto_submit", False))
+    cancel_event = _resolve_cancel_event(config)
     store = AiQuestionStore()
     if not quiz_page.llm.enabled():
         logger.warn(
@@ -745,6 +870,17 @@ async def run_zhidao_assessment_stage(
         threshold = float(getattr(config, "homeworkThreshold", 100) or 0)
         max_redo = int(getattr(config, "homeworkMaxRedo", 3) or 0)
         hw_api = ZhidaoHomeworkApi(client)
+        clone_fn = getattr(client, "clone_session", None)
+        analysis_session = (
+            clone_fn() if callable(clone_fn) else getattr(client, "session", None)
+        )
+        analysis_api = AiAnalysisApi(
+            session=analysis_session,
+            proxy=proxy,
+            owns_session=callable(clone_fn)
+            and analysis_session is not getattr(client, "session", None),
+        )
+        resources.append(analysis_api)
         hw_worker = ZhidaoHomeworkWorker(
             hw_api,
             course_id=course_id,
@@ -752,11 +888,13 @@ async def run_zhidao_assessment_stage(
             recruit_id=recruit_id,
             school_id=school_id,
             store=store,
-            analysis_api=AiAnalysisApi(session=client.session, proxy=proxy),
+            analysis_api=analysis_api,
             auto_submit=auto_submit,
             target_score=threshold,
             max_rounds=max_redo,
+            cancel_event=cancel_event,
         )
+        resources.append(hw_worker)
         try:
             pending_items = await asyncio.to_thread(
                 hw_worker.scan, 1, recruit_id=recruit_id, course_id=course_id
@@ -852,7 +990,10 @@ async def run_zhidao_assessment_stage(
                             exam_id=e,
                             school_id=str(sc or ""),
                         ),
+                        cancel_event=cancel_event,
                     )
+                except asyncio.CancelledError:
+                    raise
                 except Exception as exc:
                     hw_summary["failed"] += 1
                     hw_summary["details"].append(
@@ -871,7 +1012,12 @@ async def run_zhidao_assessment_stage(
                 vision_stats = None
                 if stats.get("needs_vision"):
                     vision_stats = await _run_vision_fallback_on_url(
-                        page, item_url, config, logger, label=exam_name
+                        page,
+                        item_url,
+                        config,
+                        logger,
+                        label=exam_name,
+                        api_answered_text=int(stats.get("answered", 0) or 0) > 0,
                     )
                     stats["vision"] = vision_stats
 
@@ -963,7 +1109,9 @@ async def run_zhidao_assessment_stage(
             school_id=school_id,
             store=store,
             auto_submit=auto_submit,
+            cancel_event=cancel_event,
         )
+        resources.append(exam_worker)
         try:
             exams = await asyncio.to_thread(
                 exam_worker.scan, 1, recruit_id=recruit_id, course_id=course_id
@@ -1040,7 +1188,10 @@ async def run_zhidao_assessment_stage(
                             school_id=str(sc or ""),
                             exam_name=n,
                         ),
+                        cancel_event=cancel_event,
                     )
+                except asyncio.CancelledError:
+                    raise
                 except Exception as exc:
                     exam_summary["failed"] += 1
                     exam_summary["details"].append(
@@ -1066,7 +1217,12 @@ async def run_zhidao_assessment_stage(
                 vision_stats = None
                 if stats.get("needs_vision"):
                     vision_stats = await _run_vision_fallback_on_url(
-                        page, exam_url, config, logger, label=exam_name
+                        page,
+                        exam_url,
+                        config,
+                        logger,
+                        label=exam_name,
+                        api_answered_text=int(stats.get("answered", 0) or 0) > 0,
                     )
                     stats["vision"] = vision_stats
 
@@ -1150,27 +1306,39 @@ async def run_zhidao_assessment_stage(
 async def run_formal_exam_route(page: Page, parsed: dict, config, logger) -> dict:
     """testDetail 链接: 直接按综合考试接口作答."""
     api = await build_page_exam_api(page, config)
-    auto_submit = bool(quiz_page.llm.conf().get("auto_submit", False))
-    task = {
-        "courseId": parsed.get("courseId", ""),
-        "classId": parsed.get("classId", ""),
-        "examTestId": parsed.get("examTestId", ""),
-        "examPaperId": parsed.get("examPaperId", ""),
-    }
-    logger.info(f"检测到综合考试链接, 开始接口作答 (自动交卷={auto_submit}) ...")
-    logger.event("综合考试", 状态="开始", 自动交卷=auto_submit)
-    ctx = AiFormalExamCtx.from_task(api, task, auto_submit=auto_submit)
-    submitted, answered, total = await asyncio.to_thread(ctx.start, submit=auto_submit)
-    ok = _formal_exam_succeeded(ctx, submitted, answered, total, auto_submit)
-    logger.event(
-        "综合考试",
-        状态="结束",
-        成功=ok,
-        已交卷=bool(submitted),
-        作答=answered,
-        总数=total,
-    )
-    return {"success": ok, "answered": answered, "total": total}
+    try:
+        auto_submit = bool(quiz_page.llm.conf().get("auto_submit", False))
+        task = {
+            "courseId": parsed.get("courseId", ""),
+            "classId": parsed.get("classId", ""),
+            "examTestId": parsed.get("examTestId", ""),
+            "examPaperId": parsed.get("examPaperId", ""),
+        }
+        logger.info(f"检测到综合考试链接, 开始接口作答 (自动交卷={auto_submit}) ...")
+        logger.event("综合考试", 状态="开始", 自动交卷=auto_submit)
+        cancel_event = _resolve_cancel_event(config)
+        ctx = AiFormalExamCtx.from_task(
+            api, task, auto_submit=auto_submit, cancel_event=cancel_event
+        )
+        try:
+            submitted, answered, total = await asyncio.to_thread(ctx.start, submit=auto_submit)
+        except asyncio.CancelledError:
+            cancel_event.set()
+            raise
+        ok = _formal_exam_succeeded(ctx, submitted, answered, total, auto_submit)
+        logger.event(
+            "综合考试",
+            状态="结束",
+            成功=ok,
+            已交卷=bool(submitted),
+            作答=answered,
+            总数=total,
+        )
+        return {"success": ok, "answered": answered, "total": total}
+    finally:
+        close_fn = getattr(api, "close", None)
+        if callable(close_fn):
+            close_fn()
 
 
 async def run_learn_page_route(
@@ -1198,24 +1366,35 @@ async def run_learn_page_route(
     if not getattr(config, "enableExamApi", True):
         return {}
     api = await build_page_exam_api(page, config)
-    limit = getattr(config, "limitMaxTime", 0) or 0
-    deadline = time.monotonic() + limit * 60 if limit > 0 else None
-    runner = ExamRunner(
-        course_id,
-        class_id,
-        api,
-        target=int(config.masteryTarget),
-        enable_ppt=getattr(config, "enablePptReference", True),
-    )
-    node = {"nodeUid": node_uid, "name": f"知识点 {node_uid}"}
-    summary = await asyncio.to_thread(runner.run, [node], deadline)
-    logger.event(
-        "接口考试汇总",
-        达标=len(summary.get("done") or []),
-        跳过=len(summary.get("skipped") or []),
-        未完成=len(summary.get("failed") or []),
-    )
-    return summary
+    try:
+        limit = getattr(config, "limitMaxTime", 0) or 0
+        deadline = time.monotonic() + limit * 60 if limit > 0 else None
+        cancel_event = _resolve_cancel_event(config)
+        runner = ExamRunner(
+            course_id,
+            class_id,
+            api,
+            target=int(config.masteryTarget),
+            enable_ppt=getattr(config, "enablePptReference", True),
+            cancel_event=cancel_event,
+        )
+        node = {"nodeUid": node_uid, "name": f"知识点 {node_uid}"}
+        try:
+            summary = await asyncio.to_thread(runner.run, [node], deadline)
+        except asyncio.CancelledError:
+            cancel_event.set()
+            raise
+        logger.event(
+            "接口考试汇总",
+            达标=len(summary.get("done") or []),
+            跳过=len(summary.get("skipped") or []),
+            未完成=len(summary.get("failed") or []),
+        )
+        return summary
+    finally:
+        close_fn = getattr(api, "close", None)
+        if callable(close_fn):
+            close_fn()
 
 
 _DIRECT_TASK_KINDS = (
@@ -1282,6 +1461,7 @@ async def run_mastery_stage(page: Page, course_url: str, config, logger) -> dict
         logger,
         target=target,
         max_attempts=3,
+        force_redo=bool(getattr(config, "forceRedoAnswered", False)),
     )
     return summary
 
@@ -1408,8 +1588,8 @@ async def run_fetch_courses(config, write_config: bool = False) -> int:
     if not courses:
         async with async_playwright() as p:
             session = await create_browser_session(p, config, cookies, logger)
-            page, context = session.page, session.context
             try:
+                page, context = session.page, session.context
                 await ensure_login(context, page, cookies, config)
                 logger.info("正在从智慧树接口与学生主页读取课程列表...")
                 courses = await fetch_courses_from_page(
@@ -1441,8 +1621,22 @@ async def run_fetch_courses(config, write_config: bool = False) -> int:
     return 0
 
 
-async def main(config) -> bool:
+async def main(config, cancel_event: threading.Event | None = None) -> bool:
+    notifier = Notifier.from_config(config, logger=logger)
+    try:
+        return await _main_impl(config, notifier, cancel_event=cancel_event)
+    finally:
+        close_fn = getattr(notifier, "close", None)
+        if callable(close_fn):
+            close_fn()
+
+
+async def _main_impl(
+    config, notifier, cancel_event: threading.Event | None = None
+) -> bool:
     global event_loop_verify, event_loop_answer, COOKIE_PATH
+    if cancel_event is not None:
+        setattr(config, "_cancel_event", cancel_event)
     event_loop_verify = asyncio.Event()
     event_loop_answer = asyncio.Event()
     COOKIE_PATH = get_runtime_path("data", "cookies.json")
@@ -1455,7 +1649,6 @@ async def main(config) -> bool:
     popups_enabled.set()
     all_courses_complete = True
     run_ok = True
-    notifier = Notifier.from_config(config, logger=logger)
     if config.enableAutoCaptcha:
         logger.section("依赖检查")
         logger.info("正在检查验证码识别依赖...")
@@ -1470,28 +1663,35 @@ async def main(config) -> bool:
             cookies = await maybe_qr_login(config, cookies)
         logger.event("本地凭证", 数量=len(cookies) if cookies else 0, 文件=COOKIE_PATH)
         session = await create_browser_session(p, config, cookies, logger)
-        page, context = session.page, session.context
-        # 捕获课程流程中新开的测验页面(如课堂测验跳转的新标签页), 自动作答
-        def _on_new_page(new_page):
-            asyncio.ensure_future(quiz_page.auto_answer_new_page(new_page, config))
-        context.on("page", _on_new_page)
-        if getattr(config, "enableZhidaoQuiz", True) and quiz_page.llm.enabled():
-            quiz_capture_status = f"已启用 (智慧树AI -> {quiz_page.llm.provider_label()})"
-        elif getattr(config, "enableZhidaoQuiz", True):
-            quiz_capture_status = "已启用 (智慧树AI)"
-        elif quiz_page.llm.enabled():
-            quiz_capture_status = f"已启用 ({quiz_page.llm.provider_label()})"
-        elif quiz_page.llm.vision_enabled():
-            quiz_capture_status = "已启用 (仅作业/考试图片题视觉模型)"
-        else:
-            quiz_capture_status = "未配置答题源, 仅监听不答题"
-        if quiz_page.llm.vision_enabled():
-            quiz_capture_status += f" ; 图片题={quiz_page.llm.vision_label()}"
-        else:
-            quiz_capture_status += " ; 图片题=未配置视觉模型"
-        logger.event("测验页面捕获", 状态=quiz_capture_status)
         monitor_task = None
+        context = None
+        quiz_tasks: set[asyncio.Task] = set()
+        _on_new_page = None
         try:
+            page, context = session.page, session.context
+
+            # 捕获课程流程中新开的测验页面(如课堂测验跳转的新标签页), 自动作答
+            def _on_new_page(new_page):
+                task = asyncio.create_task(quiz_page.auto_answer_new_page(new_page, config))
+                quiz_tasks.add(task)
+                task.add_done_callback(quiz_tasks.discard)
+
+            context.on("page", _on_new_page)
+            if getattr(config, "enableZhidaoQuiz", True) and quiz_page.llm.enabled():
+                quiz_capture_status = f"已启用 (智慧树AI -> {quiz_page.llm.provider_label()})"
+            elif getattr(config, "enableZhidaoQuiz", True):
+                quiz_capture_status = "已启用 (智慧树AI)"
+            elif quiz_page.llm.enabled():
+                quiz_capture_status = f"已启用 ({quiz_page.llm.provider_label()})"
+            elif quiz_page.llm.vision_enabled():
+                quiz_capture_status = "已启用 (仅作业/考试图片题视觉模型)"
+            else:
+                quiz_capture_status = "未配置答题源, 仅监听不答题"
+            if quiz_page.llm.vision_enabled():
+                quiz_capture_status += f" ; 图片题={quiz_page.llm.vision_label()}"
+            else:
+                quiz_capture_status += " ; 图片题=未配置视觉模型"
+            logger.event("测验页面捕获", 状态=quiz_capture_status)
             login_by_cookie = await ensure_login(context, page, cookies, config, modules)
 
             logger.context(登录方式="Cookie" if login_by_cookie else "账号")
@@ -1688,17 +1888,28 @@ async def main(config) -> bool:
                     finally:
                         popups_enabled.set()
         finally:
+            if context is not None and _on_new_page is not None:
+                remove_listener = getattr(context, "remove_listener", None)
+                if callable(remove_listener):
+                    try:
+                        remove_listener("page", _on_new_page)
+                    except Exception:
+                        pass
+            pending_quiz_tasks = list(quiz_tasks)
+            for qtask in pending_quiz_tasks:
+                qtask.cancel()
             for task in tasks:
                 task.cancel()
             if monitor_task:
                 monitor_task.cancel()
-            await asyncio.gather(*tasks, return_exceptions=True)
+            await asyncio.gather(*tasks, *pending_quiz_tasks, return_exceptions=True)
             if monitor_task:
                 await asyncio.gather(monitor_task, return_exceptions=True)
-            try:
-                await persist_login_cookies(context)
-            except Exception as exc:
-                logger.log_exception("刷新登录 Cookies 失败.", exc)
+            if context is not None:
+                try:
+                    await persist_login_cookies(context)
+                except Exception as exc:
+                    logger.log_exception("刷新登录 Cookies 失败.", exc)
             await session.close()
 
     logger.section("任务结束")
@@ -1863,7 +2074,7 @@ def cli() -> int:
             系统=platform.system(),
             系统版本=platform.release(),
             系统架构=platform.machine(),
-            启动参数=(f"[{' '.join(sys.argv[1:])}]" if sys.argv[1:] else "无"),
+            启动参数=redact_argv(sys.argv[1:]),
             日志文件=logger.filename,
         )
         installer.validate_python_version()
@@ -2002,6 +2213,10 @@ def cli() -> int:
             notifier.notify_error_sync(f"程序运行时出现异常：{type(exc).__name__}: {exc}")
         exit_code = 1
     finally:
+        if notifier is not None:
+            close_fn = getattr(notifier, "close", None)
+            if callable(close_fn):
+                close_fn()
         logger.save()
         if getattr(sys, "frozen", False) and sys.stdin.isatty():
             try:

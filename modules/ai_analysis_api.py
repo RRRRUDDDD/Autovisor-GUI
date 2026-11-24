@@ -36,9 +36,26 @@ def _as_int(value):
 class AiAnalysisApi:
     """封装官方 AI 解析, 失败时返回空串由调用方静默跳过."""
 
-    def __init__(self, session=None, proxy: str = ""):
-        self.session = session or requests.Session()
+    def __init__(self, session=None, proxy: str = "", *, owns_session: bool | None = None):
+        self._owns_session = (session is None) if owns_session is None else bool(owns_session)
+        self.session = session if session is not None else requests.Session()
         self.proxy = proxy
+
+    def close(self) -> None:
+        if self._owns_session and self.session is not None:
+            close_fn = getattr(self.session, "close", None)
+            if callable(close_fn):
+                try:
+                    close_fn()
+                except Exception:
+                    pass
+            self._owns_session = False
+
+    def __enter__(self) -> "AiAnalysisApi":
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        self.close()
 
     def _proxies(self):
         if not self.proxy:

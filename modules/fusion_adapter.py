@@ -214,49 +214,56 @@ class FusionAdapter:
                     await FusionAdapter.resume_video(page)
                     return True
 
+            owned_answerer = None
             if answerer is None and config is not None:
                 from modules.quiz_page import make_zhidao_answerer
 
-                answerer = await make_zhidao_answerer(page, config)
+                owned_answerer = await make_zhidao_answerer(page, config)
+                answerer = owned_answerer
 
             llm_selected = 0
-            if answerer is not None or llm.enabled():
-                try:
-                    question_roots = await page.query_selector_all(
-                        f"{AI_CLASS_EXERCISE_DIALOG} .ques-list .item"
-                    )
-                    if not question_roots:
-                        dlg = await page.query_selector(AI_CLASS_EXERCISE_DIALOG)
-                        question_roots = [dlg] if dlg else []
-                    for q_idx, root in enumerate(question_roots, 1):
-                        if await root.query_selector(".class-question-select.isSelect"):
-                            continue
-                        option_handles = await root.query_selector_all(".option")
-                        if not option_handles:
-                            continue
-                        option_texts = []
-                        for handle in option_handles:
-                            try:
-                                option_texts.append(
-                                    " ".join((await handle.inner_text()).split())
-                                )
-                            except Exception:
-                                option_texts.append("")
-                        question_text = " ".join((await root.inner_text()).split())
-                        chosen_idx = await pick_option(
-                            question_text, option_texts, answerer=answerer
+            try:
+                if answerer is not None or llm.enabled():
+                    try:
+                        question_roots = await page.query_selector_all(
+                            f"{AI_CLASS_EXERCISE_DIALOG} .ques-list .item"
                         )
-                        if chosen_idx >= 0:
-                            logger.info(
-                                f"AI 随堂练习第 {q_idx} 题使用 AI 选择: {option_texts[chosen_idx]}"
+                        if not question_roots:
+                            dlg = await page.query_selector(AI_CLASS_EXERCISE_DIALOG)
+                            question_roots = [dlg] if dlg else []
+                        for q_idx, root in enumerate(question_roots, 1):
+                            if await root.query_selector(".class-question-select.isSelect"):
+                                continue
+                            option_handles = await root.query_selector_all(".option")
+                            if not option_handles:
+                                continue
+                            option_texts = []
+                            for handle in option_handles:
+                                try:
+                                    option_texts.append(
+                                        " ".join((await handle.inner_text()).split())
+                                    )
+                                except Exception:
+                                    option_texts.append("")
+                            question_text = " ".join((await root.inner_text()).split())
+                            chosen_idx = await pick_option(
+                                question_text, option_texts, answerer=answerer
                             )
-                            await option_handles[chosen_idx].click(timeout=2000)
-                            llm_selected += 1
-                except Exception as exc:
-                    logger.debug_throttled(
-                        "fusion:ai_llm",
-                        f"大模型选题跳过: {logger.summarize_exception(exc)}",
-                    )
+                            if chosen_idx >= 0:
+                                logger.info(
+                                    f"AI 随堂练习第 {q_idx} 题使用 AI 选择: {option_texts[chosen_idx]}"
+                                )
+                                await option_handles[chosen_idx].click(timeout=2000)
+                                llm_selected += 1
+                    except Exception as exc:
+                        logger.debug_throttled(
+                            "fusion:ai_llm",
+                            f"大模型选题跳过: {logger.summarize_exception(exc)}",
+                        )
+            finally:
+                close_fn = getattr(owned_answerer, "close", None)
+                if callable(close_fn):
+                    close_fn()
 
             result = await page.evaluate(_SELECT_EACH_QUESTION_JS) or {}
             selected = int(result.get("selected") or 0)

@@ -365,6 +365,61 @@ class CasSsoTests(unittest.TestCase):
         self.assertFalse(exported["CASLOGC"]["secure"])
         self.assertFalse(exported["CASLOGC"]["httpOnly"])
 
+    def test_context_manager_clone_session_and_no_retry_strategy(self):
+        cookies = [
+            {
+                "name": "CASTGC",
+                "value": "TGT-clone-1",
+                "domain": ".zhihuishu.com",
+                "path": "/",
+            }
+        ]
+        with ZhsApiClient(cookies) as client:
+            cloned = client.clone_session()
+            try:
+                self.assertIsNot(cloned, client.session)
+                self.assertEqual(cloned.cookies.get("CASTGC"), "TGT-clone-1")
+                self.assertEqual(
+                    cloned.headers.get("User-Agent"),
+                    client.session.headers.get("User-Agent"),
+                )
+            finally:
+                cloned.close()
+
+            # ai_exam_submit 禁用 urllib3 POST 自动重试
+            self.assertFalse(zhs_api.get_strategy("ai_exam_submit").allow_retry)
+            no_retry = client._get_no_retry_session()
+            self.assertIsNot(no_retry, client.session)
+            adapter = no_retry.get_adapter("https://studentexamtest.zhihuishu.com")
+            self.assertEqual(adapter.max_retries.total, 0)
+
+    def test_execute_does_not_hold_lock_during_network_io(self):
+        client = ZhsApiClient([])
+        in_post = threading.Event()
+        release_post = threading.Event()
+        lock_acquired_concurrently = []
+
+        class _BlockingSession:
+            def post(self, url, **kwargs):
+                in_post.set()
+                release_post.wait(timeout=3.0)
+                return FakeResponse({"code": 0})
+
+        client.session = _BlockingSession()
+
+        t = threading.Thread(
+            target=lambda: client.query("home", "https://example.com/slow", {"x": 1})
+        )
+        t.start()
+        self.assertTrue(in_post.wait(timeout=2.0))
+        acquired = client.lock.acquire(blocking=False)
+        if acquired:
+            lock_acquired_concurrently.append(True)
+            client.lock.release()
+        release_post.set()
+        t.join(timeout=3.0)
+        self.assertEqual(lock_acquired_concurrently, [True])
+
 
 if __name__ == "__main__":
     unittest.main()

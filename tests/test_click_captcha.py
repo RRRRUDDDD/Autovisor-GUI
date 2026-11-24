@@ -133,6 +133,65 @@ class ClickPointTests(unittest.TestCase):
         self.assertLess(x, 140, f"should click the gray v, got {point}")
         self.assertGreater(y, 80, f"should click the lower gray v, got {point}")
 
+    def test_solve_click_captcha_async_uses_asyncio_to_thread(self):
+        import asyncio
+        from unittest.mock import AsyncMock, patch
+        from modules import click_captcha
+
+        image = self._draw_puzzle()
+        ok, buf = cv2.imencode(".png", image)
+        self.assertTrue(ok)
+        png_bytes = buf.tobytes()
+
+        class _FakeLocator:
+            async def screenshot(self, type="png"):
+                return png_bytes
+
+            async def bounding_box(self):
+                return {"x": 10.0, "y": 20.0, "width": 260.0, "height": 140.0}
+
+        clicked_points = []
+
+        async def fake_click(_target, _loc, x, y, _shape):
+            clicked_points.append((x, y))
+
+        class _FakePage:
+            async def wait_for_timeout(self, _ms):
+                return None
+
+        page = _FakePage()
+        with (
+            patch.object(
+                click_captcha,
+                "resolve_click_captcha_target",
+                AsyncMock(side_effect=[page, None]),
+            ),
+            patch(
+                "modules.tencent_slider.has_slider_thumb",
+                AsyncMock(return_value=False),
+            ),
+            patch.object(
+                click_captcha,
+                "read_instruction",
+                AsyncMock(return_value="请点击大写W颜色一样的数字4"),
+            ),
+            patch.object(
+                click_captcha,
+                "find_puzzle_image",
+                AsyncMock(return_value=_FakeLocator()),
+            ),
+            patch.object(
+                click_captcha,
+                "click_image_point",
+                side_effect=fake_click,
+            ),
+        ):
+            solved = asyncio.run(
+                click_captcha.solve_click_captcha(page, [np, cv2], attempts=1)
+            )
+        self.assertTrue(solved)
+        self.assertEqual(len(clicked_points), 1)
+
 
 if __name__ == "__main__":
     unittest.main()

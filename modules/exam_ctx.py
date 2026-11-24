@@ -386,6 +386,7 @@ class ExamApi(zhs_api.ZhsApiClient):
         content_type: str = "form",
         set_timestamp: bool = True,
         extra_fields: dict | None = None,
+        allow_retry: bool = True,
     ) -> dict:
         """兼容旧方法签名: 按调用参数临时构造策略后走统一 query 流程."""
         strategy = zhs_api.QueryStrategy(
@@ -394,8 +395,16 @@ class ExamApi(zhs_api.ZhsApiClient):
             content_type=content_type,
             ok_field="code",
             ok_value=ok_code,
+            allow_retry=allow_retry,
         )
-        return self.execute(strategy, url, data, method=method, extra_fields=extra_fields)
+        return self.execute(
+            strategy,
+            url,
+            data,
+            method=method,
+            extra_fields=extra_fields,
+            allow_retry=allow_retry,
+        )
 
     def query_strategy(
         self, strategy_name: str, url: str, data: dict, method: str = "POST", **kwargs
@@ -447,10 +456,34 @@ class ExamApi(zhs_api.ZhsApiClient):
 class ZhidaoAnswerer:
     """智慧树自带 AI 答题通道(大明白 dmb-chat 流式接口, 优先级高于自定义大模型)."""
 
-    def __init__(self, session: requests.Session, lock=None, timeout: int = 60):
+    def __init__(
+        self,
+        session: requests.Session,
+        lock=None,
+        timeout: int = 60,
+        *,
+        owns_session: bool = False,
+    ):
         self.session = session
         self.lock = lock
         self.timeout = timeout
+        self._owns_session = bool(owns_session)
+
+    def close(self) -> None:
+        if self._owns_session and self.session is not None:
+            close_fn = getattr(self.session, "close", None)
+            if callable(close_fn):
+                try:
+                    close_fn()
+                except Exception:
+                    pass
+            self._owns_session = False
+
+    def __enter__(self) -> "ZhidaoAnswerer":
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        self.close()
 
     @staticmethod
     def _parse_sse_payload(payload: dict) -> tuple[str, str | None, bool]:
@@ -593,6 +626,7 @@ class AiExamBase(ABC):
         op_extra: dict | None = None,
         answer_bank: AnswerBank | None = None,
         question_bank=None,
+        cancel_event: threading.Event | None = None,
     ):
         self.api = api
         self.course_id = course_id
@@ -603,17 +637,84 @@ class AiExamBase(ABC):
         self.answer_bank = answer_bank or AnswerBank(course_id)
         self.question_bank = question_bank
         self._question_bank_ready = question_bank is not None
+        self._owns_question_bank = False
+        self.cancel_event = cancel_event
         self.reference_materials: list[dict] = []
         self.sheet_content: list | None = None
         self._stopped = threading.Event()
         self._heartbeat: threading.Thread | None = None
-        self.zhidao_answerer = ZhidaoAnswerer(
-            api.session, lock=getattr(api, "lock", None)
-        )
+        self._heartbeat_lock = threading.Lock()
+        self._failed_saves = 0
+        clone_fn = getattr(api, "clone_session", None)
+        api_session = getattr(api, "session", None)
+        if callable(clone_fn) and isinstance(api_session, requests.Session):
+            ai_session = clone_fn()
+            self.zhidao_answerer = ZhidaoAnswerer(
+                ai_session, lock=None, owns_session=True
+            )
+        else:
+            self.zhidao_answerer = ZhidaoAnswerer(
+                api_session, lock=None, owns_session=False
+            )
         self.deepseek_answerer = DeepSeekAnswerer(getattr(api, "proxy", ""))
         self._last_ai_provider = ""
         self._llm_disabled = False
         self._llm_warned = False
+
+    def close(self) -> None:
+        self._stop_heartbeat()
+        close_ai = getattr(self.zhidao_answerer, "close", None)
+        if callable(close_ai):
+            try:
+                close_ai()
+            except Exception:
+                pass
+        if self._owns_question_bank and self.question_bank is not None:
+            close_qb = getattr(self.question_bank, "close", None)
+            if callable(close_qb):
+                try:
+                    close_qb()
+                except Exception:
+                    pass
+            self._owns_question_bank = False
+
+    def __enter__(self) -> "AiExamBase":
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        self.close()
+
+    def _is_cancelled(self) -> bool:
+        return self.cancel_event is not None and self.cancel_event.is_set()
+
+    def _sleep_or_cancel(self, seconds: float) -> bool:
+        if self.cancel_event is not None:
+            return self.cancel_event.wait(seconds)
+        time.sleep(seconds)
+        return False
+
+    def _ensure_heartbeat(self) -> None:
+        """启动考试计时心跳线程；已有存活心跳线程时绝不重复拉起。"""
+        with self._heartbeat_lock:
+            if self._heartbeat is not None and self._heartbeat.is_alive():
+                return
+            self._stopped.clear()
+            self._heartbeat = threading.Thread(
+                target=self._update_used_time,
+                daemon=True,
+                name=f"exam-heartbeat-{self.exam_test_id}",
+            )
+            self._heartbeat.start()
+
+    def _stop_heartbeat(self, timeout: float = 2.0) -> None:
+        self._stopped.set()
+        with self._heartbeat_lock:
+            hb = self._heartbeat
+        if hb is not None and hb.is_alive() and hb is not threading.current_thread():
+            hb.join(timeout=timeout)
+        with self._heartbeat_lock:
+            if self._heartbeat is hb and (hb is None or not hb.is_alive()):
+                self._heartbeat = None
 
     def open_exam(self, tried: int = 0) -> None:
         data = {
@@ -621,15 +722,17 @@ class AiExamBase(ABC):
             "examPaperId": self.exam_paper_id,
             "courseId": self.course_id,
         }
-        try:
-            self.api.query(EXAM_OPEN, data)
-        except Exception as exc:
-            if tried < 3:
-                logger.warn(f"打开考试失败, 重试第 {tried + 1} 次: {exc}")
-                return self.open_exam(tried + 1)
-            raise
-        self._heartbeat = threading.Thread(target=self._update_used_time, daemon=True)
-        self._heartbeat.start()
+        max_attempts = 4
+        for attempt in range(max(0, tried), max_attempts):
+            try:
+                self.api.query(EXAM_OPEN, data)
+                break
+            except Exception as exc:
+                if attempt + 1 >= max_attempts or self._is_cancelled():
+                    raise
+                logger.warn(f"打开考试失败, 重试第 {attempt + 1} 次: {exc}")
+                self._sleep_or_cancel(min(2.0, 0.5 * (2 ** (attempt - max(0, tried)))))
+        self._ensure_heartbeat()
 
     def _update_used_time(self, heartbeat_seconds: int = 10) -> None:
         data = {
@@ -637,7 +740,7 @@ class AiExamBase(ABC):
             "examPaperId": self.exam_paper_id,
             "heartbeatTime": heartbeat_seconds,
         }
-        while not self._stopped.is_set():
+        while not self._stopped.is_set() and not self._is_cancelled():
             try:
                 self.api.query(EXAM_USED_TIME, data)
             except Exception as exc:
@@ -651,15 +754,18 @@ class AiExamBase(ABC):
             "examTestId": self.exam_test_id,
             "examPaperId": self.exam_paper_id,
         }
-        try:
-            ret = self.api.query(EXAM_SHEET, data, method="GET")
-            self.sheet_content = ret["data"]["partSheetVos"][0]["questionSheetVos"]
-        except Exception as exc:
-            if tried < 3:
-                logger.warn(f"读取试卷失败, 重试第 {tried + 1} 次: {exc}")
-                return self.get_sheet_content(tried + 1)
-            raise
-        return self.sheet_content
+        max_attempts = 4
+        for attempt in range(max(0, tried), max_attempts):
+            try:
+                ret = self.api.query(EXAM_SHEET, data, method="GET")
+                self.sheet_content = ret["data"]["partSheetVos"][0]["questionSheetVos"]
+                return self.sheet_content
+            except Exception as exc:
+                if attempt + 1 >= max_attempts or self._is_cancelled():
+                    raise
+                logger.warn(f"读取试卷失败, 重试第 {attempt + 1} 次: {exc}")
+                self._sleep_or_cancel(min(2.0, 0.5 * (2 ** (attempt - max(0, tried)))))
+        return self.sheet_content or []
 
     def get_question_content(self, question_id, version: int, tried: int = 0) -> dict | None:
         data = {
@@ -668,15 +774,18 @@ class AiExamBase(ABC):
             "questionId": question_id,
             "version": version,
         }
-        try:
-            ret = self.api.query(EXAM_QUESTION, data, method="GET")
-            return ret.get("data")
-        except Exception as exc:
-            if tried < 3:
-                logger.debug(f"读取题目失败, 重试第 {tried + 1} 次: {exc}")
-                return self.get_question_content(question_id, version, tried + 1)
-            logger.error(f"读取题目失败: {question_id} {exc}")
-            return None
+        max_attempts = 4
+        for attempt in range(max(0, tried), max_attempts):
+            try:
+                ret = self.api.query(EXAM_QUESTION, data, method="GET")
+                return ret.get("data")
+            except Exception as exc:
+                if attempt + 1 >= max_attempts or self._is_cancelled():
+                    logger.error(f"读取题目失败: {question_id} {exc}")
+                    return None
+                logger.debug(f"读取题目失败, 重试第 {attempt + 1} 次: {exc}")
+                self._sleep_or_cancel(min(1.5, 0.3 * (2 ** (attempt - max(0, tried)))))
+        return None
 
     def save_answer(self, question_id, answers: list, question_type=None) -> bool:
         if not answers:
@@ -699,6 +808,7 @@ class AiExamBase(ABC):
         return True
 
     def submit_exam(self, tried: int = 0) -> None:
+        """非幂等交卷接口：禁用 urllib3 POST 重试，绝不盲目递归重发。"""
         data = {
             "examTestId": self.exam_test_id,
             "courseId": self.course_id,
@@ -707,12 +817,10 @@ class AiExamBase(ABC):
             "aiKnlowledgeId": self.knowledge_id,
         }
         try:
-            self.api.query(EXAM_SUBMIT, data)
-        except Exception:
-            if tried < 3:
-                logger.warn(f"交卷失败, 重试第 {tried + 1} 次.")
-                return self.submit_exam(tried + 1)
-            raise
+            if isinstance(self.api, ExamApi):
+                self.api.query(EXAM_SUBMIT, data, allow_retry=False)
+            else:
+                self.api.query(EXAM_SUBMIT, data)
         finally:
             self._stopped.set()
 
@@ -725,9 +833,11 @@ class AiExamBase(ABC):
             self.question_bank = QuestionBankClient.from_config(
                 proxy=getattr(self.api, "proxy", "")
             )
+            self._owns_question_bank = self.question_bank is not None
         except Exception as exc:
             logger.debug(f"初始化外部题库失败: {exc}")
             self.question_bank = None
+            self._owns_question_bank = False
         return self.question_bank
 
     def _bank_reference(self, question: dict, question_type, choices: list[dict]) -> str:
@@ -885,7 +995,7 @@ class AiExamBase(ABC):
 
         cached_ids = self._cached_answer(question, question_id, version, valid_ids)
         if cached_ids:
-            time.sleep(random.uniform(1.5, 3.0))
+            self._sleep_or_cancel(random.uniform(1.5, 3.0))
             return cached_ids, "题库"
 
         if question_type == 3 and not choices:
@@ -903,7 +1013,7 @@ class AiExamBase(ABC):
             return self._generate_answer(question_type, question, choices), "AI"
         except Exception as exc:
             logger.warn(f"题目 {question_id} AI 作答失败, 改为随机: {exc}")
-        time.sleep(random.uniform(1.5, 3.0))
+        self._sleep_or_cancel(random.uniform(1.5, 3.0))
         if question_type == 2:
             return select_random_answers(choices, 2), "随机"
         return select_random_answers(choices, 1), "随机"
@@ -932,6 +1042,8 @@ class AiExamBase(ABC):
             answers,
             question_type=content.get("questionType", item.get("questionType")),
         )
+        if not saved:
+            self._failed_saves += 1
         self._log_answer(item, content, answers, source, index, total, saved)
         return saved
 
@@ -973,8 +1085,12 @@ class AiExamBase(ABC):
     ) -> tuple[bool, int, int]:
         """执行一次完整作答: 取卷 -> 答题 -> 收尾 (交卷/批量提交)."""
         self.reference_materials = reference_materials or []
+        self._failed_saves = 0
         self._stopped.clear()
         try:
+            if self._is_cancelled():
+                logger.warn(f"检测到取消信号, 跳过{self.exam_label}作答.")
+                return False, 0, 0
             self.answer_bank.load(self.exam_test_id)
             self._open()
             sheets = self._fetch_sheet_items()
@@ -986,7 +1102,10 @@ class AiExamBase(ABC):
             logger.event(f"{self.exam_label}开始", 试卷=self.exam_paper_id, 题目=total)
             self._answer_questions(sheets)
             flushed = self._flush_pending()
-            if submit and (not flushed or getattr(self, "_failed_saves", 0)):
+            if self._is_cancelled():
+                logger.warn("任务已取消, 放弃自动交卷并保留已保存答案.")
+                submit = False
+            elif submit and (not flushed or getattr(self, "_failed_saves", 0)):
                 logger.warn("存在未成功保存的答案, 为避免丢失作答放弃自动交卷.")
                 logger.event(
                     "接口考试",
@@ -996,8 +1115,9 @@ class AiExamBase(ABC):
                 submit = False
             return self._finish(submit, sheets)
         finally:
-            self._stopped.set()
+            self._stop_heartbeat()
             self._log_bank_stats()
+            self.close()
 
     def _log_bank_stats(self) -> None:
         bank = self.question_bank
@@ -1011,6 +1131,9 @@ class AiExamBase(ABC):
     def _answer_questions(self, sheets: list) -> None:
         total = len(sheets)
         for index, item in enumerate(sheets, 1):
+            if self._is_cancelled():
+                logger.warn(f"检测到取消信号, 已在第 {index}/{total} 题前提前退出接口答题.")
+                break
             content = self.get_question_content(
                 item["questionId"], item.get("version", 1)
             )
@@ -1133,6 +1256,7 @@ class AiFormalExamCtx(AiExamBase):
         save_nums: int = 5,
         auto_submit: bool = False,
         question_bank=None,
+        cancel_event: threading.Event | None = None,
     ):
         super().__init__(
             api,
@@ -1143,6 +1267,7 @@ class AiFormalExamCtx(AiExamBase):
             op_extra,
             answer_bank,
             question_bank,
+            cancel_event=cancel_event,
         )
         self.class_id = class_id or ""
         self.task_id = task_id or ""
@@ -1164,6 +1289,7 @@ class AiFormalExamCtx(AiExamBase):
         op_extra: dict | None = None,
         answer_bank: AnswerBank | None = None,
         question_bank=None,
+        cancel_event: threading.Event | None = None,
     ) -> "AiFormalExamCtx":
         def pick(*keys):
             for key in keys:
@@ -1186,6 +1312,7 @@ class AiFormalExamCtx(AiExamBase):
             save_nums=save_nums,
             auto_submit=auto_submit,
             question_bank=question_bank,
+            cancel_event=cancel_event,
         )
 
     def start(
@@ -1228,15 +1355,17 @@ class AiFormalExamCtx(AiExamBase):
     def open_exam(self, tried: int = 0) -> None:
         """综合考试 openExam 不传 examPaperId, 且必须先拉卷."""
         data = {"examTestId": self.exam_test_id, "courseId": self.course_id}
-        try:
-            self.api.query_strategy("ai_exam", EXAM_OPEN, data)
-        except Exception as exc:
-            if tried < 3:
-                logger.warn(f"打开考试失败, 重试第 {tried + 1} 次: {exc}")
-                return self.open_exam(tried + 1)
-            raise
-        self._heartbeat = threading.Thread(target=self._update_used_time, daemon=True)
-        self._heartbeat.start()
+        max_attempts = 4
+        for attempt in range(max(0, tried), max_attempts):
+            try:
+                self.api.query_strategy("ai_exam", EXAM_OPEN, data)
+                break
+            except Exception as exc:
+                if attempt + 1 >= max_attempts or self._is_cancelled():
+                    raise
+                logger.warn(f"打开考试失败, 重试第 {attempt + 1} 次: {exc}")
+                self._sleep_or_cancel(min(2.0, 0.5 * (2 ** (attempt - max(0, tried)))))
+        self._ensure_heartbeat()
 
     def _open(self) -> None:
         self.start_pull_paper()
@@ -1247,21 +1376,24 @@ class AiFormalExamCtx(AiExamBase):
         if self.sheet_content is not None:
             return self.sheet_content
         data = {"examTestId": self.exam_test_id, "examPaperId": self.exam_paper_id}
-        try:
-            ret = self.api.query_strategy(
-                "ai_exam", FORMAL_ANSWER_SHEET, data, method="GET"
-            )
-            parts = ret["data"]["partSheetVos"] or []
-            items: list = []
-            for part in parts:
-                items.extend((part or {}).get("questionSheetVos") or [])
-            self.sheet_content = items
-        except Exception as exc:
-            if tried < 3:
-                logger.warn(f"读取答题卡失败, 重试第 {tried + 1} 次: {exc}")
-                return self.get_sheet_content(tried + 1)
-            raise
-        return self.sheet_content
+        max_attempts = 4
+        for attempt in range(max(0, tried), max_attempts):
+            try:
+                ret = self.api.query_strategy(
+                    "ai_exam", FORMAL_ANSWER_SHEET, data, method="GET"
+                )
+                parts = ret["data"]["partSheetVos"] or []
+                items: list = []
+                for part in parts:
+                    items.extend((part or {}).get("questionSheetVos") or [])
+                self.sheet_content = items
+                return self.sheet_content
+            except Exception as exc:
+                if attempt + 1 >= max_attempts or self._is_cancelled():
+                    raise
+                logger.warn(f"读取答题卡失败, 重试第 {attempt + 1} 次: {exc}")
+                self._sleep_or_cancel(min(2.0, 0.5 * (2 ** (attempt - max(0, tried)))))
+        return self.sheet_content or []
 
     def _fetch_sheet_items(self) -> list:
         return self.get_sheet_content()
@@ -1333,6 +1465,7 @@ class AiFormalExamCtx(AiExamBase):
 
     # ------------------------------------------------------------------ 交卷
     def submit_exam(self, tried: int = 0) -> bool:
+        """非幂等交卷接口：禁用 urllib3 POST 重试，绝不盲目递归重发。"""
         data = {
             "examTestId": self.exam_test_id,
             "recruitId": str(self.course_id),
@@ -1340,11 +1473,6 @@ class AiFormalExamCtx(AiExamBase):
         }
         try:
             self.api.query_strategy("ai_exam_submit", EXAM_SUBMIT, data)
-        except Exception:
-            if tried < 3:
-                logger.warn(f"交卷失败, 重试第 {tried + 1} 次.")
-                return self.submit_exam(tried + 1)
-            raise
         finally:
             self._stopped.set()
         return True
@@ -1446,6 +1574,7 @@ class ExamRunner:
         op_extra: dict | None = None,
         bank: AnswerBank | None = None,
         enable_ppt: bool = True,
+        cancel_event: threading.Event | None = None,
     ):
         self.course_id = course_id
         self.class_id = class_id
@@ -1455,15 +1584,22 @@ class ExamRunner:
         self.op_extra = op_extra or {}
         self.bank = bank or AnswerBank(course_id)
         self.enable_ppt = bool(enable_ppt)
+        self.cancel_event = cancel_event
         self.extractor = PptExtractor(
             proxy=getattr(api, "proxy", ""),
             session=getattr(api, "session", None),
         )
         self._materials: dict[str, list[dict]] = {}
 
+    def _is_cancelled(self) -> bool:
+        return self.cancel_event is not None and self.cancel_event.is_set()
+
     def run(self, nodes: list[dict], deadline: float | None = None) -> dict:
         summary = {"done": [], "skipped": [], "failed": []}
         for index, node in enumerate(nodes, 1):
+            if self._is_cancelled():
+                logger.warn("接口考试收到取消信号, 停止剩余知识点.")
+                break
             if deadline is not None and time.monotonic() >= deadline:
                 logger.warn("接口考试达到时限, 停止剩余知识点.")
                 break
@@ -1518,6 +1654,8 @@ class ExamRunner:
 
     def _run_node(self, knowledge_id, name: str, extra: dict, deadline) -> str:
         for attempt in range(1, self.max_attempts + 1):
+            if self._is_cancelled():
+                return "failed"
             if deadline is not None and time.monotonic() >= deadline:
                 return "failed"
             paper = self.api.query_paper(self.course_id, self.class_id, knowledge_id)
@@ -1546,6 +1684,7 @@ class ExamRunner:
                 exam_paper_id=paper["paperId"],
                 op_extra=extra,
                 answer_bank=self.bank,
+                cancel_event=self.cancel_event,
             )
             try:
                 success, correct, total = ctx.start(
@@ -1553,6 +1692,8 @@ class ExamRunner:
                 )
             except Exception as exc:
                 logger.log_exception(f"知识点「{name}」考试异常.", exc)
+                return "failed"
+            if self._is_cancelled():
                 return "failed"
             logger.info(
                 f"知识点「{name}」第 {attempt}/{self.max_attempts} 轮结束: "
@@ -1565,7 +1706,12 @@ class ExamRunner:
                 得分=f"{correct}/{total}",
                 全对=success,
             )
-            time.sleep(random.uniform(0.8, 1.6))
+            wait_sec = random.uniform(0.8, 1.6)
+            if self.cancel_event is not None:
+                if self.cancel_event.wait(wait_sec):
+                    return "failed"
+            else:
+                time.sleep(wait_sec)
         return "failed"
 
 
@@ -1590,6 +1736,9 @@ async def answer_review_exam_page(page, config=None) -> bool:
         proxy=getattr(config, "proxy", "") if config is not None else "",
         user_agent=user_agent,
     )
+    cancel_event = getattr(config, "_cancel_event", None) if config is not None else None
+    if cancel_event is None:
+        cancel_event = threading.Event()
     ctx = ExamCtx(
         api,
         info.get("courseId") or "review",
@@ -1597,14 +1746,22 @@ async def answer_review_exam_page(page, config=None) -> bool:
         info["examTestId"],
         info["paperId"],
         op_extra={"knowledgePoint": info.get("nodeName") or "", "来源": "复习考试"},
+        cancel_event=cancel_event,
     )
     logger.event("复习考试接口作答", 试卷=info["paperId"], 考试=info["examTestId"])
     try:
-        success, correct, total = await asyncio.to_thread(ctx.start)
-    except Exception as exc:
-        logger.log_exception("复习考试接口作答失败.", exc)
-        logger.warn("复习考试未能通过接口完成, 请手动检查并交卷.")
-        return True
+        try:
+            success, correct, total = await asyncio.to_thread(ctx.start)
+        except asyncio.CancelledError:
+            cancel_event.set()
+            raise
+        except Exception as exc:
+            logger.log_exception("复习考试接口作答失败.", exc)
+            logger.warn("复习考试未能通过接口完成, 请手动检查并交卷.")
+            return True
+    finally:
+        ctx.close()
+        api.close()
     logger.info(
         f"复习/模拟考试接口作答完成: 得分 {correct}/{total}"
         + (" (全对)" if success else "")

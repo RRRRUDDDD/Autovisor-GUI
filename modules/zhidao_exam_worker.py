@@ -81,6 +81,9 @@ class ZhidaoExamWorker(ZhidaoHomeworkWorker):
         for exam in self.scan(
             flag=1, recruit_id=effective_recruit, course_id=course_id
         ):
+            if self._is_cancelled():
+                logger.warn("知到正式考试收到取消信号, 停止剩余考试.")
+                break
             exam_id = exam.get("examId", "")
             stu_exam_id = exam.get("studentExamId", "")
             exam_name = exam.get("examName", "")
@@ -232,12 +235,17 @@ class ZhidaoExamWorker(ZhidaoHomeworkWorker):
 
         exam_key = str(exam_id)
         for question in questions:
+            if self._is_cancelled():
+                logger.warn("知到正式考试收到取消信号, 提前退出答题循环.")
+                return stats
             existing = self._find_row(question, exam_key, course_id=course_id)
             remembered = self._remember_question(question, exam_key, course_id=course_id)
             row = self._merge_row(remembered, existing)
             values, source = self._answer_question(question, row)
             if source in ("题库", "随机", "排除法"):
-                self.sleep(random.uniform(1.5, 3.0))
+                if self._wait_sleep(random.uniform(1.5, 3.0)):
+                    logger.warn("知到正式考试收到取消信号, 提前退出答题循环.")
+                    return stats
             self._save_answer(
                 question=question,
                 values=values,
@@ -253,6 +261,9 @@ class ZhidaoExamWorker(ZhidaoHomeworkWorker):
                 f"考试作答 {question['eid']}({source}): {question.get('content', '')[:40]}"
             )
 
+        if self._is_cancelled():
+            logger.warn("知到正式考试收到取消信号, 放弃自动交卷.")
+            return stats
         if not self.auto_submit:
             logger.info("考试答案已保存, 请手动交卷 (data/llm.json 中 auto_submit=true 可自动交卷).")
             return stats

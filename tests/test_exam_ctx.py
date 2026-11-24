@@ -568,5 +568,87 @@ class ExamRunnerReferenceTests(unittest.TestCase):
         self.assertEqual(extractor.calls[0][1], "测试课程")
 
 
+class Phase2ExamCtxHardeningTests(unittest.TestCase):
+    def test_homework_ctx_tracks_failed_saves_and_skips_submit(self):
+        directory = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, directory, True)
+        bank = AnswerBank("course-fail", base_dir=directory)
+        api = ExamApi([])
+        ctx = ExamCtx(api, "course-fail", "k-1", "t-1", "p-1", answer_bank=bank)
+        ctx.zhidao_answerer = StubAnswerer(result=[11])
+        question_data = {
+            "id": 501,
+            "questionType": 1,
+            "content": "<p>测试题</p>",
+            "optionVos": [
+                {"id": 11, "content": "A"},
+                {"id": 12, "content": "B"},
+            ],
+        }
+        with (
+            patch.object(ctx, "open_exam"),
+            patch.object(
+                ctx,
+                "get_sheet_content",
+                return_value=[{"questionId": 501, "version": 1}],
+            ),
+            patch.object(ctx, "get_question_content", return_value=dict(question_data)),
+            patch.object(ctx, "save_answer", return_value=False),
+            patch.object(ctx, "submit_exam") as submit_mock,
+        ):
+            success, correct, total = ctx.start(submit=True)
+        self.assertFalse(success)
+        self.assertEqual(correct, 0)
+        self.assertEqual(total, 1)
+        self.assertEqual(ctx._failed_saves, 1)
+        submit_mock.assert_not_called()
+        api.close()
+
+    def test_submit_exam_does_not_retry_recursively_on_error(self):
+        calls = []
+
+        class _FailSubmitApi(ExamApi):
+            def query(self, url, data, **kwargs):
+                calls.append((url, kwargs.get("allow_retry")))
+                raise RuntimeError("read timed out")
+
+        api = _FailSubmitApi([])
+        ctx = ExamCtx(api, "c1", "k1", "t1", "p1")
+        with self.assertRaises(RuntimeError):
+            ctx.submit_exam()
+        self.assertEqual(len(calls), 1)
+        self.assertIs(calls[0][1], False)
+        ctx.close()
+        api.close()
+
+    def test_open_exam_deduplicates_heartbeat_and_joins_on_close(self):
+        class _OkApi:
+            session = None
+            proxy = ""
+
+            def query(self, url, data, **kwargs):
+                return {"code": 0, "data": {}}
+
+        ctx = ExamCtx(_OkApi(), "c1", "k1", "t1", "p1")
+        ctx.open_exam()
+        first_hb = ctx._heartbeat
+        self.assertIsNotNone(first_hb)
+        self.assertTrue(first_hb.is_alive())
+        # 重复调用 open_exam 不应拉起第二个心跳线程
+        ctx.open_exam()
+        self.assertIs(ctx._heartbeat, first_hb)
+        ctx.close()
+        self.assertFalse(first_hb.is_alive())
+
+    def test_ai_exam_base_gives_zhidao_answerer_isolated_session(self):
+        with ExamApi([{"name": "CASTGC", "value": "TGT-iso", "domain": ".zhihuishu.com"}]) as api:
+            with ExamCtx(api, "c1", "k1", "t1", "p1") as ctx:
+                self.assertIsNot(ctx.zhidao_answerer.session, api.session)
+                self.assertIsNone(ctx.zhidao_answerer.lock)
+                self.assertEqual(
+                    ctx.zhidao_answerer.session.cookies.get("CASTGC"), "TGT-iso"
+                )
+
+
 if __name__ == "__main__":
     unittest.main()

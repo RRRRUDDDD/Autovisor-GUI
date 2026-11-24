@@ -215,3 +215,34 @@ class CourseRunnerTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIs(result, CourseOutcome.TIME_LIMIT)
         self.assertEqual(review.await_count, 2)
+
+    async def test_task_monitor_skips_cancelled_tasks_without_raising(self):
+        from modules.tasks import task_monitor
+
+        async def _sleeper():
+            await asyncio.sleep(60)
+
+        t = asyncio.create_task(_sleeper())
+        t.cancel()
+        await asyncio.gather(t, return_exceptions=True)
+        # 取消后的任务已完成且 cancelled()==True，task_monitor 不应抛出 CancelledError
+        await task_monitor([t])
+
+    async def test_batch_catalog_status_single_evaluate_all(self):
+        from modules.lesson_navigation import WISDOM_CATALOG, batch_catalog_status
+
+        locator = Mock()
+        locator.evaluate_all = AsyncMock(
+            return_value=[
+                {"key": '[0,"id-1","第一节"]', "finished": True, "rawProgress": 100},
+                {"key": '[1,"id-2","第二节"]', "finished": False, "rawProgress": "42%"},
+            ]
+        )
+        page = Mock()
+        page.locator = Mock(return_value=locator)
+        statuses = await batch_catalog_status(page, WISDOM_CATALOG)
+        self.assertEqual(
+            statuses,
+            [('[0,"id-1","第一节"]', 100), ('[1,"id-2","第二节"]', 42)],
+        )
+        locator.evaluate_all.assert_awaited_once()

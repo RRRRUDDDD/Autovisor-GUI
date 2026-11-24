@@ -636,7 +636,12 @@ def fetch_courses_via_api(
         display_name = str(
             caslogc.get("realName") or caslogc.get("username") or ""
         ).strip()
-        school_name = str(caslogc.get("schoolName") or "").strip()
+        school_name = str(
+            caslogc.get("schoolName")
+            or caslogc.get("universityName")
+            or caslogc.get("collegeName")
+            or ""
+        ).strip()
         session_valid = False
 
         # 1) 用户基础信息（补充姓名 / 学校 / uuid）
@@ -678,7 +683,13 @@ def fetch_courses_via_api(
                     or display_name
                 )
                 school_name = (
-                    str(u_res.get("schoolName") or "").strip() or school_name
+                    str(
+                        u_res.get("schoolName")
+                        or u_res.get("universityName")
+                        or u_res.get("collegeName")
+                        or ""
+                    ).strip()
+                    or school_name
                 )
         except Exception as exc:
             if logger:
@@ -860,11 +871,7 @@ def fetch_courses_via_api(
                     logger.debug(f"API 拉取翻转/校内课列表失败: {exc}")
 
         merged = dedupe_courses(zhidao_courses + ai_courses + hike_courses)
-        if not school_name:
-            for item in merged:
-                if item.school:
-                    school_name = item.school
-                    break
+        # 注意: 不得回退读取课程条目的 school 字段, 共享课/慕课的 school 是开课高校而非学生本人就读学校.
 
         exported_cookies = []
         if own_client:
@@ -888,7 +895,7 @@ def fetch_courses_via_api(
     finally:
         if own_client:
             try:
-                client.session.close()
+                client.close()
             except Exception:
                 pass
 
