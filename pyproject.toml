@@ -36,7 +36,7 @@ build = ["pyinstaller==6.13.0"]
 package = false
 
 [tool.setuptools.dynamic]
-version = { attr = "modules.version.__version__" }
+version = { attr = "modules.version.__engine_version__" }
 
 [tool.setuptools]
 py-modules = []

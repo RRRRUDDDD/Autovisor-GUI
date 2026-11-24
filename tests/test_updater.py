@@ -5,7 +5,7 @@ import unittest
 import requests
 
 from modules import updater
-from modules.version import __gui_version__, __version__
+from modules.version import __engine_version__, __gui_version__, __version__
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -328,12 +328,13 @@ class VersionSourceTests(unittest.TestCase):
         with open(os.path.join(PROJECT_ROOT, "pyproject.toml"), "r", encoding="utf-8") as file:
             content = file.read()
         self.assertIn('dynamic = ["version"]', content)
-        self.assertIn('attr = "modules.version.__version__"', content)
+        self.assertIn('attr = "modules.version.__engine_version__"', content)
         self.assertIsNone(
             re.search(r'^version\s*=\s*"', content, re.MULTILINE),
             "pyproject.toml 不应再写死 version",
         )
         self.assertEqual(updater.__version__, __version__)
+        self.assertEqual(__engine_version__, "3.21.0")
         self.assertEqual(__version__, "3.21.0(Autovisor GUI Edition)")
         self.assertEqual(__gui_version__, "1.2.0")
 
