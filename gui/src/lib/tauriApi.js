@@ -67,6 +67,7 @@ const mockState = {
       },
     ],
     session: null,
+    savedLogin: null,
   },
   config: {
     ...defaultConfig(),
@@ -143,6 +144,46 @@ async function call(cmd, args = {}) {
       mockState.runtime.cookieExists = true;
       mockState.runtime.cookieCount = 12;
       mockState.runtime.session = profile;
+      if (req.mode && req.mode !== 'cookie') {
+        const prevSaved = mockState.runtime.savedLogin || {
+          loginMode: 'phone',
+          rememberPhone: false,
+          phoneUsername: '',
+          phonePassword: '',
+          rememberStudent: false,
+          schoolId: '',
+          schoolName: '',
+          studentId: '',
+          studentPassword: '',
+        };
+        const nextSaved = { ...prevSaved, loginMode: req.mode };
+        if (req.mode === 'phone') {
+          if (req.rememberCredentials) {
+            nextSaved.rememberPhone = true;
+            nextSaved.phoneUsername = String(req.username || '').trim();
+            nextSaved.phonePassword = String(req.password || '');
+          } else {
+            nextSaved.rememberPhone = false;
+            nextSaved.phoneUsername = '';
+            nextSaved.phonePassword = '';
+          }
+        } else if (req.mode === 'student') {
+          if (req.rememberCredentials) {
+            nextSaved.rememberStudent = true;
+            nextSaved.schoolId = String(req.schoolId || '').trim();
+            nextSaved.schoolName = String(req.schoolName || '').trim();
+            nextSaved.studentId = String(req.studentId || '').trim();
+            nextSaved.studentPassword = String(req.password || '');
+          } else {
+            nextSaved.rememberStudent = false;
+            nextSaved.schoolId = '';
+            nextSaved.schoolName = '';
+            nextSaved.studentId = '';
+            nextSaved.studentPassword = '';
+          }
+        }
+        mockState.runtime.savedLogin = nextSaved;
+      }
       mockState.config.courses = structuredClone(MOCK_DISCOVERED_COURSES);
       return {
         profile: structuredClone(profile),
@@ -175,6 +216,29 @@ async function call(cmd, args = {}) {
       mockState.runtime.cookieCount = 0;
       mockState.runtime.session = null;
       return structuredClone(mockState.runtime);
+    case 'clear_saved_login': {
+      const m = String(args.mode || '').trim();
+      if (m === 'phone' && mockState.runtime.savedLogin) {
+        mockState.runtime.savedLogin = {
+          ...mockState.runtime.savedLogin,
+          rememberPhone: false,
+          phoneUsername: '',
+          phonePassword: '',
+        };
+      } else if (m === 'student' && mockState.runtime.savedLogin) {
+        mockState.runtime.savedLogin = {
+          ...mockState.runtime.savedLogin,
+          rememberStudent: false,
+          schoolId: '',
+          schoolName: '',
+          studentId: '',
+          studentPassword: '',
+        };
+      } else {
+        mockState.runtime.savedLogin = null;
+      }
+      return structuredClone(mockState.runtime);
+    }
     case 'load_config':
       return structuredClone(mockState.config);
     case 'save_config':
@@ -352,6 +416,7 @@ export const tauriApi = {
   cancelZhsLogin: () => call('cancel_zhs_login'),
   refreshCourses: () => call('refresh_courses'),
   logoutZhs: () => call('logout_zhs'),
+  clearSavedLogin: (mode = '') => call('clear_saved_login', { mode: mode || null }),
   pickBrowserExe: () => call('pick_browser_exe'),
   pickCookieFile: () => call('pick_cookie_file'),
   pickDirectory: () => call('pick_directory'),

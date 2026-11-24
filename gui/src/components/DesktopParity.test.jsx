@@ -13,7 +13,7 @@ describe('Desktop Parity features (Phases 1-6)', () => {
     vi.restoreAllMocks();
   });
 
-  it('keeps masteryTarget visible when enableMastery=false and enableExamApi=true, and hides when both are false', () => {
+  it('keeps masteryTarget visible in SettingsView when enableMastery=false and enableExamApi=true, and hides when both are false', () => {
     const baseCfg = {
       ...defaultConfig(),
       enableMastery: false,
@@ -21,25 +21,21 @@ describe('Desktop Parity features (Phases 1-6)', () => {
       courses: [],
     };
     const { rerender } = render(
-      <WorkspaceView
+      <SettingsView
         config={baseCfg}
         onChangeConfig={() => {}}
         runtime={{}}
-        runState={{ status: 'idle' }}
-        onStartStudy={() => {}}
-        onReturnToProgress={() => {}}
+        onListLogFiles={vi.fn().mockResolvedValue([])}
       />
     );
     expect(screen.getByLabelText('掌握度目标（%）')).toBeTruthy();
 
     rerender(
-      <WorkspaceView
+      <SettingsView
         config={{ ...baseCfg, enableMastery: false, enableExamApi: false }}
         onChangeConfig={() => {}}
         runtime={{}}
-        runState={{ status: 'idle' }}
-        onStartStudy={() => {}}
-        onReturnToProgress={() => {}}
+        onListLogFiles={vi.fn().mockResolvedValue([])}
       />
     );
     expect(screen.queryByLabelText('掌握度目标（%）')).toBeNull();
@@ -188,7 +184,7 @@ describe('Desktop Parity features (Phases 1-6)', () => {
     });
     const onTestQuestionBank = vi.fn().mockResolvedValue('题库连接正常, 剩余 5 次');
     const onExportQuestionCache = vi.fn().mockResolvedValue('C:\\out.json');
-    const onImportQuestionCache = vi.fn().mockResolvedValue({ questions: 3, answers: 4 });
+    const onImportQuestionCache = vi.fn().mockResolvedValue({ zhidao_questions: 3, ai_questions: 4 });
     const onClearQuestionCache = vi
       .fn()
       .mockResolvedValueOnce({ zhidao_questions: 5, ai_questions: 2, json_files: 1 })
@@ -224,6 +220,9 @@ describe('Desktop Parity features (Phases 1-6)', () => {
     fireEvent.click(screen.getByRole('checkbox', { name: /知到作业优先走加密 API/ }));
     expect(cfg.enableHomeworkApi).toBe(false);
 
+    fireEvent.click(screen.getByRole('checkbox', { name: /已作答保存的题目仍重新作答/ }));
+    expect(cfg.forceRedoAnswered).toBe(true);
+
     fireEvent.change(screen.getByLabelText('作业达标得分率（%）'), {
       target: { value: '85' },
     });
@@ -243,7 +242,7 @@ describe('Desktop Parity features (Phases 1-6)', () => {
 
     fireEvent.click(screen.getByRole('button', { name: '导入题库缓存' }));
     expect(
-      await screen.findByText('题库缓存导入完成：题目 3，答案 4')
+      await screen.findByText('题库缓存导入完成：知到题 3 条，AI 题 4 条')
     ).toBeTruthy();
 
     fireEvent.click(screen.getByRole('button', { name: '清理题库缓存' }));
@@ -376,5 +375,72 @@ describe('Desktop Parity features (Phases 1-6)', () => {
 
     unmount();
     expect(cancelQrSpy).toHaveBeenCalledWith('qr-test-1');
+  });
+
+  it('prefills remembered student and phone login info and supports clearing remembered credentials', async () => {
+    vi.spyOn(tauriApi, 'listenLoginStatus').mockResolvedValue(() => {});
+    const onClearSavedLogin = vi.fn().mockResolvedValue(undefined);
+    const zhsLoginSpy = vi.spyOn(tauriApi, 'zhsLogin').mockResolvedValue({
+      profile: { loggedIn: true, displayName: '学生甲', schoolName: '清华大学' },
+      courses: [],
+      cookieCount: 5,
+    });
+    const onLoginSuccess = vi.fn().mockResolvedValue(undefined);
+
+    render(
+      <LoginView
+        runtime={{
+          cookieExists: false,
+          detectedBrowsers: [
+            { id: 'chrome', name: 'Google Chrome', driver: 'Chrome', exePath: '/usr/bin/chrome' },
+          ],
+          savedLogin: {
+            loginMode: 'student',
+            rememberPhone: true,
+            phoneUsername: '13900139000',
+            phonePassword: 'phone-pass',
+            rememberStudent: true,
+            schoolId: '1001',
+            schoolName: '清华大学',
+            studentId: '20240088',
+            studentPassword: 'stu-pass',
+          },
+        }}
+        config={defaultConfig()}
+        onLoginSuccess={onLoginSuccess}
+        onClearSavedLogin={onClearSavedLogin}
+      />
+    );
+
+    // Defaults to last remembered student mode with school, studentId, password prefilled
+    expect(screen.getByLabelText('学校').value).toBe('清华大学');
+    expect(screen.getByLabelText('大学学号').value).toBe('20240088');
+    expect(screen.getByLabelText('密码').value).toBe('stu-pass');
+    expect(screen.getByRole('checkbox', { name: /记住学校、学号和密码/ }).checked).toBe(true);
+
+    // Submits student login with rememberCredentials=true
+    fireEvent.click(screen.getByRole('button', { name: /登录并自动识别课程/ }));
+    await waitFor(() => expect(zhsLoginSpy).toHaveBeenCalledTimes(1));
+    expect(zhsLoginSpy.mock.calls[0][0]).toMatchObject({
+      mode: 'student',
+      schoolId: '1001',
+      schoolName: '清华大学',
+      studentId: '20240088',
+      password: 'stu-pass',
+      rememberCredentials: true,
+    });
+
+    // Switch to phone tab: phone credentials are also independently prefilled
+    fireEvent.click(screen.getByRole('tab', { name: '手机号登录' }));
+    expect(screen.getByLabelText('手机号').value).toBe('13900139000');
+    expect(screen.getByLabelText('密码').value).toBe('phone-pass');
+    expect(screen.getByRole('checkbox', { name: /记住账号密码/ }).checked).toBe(true);
+
+    // Clear remembered phone credentials
+    fireEvent.click(screen.getByRole('button', { name: '清除已记住' }));
+    await waitFor(() => expect(onClearSavedLogin).toHaveBeenCalledWith('phone'));
+    expect(screen.getByLabelText('手机号').value).toBe('');
+    expect(screen.getByLabelText('密码').value).toBe('');
+    expect(screen.getByRole('checkbox', { name: /记住账号密码/ }).checked).toBe(false);
   });
 });

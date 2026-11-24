@@ -1,8 +1,33 @@
 import { inferLlmProvider, normalizeLlmApiFormat } from './llmProviders';
 
 const URL_PATTERN = /^https:\/\/[-A-Za-z0-9+&@#/%?=~_|!:,.;]+[-A-Za-z0-9+&@#/%=~_|]$/i;
-const HTTP_URL_PATTERN = /^https?:\/\/[^\s/]+/i;
-const PROXY_PATTERN = /^(https?|socks5h?):\/\/[^\s/]+/i;
+const PROXY_SCHEMES = new Set(['http:', 'https:', 'socks5:', 'socks5h:']);
+
+function parseStrictUrl(raw, allowedSchemes) {
+  const trimmed = String(raw || '').trim();
+  if (!trimmed) return { empty: true, ok: true };
+  if (/[\s\u0000-\u001f\u007f]/.test(trimmed)) return { empty: false, ok: false };
+  try {
+    const rawUrl = new URL(trimmed);
+    const protocol = rawUrl.protocol.toLowerCase();
+    if (!allowedSchemes.has(protocol)) return { empty: false, ok: false };
+    // Normalize socks5/socks5h to http: so WHATWG URL parser strictly validates hostname & port range (1..65535)
+    const normalizedForAuthority =
+      protocol === 'socks5:' || protocol === 'socks5h:'
+        ? new URL(trimmed.replace(/^socks5h?:/i, 'http:'))
+        : rawUrl;
+    if (!normalizedForAuthority.hostname) return { empty: false, ok: false };
+    if (normalizedForAuthority.port) {
+      const portNum = Number(normalizedForAuthority.port);
+      if (!Number.isInteger(portNum) || portNum < 1 || portNum > 65535) {
+        return { empty: false, ok: false };
+      }
+    }
+    return { empty: false, ok: true };
+  } catch {
+    return { empty: false, ok: false };
+  }
+}
 
 export const NOTIFICATION_PROVIDERS = [
   { value: '', label: '不使用通知', hint: '' },
@@ -101,6 +126,7 @@ export function defaultConfig() {
     homeworkThreshold: 100,
     homeworkMaxRedo: 3,
     enableFormalExamApi: true,
+    forceRedoAnswered: false,
     logMaxSizeMb: 10,
     logRetentionDays: 14,
     logMaxFiles: 200,
@@ -121,15 +147,11 @@ export function isValidCourseUrl(raw) {
 }
 
 export function isValidProxyUrl(raw) {
-  const trimmed = String(raw || '').trim();
-  if (!trimmed) return true;
-  return PROXY_PATTERN.test(trimmed);
+  return parseStrictUrl(raw, PROXY_SCHEMES).ok;
 }
 
 export function isValidLlmApiBase(raw) {
-  const trimmed = String(raw || '').trim();
-  if (!trimmed) return true;
-  return HTTP_URL_PATTERN.test(trimmed);
+  return parseStrictUrl(raw, new Set(['http:', 'https:'])).ok;
 }
 
 export function detectCourseType(rawUrl) {
@@ -332,6 +354,7 @@ export function normalizeConfig(raw) {
         : 3,
     enableFormalExamApi:
       raw.enableFormalExamApi !== undefined ? Boolean(raw.enableFormalExamApi) : true,
+    forceRedoAnswered: Boolean(raw.forceRedoAnswered),
     logMaxSizeMb:
       Number.isFinite(logMaxSizeMb) && logMaxSizeMb > 0 ? Math.round(logMaxSizeMb) : 10,
     logRetentionDays:

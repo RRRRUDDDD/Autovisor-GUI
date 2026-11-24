@@ -42,9 +42,9 @@ describe('App UI flows', () => {
     expect(screen.getByText('高等数学（上）')).toBeTruthy();
     expect(screen.getByText('人工智能导论')).toBeTruthy();
     expect(screen.getByText(/已选 2 \/ 共 2/)).toBeTruthy();
-    expect(screen.getByText('AI 智慧课自动刷掌握度')).toBeTruthy();
-    expect(screen.getByLabelText('掌握度目标（%）')).toBeTruthy();
     expect(screen.getByText('复习模式（刷习惯分）')).toBeTruthy();
+    expect(screen.getByText('刷课任务完成后自动关机')).toBeTruthy();
+    expect(screen.queryByText('AI 智慧课自动刷掌握度')).toBeNull();
     expect(screen.queryByText('运行环境与进阶配置')).toBeNull();
     const studyRegion = screen.getByRole('region', { name: '任务参数' });
     const studySwitches = Array.from(studyRegion.querySelectorAll('input[type="checkbox"]')).map((el) => el.id);
@@ -53,24 +53,20 @@ describe('App UI flows', () => {
       'enableAutoCaptcha',
       'soundOff',
       'enableHideWindow',
-      'enableZhidaoQuiz',
-      'enableMastery',
-      'enableExamApi',
-      'enableReviewExamApi',
+      'shutdownOnComplete',
     ]);
     fireEvent.click(screen.getByRole('checkbox', { name: /复习模式（刷习惯分）/ }));
     expect(screen.getByRole('button', { name: '开始复习刷分' })).toBeTruthy();
     fireEvent.click(screen.getByRole('checkbox', { name: /复习模式（刷习惯分）/ }));
     expect(screen.getByRole('button', { name: '开始刷课' })).toBeTruthy();
 
-    // 4. Navigates to 系统设置, verifies LLM, notification, Cookie & history log cards, and toggles dark theme from rail
+    // 4. Navigates to 系统设置, verifies swapped order (答题增强与题库 before 大模型智能答题), moved AI mastery controls, notification, Cookie & history log cards, and toggles dark theme from rail
     fireEvent.click(screen.getByText('系统设置'));
     expect(screen.getByText('AI 答题、浏览器、推送通知与凭证日志')).toBeTruthy();
     const settingsHeadings = screen.getAllByRole('heading', { level: 2 }).map((el) => el.textContent);
     expect(settingsHeadings).toEqual([
-      '大模型智能答题',
       '答题增强与题库',
-      '完成后关机',
+      '大模型智能答题',
       '桌面窗口',
       '浏览器与网络',
       '消息推送通知',
@@ -78,6 +74,9 @@ describe('App UI flows', () => {
       '历史运行日志',
       '运行环境与版本',
     ]);
+    expect(screen.getByText('AI 智慧课自动刷掌握度')).toBeTruthy();
+    expect(screen.getByLabelText('掌握度目标（%）')).toBeTruthy();
+    expect(screen.getByText('已作答保存的题目仍重新作答')).toBeTruthy();
     expect(screen.getByText('消息推送通知')).toBeTruthy();
     expect(screen.getByLabelText('通知服务').value).toBe('Windows');
     expect(screen.queryByLabelText('通知 URL')).toBeNull();

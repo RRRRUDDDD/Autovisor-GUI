@@ -47,31 +47,74 @@ const LoginView = ({
   onPickBrowserExe,
   onImportCookies,
   onSaveProxy,
+  onClearSavedLogin,
 }) => {
+  const savedLogin = runtime?.savedLogin || null;
+  const savedMode = savedLogin?.loginMode || runtime?.session?.loginMode || '';
   const initialMode =
-    runtime?.session?.loginMode === 'student'
+    savedMode === 'student'
       ? 'student'
-      : runtime?.session?.loginMode === 'qrcode'
+      : savedMode === 'qrcode'
         ? 'qrcode'
         : 'phone';
 
-  const [mode, setMode] = useState(initialMode);
-  const [username, setUsername] = useState(() => config?.username || '');
-  const [password, setPassword] = useState('');
-  const [schoolQuery, setSchoolQuery] = useState(() => runtime?.session?.schoolName || '');
-  const [selectedSchool, setSelectedSchool] = useState(() =>
-    runtime?.session?.schoolName
-      ? { schoolId: runtime.session.schoolId || '', name: runtime.session.schoolName }
-      : null
+  const hasSavedPhone = Boolean(
+    savedLogin?.rememberPhone && (savedLogin?.phoneUsername || savedLogin?.phonePassword)
   );
+  const hasSavedStudent = Boolean(
+    savedLogin?.rememberStudent &&
+      (savedLogin?.schoolName || savedLogin?.studentId || savedLogin?.studentPassword)
+  );
+  const fallbackConfigPhone = Boolean(
+    !savedLogin && config?.username && config?.password
+  );
+
+  const [mode, setMode] = useState(initialMode);
+  const [username, setUsername] = useState(() =>
+    hasSavedPhone ? savedLogin.phoneUsername || '' : config?.username || ''
+  );
+  const [phonePassword, setPhonePassword] = useState(() =>
+    hasSavedPhone
+      ? savedLogin.phonePassword || ''
+      : fallbackConfigPhone
+        ? config?.password || ''
+        : ''
+  );
+  const [schoolQuery, setSchoolQuery] = useState(() =>
+    hasSavedStudent
+      ? savedLogin.schoolName || ''
+      : runtime?.session?.schoolName || ''
+  );
+  const [selectedSchool, setSelectedSchool] = useState(() => {
+    if (hasSavedStudent && savedLogin.schoolName) {
+      return { schoolId: savedLogin.schoolId || '', name: savedLogin.schoolName };
+    }
+    if (runtime?.session?.schoolName) {
+      return { schoolId: runtime.session.schoolId || '', name: runtime.session.schoolName };
+    }
+    return null;
+  });
   const [schoolOptions, setSchoolOptions] = useState([]);
   const [schoolLoading, setSchoolLoading] = useState(false);
   const [schoolDropdownOpen, setSchoolDropdownOpen] = useState(false);
   const [studentId, setStudentId] = useState(() =>
-    runtime?.session?.loginMode === 'student' ? runtime?.session?.account || '' : ''
+    hasSavedStudent
+      ? savedLogin.studentId || ''
+      : runtime?.session?.loginMode === 'student'
+        ? runtime?.session?.account || ''
+        : ''
+  );
+  const [studentPassword, setStudentPassword] = useState(() =>
+    hasSavedStudent ? savedLogin.studentPassword || '' : ''
   );
   const [showPassword, setShowPassword] = useState(false);
-  const [rememberCredentials, setRememberCredentials] = useState(false);
+  const [rememberCredentials, setRememberCredentials] = useState(
+    () => hasSavedPhone || fallbackConfigPhone
+  );
+  const [rememberStudentCredentials, setRememberStudentCredentials] = useState(
+    () => hasSavedStudent
+  );
+  const [clearingSaved, setClearingSaved] = useState(false);
   const [proxyInput, setProxyInput] = useState(() => config?.proxy || '');
   const [showProxyInput, setShowProxyInput] = useState(() => Boolean(config?.proxy));
   const [loading, setLoading] = useState(false);
@@ -94,6 +137,9 @@ const LoginView = ({
   const mountedRef = useRef(true);
   const qrSessionIdRef = useRef('');
   const qrPollTimerRef = useRef(null);
+  const qrAttemptIdRef = useRef(0);
+  const modeRef = useRef(mode);
+  modeRef.current = mode;
 
   const proxyValid = isValidProxyUrl(proxyInput);
   const effectiveProxy = proxyValid ? proxyInput.trim() : '';
@@ -119,6 +165,7 @@ const LoginView = ({
   }, []);
 
   const cancelActiveQrSession = useCallback(() => {
+    qrAttemptIdRef.current += 1;
     stopQrPolling();
     const sid = qrSessionIdRef.current;
     qrSessionIdRef.current = '';
@@ -207,7 +254,10 @@ const LoginView = ({
       try {
         const res = await tauriApi.zhsLogin(request);
         if (!mountedRef.current) return;
-        setPassword('');
+        if (!request?.rememberCredentials) {
+          if (request?.mode === 'phone') setPhonePassword('');
+          else if (request?.mode === 'student') setStudentPassword('');
+        }
         await onLoginSuccess(res);
       } catch (err) {
         if (!mountedRef.current) return;
@@ -271,6 +321,7 @@ const LoginView = ({
 
   const startInAppQrLogin = useCallback(async () => {
     cancelActiveQrSession();
+    const attempt = ++qrAttemptIdRef.current;
     setError('');
     setQrState({
       loading: true,
@@ -283,7 +334,11 @@ const LoginView = ({
     });
     try {
       const res = await tauriApi.startQrLogin(effectiveProxy, '');
-      if (!mountedRef.current) {
+      if (
+        !mountedRef.current ||
+        qrAttemptIdRef.current !== attempt ||
+        modeRef.current !== 'qrcode'
+      ) {
         if (res?.sessionId) void tauriApi.cancelQrLogin(res.sessionId).catch(() => {});
         return;
       }
@@ -304,10 +359,24 @@ const LoginView = ({
       });
 
       const pollOnce = async () => {
-        if (!mountedRef.current || qrSessionIdRef.current !== sid) return;
+        if (
+          !mountedRef.current ||
+          qrAttemptIdRef.current !== attempt ||
+          qrSessionIdRef.current !== sid ||
+          modeRef.current !== 'qrcode'
+        ) {
+          return;
+        }
         try {
           const pollRes = await tauriApi.pollQrLogin(sid);
-          if (!mountedRef.current || qrSessionIdRef.current !== sid) return;
+          if (
+            !mountedRef.current ||
+            qrAttemptIdRef.current !== attempt ||
+            qrSessionIdRef.current !== sid ||
+            modeRef.current !== 'qrcode'
+          ) {
+            return;
+          }
           const st = pollRes?.status || 'waiting';
           if (st === 'confirmed') {
             qrSessionIdRef.current = '';
@@ -329,7 +398,14 @@ const LoginView = ({
           setQrState((prev) => ({ ...prev, status: st }));
           qrPollTimerRef.current = setTimeout(pollOnce, 1500);
         } catch (err) {
-          if (!mountedRef.current || qrSessionIdRef.current !== sid) return;
+          if (
+            !mountedRef.current ||
+            qrAttemptIdRef.current !== attempt ||
+            qrSessionIdRef.current !== sid ||
+            modeRef.current !== 'qrcode'
+          ) {
+            return;
+          }
           qrSessionIdRef.current = '';
           stopQrPolling();
           setQrState((prev) => ({
@@ -342,7 +418,13 @@ const LoginView = ({
 
       qrPollTimerRef.current = setTimeout(pollOnce, 1500);
     } catch (err) {
-      if (!mountedRef.current) return;
+      if (
+        !mountedRef.current ||
+        qrAttemptIdRef.current !== attempt ||
+        modeRef.current !== 'qrcode'
+      ) {
+        return;
+      }
       setQrState({
         loading: false,
         sessionId: '',
@@ -444,7 +526,7 @@ const LoginView = ({
         setError('请输入手机号或账号');
         return;
       }
-      if (!password) {
+      if (!phonePassword) {
         setError('请输入登录密码');
         return;
       }
@@ -458,7 +540,7 @@ const LoginView = ({
         setError('请输入大学学号');
         return;
       }
-      if (!password) {
+      if (!studentPassword) {
         setError('请输入学号登录密码');
         return;
       }
@@ -475,11 +557,46 @@ const LoginView = ({
       schoolId: mode === 'student' ? selectedSchool?.schoolId || '' : '',
       schoolName: mode === 'student' ? (selectedSchool?.name || schoolQuery).trim() : '',
       studentId: mode === 'student' ? studentId.trim() : '',
-      password: mode === 'qrcode' ? '' : password,
+      password: mode === 'phone' ? phonePassword : mode === 'student' ? studentPassword : '',
       browserExe: activeBrowser?.exePath || config?.exePath || '',
       proxy: trimmedProxy,
-      rememberCredentials: mode === 'phone' && rememberCredentials,
+      rememberCredentials:
+        mode === 'phone'
+          ? rememberCredentials
+          : mode === 'student'
+            ? rememberStudentCredentials
+            : false,
     });
+  };
+
+  const handleClearRemembered = async (targetMode) => {
+    if (clearingSaved || loading) return;
+    setClearingSaved(true);
+    try {
+      if (onClearSavedLogin) {
+        await onClearSavedLogin(targetMode);
+      } else {
+        await tauriApi.clearSavedLogin(targetMode);
+      }
+      if (!mountedRef.current) return;
+      if (targetMode === 'phone') {
+        setUsername('');
+        setPhonePassword('');
+        setRememberCredentials(false);
+      } else if (targetMode === 'student') {
+        setSchoolQuery('');
+        setSelectedSchool(null);
+        setStudentId('');
+        setStudentPassword('');
+        setRememberStudentCredentials(false);
+      }
+    } catch (err) {
+      if (mountedRef.current) {
+        setError(err?.message || String(err) || '清除已记住的账号密码失败');
+      }
+    } finally {
+      if (mountedRef.current) setClearingSaved(false);
+    }
   };
 
   const handleCancelLogin = async () => {
@@ -567,10 +684,12 @@ const LoginView = ({
                       aria-selected={active}
                       disabled={loading}
                       onClick={() => {
+                        modeRef.current = tab.id;
                         if (mode === 'qrcode' && tab.id !== 'qrcode') {
                           cancelActiveQrSession();
                           setQrState((prev) => ({
                             ...prev,
+                            loading: false,
                             status: 'idle',
                             sessionId: '',
                             imageBase64: '',
@@ -627,9 +746,9 @@ const LoginView = ({
                           type={showPassword ? 'text' : 'password'}
                           autoComplete="current-password"
                           placeholder="请输入密码"
-                          value={password}
+                          value={phonePassword}
                           disabled={loading}
-                          onChange={(e) => setPassword(e.target.value)}
+                          onChange={(e) => setPhonePassword(e.target.value)}
                           className="pr-11"
                         />
                         <button
@@ -643,17 +762,29 @@ const LoginView = ({
                         </button>
                       </div>
                     </div>
-                    <label className="flex cursor-pointer items-center gap-2.5 pt-0.5 text-xs text-on-surface-variant">
-                      <input
-                        id="login-remember-credentials"
-                        type="checkbox"
-                        checked={rememberCredentials}
-                        disabled={loading}
-                        onChange={(e) => setRememberCredentials(e.target.checked)}
-                        className="h-4 w-4 rounded accent-primary"
-                      />
-                      <span>记住账号密码（挂机中途掉线时自动重登）</span>
-                    </label>
+                    <div className="flex flex-wrap items-center justify-between gap-2 pt-0.5">
+                      <label className="flex cursor-pointer items-center gap-2.5 text-xs text-on-surface-variant">
+                        <input
+                          id="login-remember-credentials"
+                          type="checkbox"
+                          checked={rememberCredentials}
+                          disabled={loading}
+                          onChange={(e) => setRememberCredentials(e.target.checked)}
+                          className="h-4 w-4 rounded accent-primary"
+                        />
+                        <span>记住账号密码（下次自动填充，掉线时自动重登）</span>
+                      </label>
+                      {hasSavedPhone && (
+                        <button
+                          type="button"
+                          disabled={loading || clearingSaved}
+                          onClick={() => void handleClearRemembered('phone')}
+                          className="rounded-full px-2 py-0.5 text-[11px] font-medium text-on-surface-variant hover:bg-on-surface/[0.06] hover:text-error disabled:opacity-50"
+                        >
+                          清除已记住
+                        </button>
+                      )}
+                    </div>
                   </>
                 )}
 
@@ -765,9 +896,9 @@ const LoginView = ({
                           type={showPassword ? 'text' : 'password'}
                           autoComplete="current-password"
                           placeholder="请输入密码"
-                          value={password}
+                          value={studentPassword}
                           disabled={loading}
-                          onChange={(e) => setPassword(e.target.value)}
+                          onChange={(e) => setStudentPassword(e.target.value)}
                           className="pr-11"
                         />
                         <button
@@ -780,6 +911,30 @@ const LoginView = ({
                           {showPassword ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
                         </button>
                       </div>
+                    </div>
+
+                    <div className="flex flex-wrap items-center justify-between gap-2 pt-0.5">
+                      <label className="flex cursor-pointer items-center gap-2.5 text-xs text-on-surface-variant">
+                        <input
+                          id="login-remember-student-credentials"
+                          type="checkbox"
+                          checked={rememberStudentCredentials}
+                          disabled={loading}
+                          onChange={(e) => setRememberStudentCredentials(e.target.checked)}
+                          className="h-4 w-4 rounded accent-primary"
+                        />
+                        <span>记住学校、学号和密码（下次打开自动填充）</span>
+                      </label>
+                      {hasSavedStudent && (
+                        <button
+                          type="button"
+                          disabled={loading || clearingSaved}
+                          onClick={() => void handleClearRemembered('student')}
+                          className="rounded-full px-2 py-0.5 text-[11px] font-medium text-on-surface-variant hover:bg-on-surface/[0.06] hover:text-error disabled:opacity-50"
+                        >
+                          清除已记住
+                        </button>
+                      )}
                     </div>
                   </>
                 )}
@@ -1093,8 +1248,10 @@ const LoginView = ({
             <span className="inline-flex items-center gap-1.5">
               <KeyRound className="h-3.5 w-3.5" aria-hidden="true" />
               {mode === 'phone' && rememberCredentials
-                ? '凭证保存在本机 data/cookies.json；已勾选记住密码，登录成功后将保存至本机 config.ini'
-                : '密码默认不落盘；仅在勾选记住密码时保存在本机 config.ini'}
+                ? '凭证保存在本机 data/cookies.json；已勾选记住登录信息，登录成功后自动保存'
+                : mode === 'student' && rememberStudentCredentials
+                  ? '凭证保存在本机 data/cookies.json；已勾选记住学校与学号密码，下次打开自动填充'
+                  : '密码默认不落盘；仅在勾选记住登录信息后保存在本机'}
             </span>
             {!loading && !importingCookies && (
               <button

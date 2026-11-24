@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react';
+import { memo, useEffect, useMemo, useRef, useState } from 'react';
 import {
   Loader2,
   ArrowLeft,
@@ -13,10 +13,19 @@ import {
   FolderOpen,
   RotateCcw,
   Power,
+  Settings2,
+  LogOut,
+  ChevronDown,
+  ChevronUp,
 } from 'lucide-react';
 import Button from './ui/Button';
 import ExecutionLog from './ExecutionLog';
 import { ScheduledShutdownBanner, ShutdownStatusText } from './ShutdownBanner';
+import { diagnoseAttention, diagnoseRunError } from '../lib/errorDiagnosis';
+import { useRunState } from '../lib/runStateStore';
+
+const EMPTY_LOGS = [];
+const EMPTY_COMPLETED_LESSONS = [];
 
 function formatElapsed(startSec, endSec) {
   if (!startSec) return '--';
@@ -28,6 +37,19 @@ function formatElapsed(startSec, endSec) {
   if (h > 0) return `${h}时 ${String(m).padStart(2, '0')}分 ${String(s).padStart(2, '0')}秒`;
   return `${m}分 ${String(s).padStart(2, '0')}秒`;
 }
+
+const ElapsedTimer = memo(function ElapsedTimer({ startedAt, finishedAt, running }) {
+  const [nowTick, setNowTick] = useState(() => Date.now() / 1000);
+
+  useEffect(() => {
+    if (!running || finishedAt) return undefined;
+    setNowTick(Date.now() / 1000);
+    const timer = setInterval(() => setNowTick(Date.now() / 1000), 1000);
+    return () => clearInterval(timer);
+  }, [running, finishedAt]);
+
+  return formatElapsed(startedAt, finishedAt || (running ? nowTick : null));
+});
 
 function formatStartTime(sec) {
   if (!sec) return '--';
@@ -42,34 +64,40 @@ const MODE_LABELS = {
   import_cookies: '导入智慧树 Cookie',
 };
 
-const ProgressView = ({
-  runState,
+const ProgressView = memo(function ProgressView({
+  runState: runStateProp,
   config,
   onBack,
   onStop,
   onRestart,
   onOpenPath,
+  onOpenSettings,
+  onRelogin,
   onCancelShutdown,
   onToggleDebugLog,
   stopping = false,
   cancellingShutdown = false,
   cancelShutdownError = '',
-}) => {
+}) {
+  const storeRunState = useRunState();
+  const runState = runStateProp !== undefined ? runStateProp : storeRunState;
   const [stopConfirming, setStopConfirming] = useState(false);
-  const [nowTick, setNowTick] = useState(() => Date.now() / 1000);
+  const [showErrorDetail, setShowErrorDetail] = useState(false);
   const stopConfirmTimer = useRef(null);
 
   const status = runState?.status || 'idle';
-  const running = status === 'running';
+  const isStoppingState = status === 'stopping';
+  const effectiveStopping = stopping || isStoppingState;
+  const running = status === 'running' || isStoppingState;
   const isReviewMode = runState?.mode === 'study' && Boolean(runState?.reviewMode);
   const terminal = ['completed', 'error', 'cancelled', 'time_limit'].includes(status);
-  const hasLogs = (runState?.logs?.length || 0) > 0;
-
-  useEffect(() => {
-    if (!running) return undefined;
-    const timer = setInterval(() => setNowTick(Date.now() / 1000), 1000);
-    return () => clearInterval(timer);
-  }, [running]);
+  const logs = runState?.logs || EMPTY_LOGS;
+  const hasLogs = logs.length > 0;
+  const errorDiagnosis = useMemo(() => diagnoseRunError(runState), [runState]);
+  const attentionInfo = useMemo(
+    () => (status === 'running' ? diagnoseAttention(runState?.needsAttention) : null),
+    [status, runState?.needsAttention]
+  );
 
   useEffect(() => {
     return () => {
@@ -86,7 +114,7 @@ const ProgressView = ({
   };
 
   const handleStopClick = async () => {
-    if (stopping || !running) return;
+    if (effectiveStopping || !running) return;
     if (!stopConfirming) {
       setStopConfirming(true);
       stopConfirmTimer.current = setTimeout(() => {
@@ -121,8 +149,14 @@ const ProgressView = ({
 
   const statusMeta = (() => {
     switch (status) {
+      case 'stopping':
+        return {
+          text: '正在停止',
+          badgeCls: 'bg-surface-container-highest text-on-surface-variant',
+          icon: Loader2,
+        };
       case 'running':
-        return stopping
+        return effectiveStopping
           ? {
               text: '正在停止',
               badgeCls: 'bg-surface-container-highest text-on-surface-variant',
@@ -172,7 +206,7 @@ const ProgressView = ({
   const courseTotal =
     runState?.courseTotal || (config?.courses || []).filter((c) => c.enabled).length;
   const courseIndex = runState?.courseIndex || 0;
-  const completedLessons = runState?.completedLessons || [];
+  const completedLessons = runState?.completedLessons || EMPTY_COMPLETED_LESSONS;
   const shutdownInfo = runState?.shutdown || null;
   const shutdownScheduled = shutdownInfo?.state === 'scheduled';
   const shutdownCancelled = shutdownInfo?.state === 'cancelled';
@@ -191,7 +225,7 @@ const ProgressView = ({
             className={`inline-flex items-center gap-1.5 rounded-full px-3 py-1 text-xs font-semibold ${statusMeta.badgeCls}`}
           >
             <statusMeta.icon
-              className={`h-3.5 w-3.5 ${running && stopping ? 'animate-spin' : ''}`}
+              className={`h-3.5 w-3.5 ${running && effectiveStopping ? 'animate-spin' : ''}`}
               aria-hidden="true"
             />
             {statusMeta.text}
@@ -210,14 +244,14 @@ const ProgressView = ({
               size="sm"
               onClick={handleStopClick}
               onBlur={clearStopConfirm}
-              disabled={stopping}
+              disabled={effectiveStopping}
             >
-              {stopping ? (
+              {effectiveStopping ? (
                 <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden="true" />
               ) : (
                 <StopCircle className="h-3.5 w-3.5" aria-hidden="true" />
               )}
-              {stopping ? '正在停止' : stopConfirming ? '确认停止' : '停止任务'}
+              {effectiveStopping ? '正在停止' : stopConfirming ? '确认停止' : '停止任务'}
             </Button>
           )}
           {terminal && runState?.mode === 'study' && (
@@ -293,19 +327,153 @@ const ProgressView = ({
       )}
 
       {/* 需要用户介入提醒 */}
-      {running && runState?.needsAttention && (
+      {attentionInfo && (
         <div
           role="alert"
           className="flex items-start gap-3 rounded-[24px] bg-warning-container px-5 py-4 text-sm text-on-warning-container animate-fade-in"
         >
           <ShieldAlert className="mt-0.5 h-5 w-5 shrink-0" aria-hidden="true" />
+          <div className="min-w-0 space-y-1">
+            <p className="font-semibold">{attentionInfo.title}</p>
+            <p className="text-[13px] leading-relaxed opacity-95">{attentionInfo.message}</p>
+            <p className="text-xs leading-relaxed opacity-80">{attentionInfo.hint}</p>
+          </div>
+        </div>
+      )}
+
+      {/* 达到单课时长上限（正常结束说明，避免误判为异常） */}
+      {status === 'time_limit' && !errorDiagnosis && (
+        <div
+          role="status"
+          className="flex items-start gap-3 rounded-[24px] bg-warning-container/70 px-5 py-4 text-sm text-on-warning-container animate-fade-in"
+        >
+          <Clock className="mt-0.5 h-5 w-5 shrink-0" aria-hidden="true" />
           <div className="min-w-0">
-            <p className="font-semibold">需要留意浏览器窗口</p>
-            <p className="mt-0.5 text-[13px] leading-relaxed opacity-90">
-              {runState.needsAttention}
+            <p className="font-semibold">已达到单门课程时长上限（正常结束）</p>
+            <p className="mt-0.5 text-xs leading-relaxed opacity-90">
+              本轮已按「学习参数」中设定的时长上限自动停止，并非异常报错；如需继续学完剩余课时，可调大或设为 0（不限制）后再次运行。
             </p>
           </div>
         </div>
+      )}
+
+      {/* 分类化异常诊断与处理指引卡片 */}
+      {errorDiagnosis && (
+        <section
+          role="alert"
+          aria-label="任务异常诊断"
+          className={`rounded-[24px] p-5 animate-fade-in ${
+            errorDiagnosis.severity === 'warning'
+              ? 'bg-warning-container/85 text-on-warning-container'
+              : 'bg-error-container text-on-error-container'
+          }`}
+        >
+          <div className="flex flex-wrap items-start justify-between gap-3">
+            <div className="flex min-w-0 items-start gap-3">
+              <AlertCircle className="mt-0.5 h-5 w-5 shrink-0" aria-hidden="true" />
+              <div className="min-w-0">
+                <div className="flex flex-wrap items-center gap-2">
+                  <span className="rounded-full bg-surface/85 px-2.5 py-0.5 text-[11px] font-semibold text-on-surface">
+                    {errorDiagnosis.badge}
+                  </span>
+                  {runState?.exitCode !== null &&
+                    runState?.exitCode !== undefined &&
+                    runState.exitCode !== 0 && (
+                      <span className="font-mono text-[11px] opacity-80 tnum">
+                        退出码 {runState.exitCode}
+                      </span>
+                    )}
+                </div>
+                <h2 className="mt-1.5 text-sm font-semibold">{errorDiagnosis.title}</h2>
+                <p className="mt-1 text-xs leading-relaxed opacity-90">
+                  {errorDiagnosis.summary}
+                </p>
+              </div>
+            </div>
+          </div>
+
+          {errorDiagnosis.steps?.length > 0 && (
+            <div className="mt-3.5 rounded-2xl bg-surface/65 px-4 py-3 text-on-surface">
+              <p className="text-xs font-semibold text-on-surface">建议处理步骤</p>
+              <ol className="mt-1.5 list-decimal space-y-1 pl-4 text-xs leading-relaxed text-on-surface-variant">
+                {errorDiagnosis.steps.map((step, idx) => (
+                  <li key={idx}>{step}</li>
+                ))}
+              </ol>
+            </div>
+          )}
+
+          <div className="mt-3.5 flex flex-wrap items-center justify-between gap-2">
+            <div className="flex flex-wrap items-center gap-2">
+              {errorDiagnosis.actions.includes('relogin') && onRelogin && (
+                <Button size="sm" onClick={onRelogin}>
+                  <LogOut className="h-3.5 w-3.5" aria-hidden="true" />
+                  重新登录
+                </Button>
+              )}
+              {errorDiagnosis.actions.includes('settings') && onOpenSettings && (
+                <Button size="sm" variant="tonal" onClick={onOpenSettings}>
+                  <Settings2 className="h-3.5 w-3.5" aria-hidden="true" />
+                  前往系统设置
+                </Button>
+              )}
+              {errorDiagnosis.actions.includes('courses') && onBack && (
+                <Button size="sm" variant="tonal" onClick={onBack}>
+                  <ArrowLeft className="h-3.5 w-3.5" aria-hidden="true" />
+                  返回课程队列
+                </Button>
+              )}
+              {errorDiagnosis.actions.includes('restart') &&
+                terminal &&
+                runState?.mode === 'study' &&
+                onRestart && (
+                  <Button size="sm" variant="tonal" onClick={onRestart}>
+                    <RotateCcw className="h-3.5 w-3.5" aria-hidden="true" />
+                    再次运行
+                  </Button>
+                )}
+              {errorDiagnosis.actions.includes('open_log') &&
+                runState?.logFilePath &&
+                onOpenPath && (
+                  <Button
+                    size="sm"
+                    variant="ghost"
+                    onClick={() => onOpenPath(runState.logFilePath)}
+                  >
+                    <FolderOpen className="h-3.5 w-3.5" aria-hidden="true" />
+                    打开完整日志
+                  </Button>
+                )}
+            </div>
+
+            {errorDiagnosis.rawDetail && (
+              <button
+                type="button"
+                onClick={() => setShowErrorDetail((v) => !v)}
+                aria-expanded={showErrorDetail}
+                className="inline-flex items-center gap-1 rounded-full px-2.5 py-1 text-xs font-medium opacity-85 hover:bg-surface/35 hover:opacity-100"
+              >
+                {showErrorDetail ? (
+                  <>
+                    <ChevronUp className="h-3.5 w-3.5" aria-hidden="true" />
+                    收起技术详情
+                  </>
+                ) : (
+                  <>
+                    <ChevronDown className="h-3.5 w-3.5" aria-hidden="true" />
+                    查看技术详情
+                  </>
+                )}
+              </button>
+            )}
+          </div>
+
+          {showErrorDetail && errorDiagnosis.rawDetail && (
+            <pre className="mt-2.5 max-h-36 overflow-auto rounded-xl bg-surface/80 p-3 font-mono text-[11px] leading-relaxed text-on-surface whitespace-pre-wrap [overflow-wrap:anywhere]">
+              {errorDiagnosis.rawDetail}
+            </pre>
+          )}
+        </section>
       )}
 
       <div className="grid grid-cols-1 gap-5 lg:grid-cols-[minmax(0,1fr)_clamp(20rem,28vw,25rem)] lg:items-start">
@@ -393,19 +561,14 @@ const ProgressView = ({
               </div>
             )}
 
-            {/* 错误提示 */}
-            {runState?.errorMessage && (
-              <div
-                role="alert"
-                className="mt-4 flex items-start gap-2.5 rounded-2xl bg-error-container px-4 py-3 text-on-error-container animate-fade-in"
-              >
-                <AlertCircle className="mt-0.5 h-4 w-4 shrink-0" aria-hidden="true" />
-                <div className="min-w-0">
-                  <p className="text-xs font-semibold">执行异常</p>
-                  <p className="mt-0.5 break-words text-xs leading-relaxed opacity-90">
-                    {runState.errorMessage}
-                  </p>
-                </div>
+            {/* 侧栏摘要：有异常时引导查看顶部诊断卡片 */}
+            {errorDiagnosis && (
+              <div className="mt-4 flex items-center justify-between gap-2 rounded-2xl bg-error-container/70 px-3.5 py-2.5 text-xs text-on-error-container">
+                <span className="flex min-w-0 items-center gap-1.5 font-medium">
+                  <AlertCircle className="h-3.5 w-3.5 shrink-0" aria-hidden="true" />
+                  <span className="truncate">{errorDiagnosis.badge}</span>
+                </span>
+                <span className="shrink-0 opacity-80">见顶部排查指引</span>
               </div>
             )}
           </section>
@@ -423,10 +586,11 @@ const ProgressView = ({
               <div className="rounded-2xl bg-surface-container p-3.5">
                 <dt className="text-on-surface-variant">运行耗时</dt>
                 <dd className="mt-1 text-sm font-semibold text-on-surface tnum">
-                  {formatElapsed(
-                    runState?.startedAt,
-                    runState?.finishedAt || (running ? nowTick : null)
-                  )}
+                  <ElapsedTimer
+                    startedAt={runState?.startedAt}
+                    finishedAt={runState?.finishedAt}
+                    running={running}
+                  />
                 </dd>
               </div>
               <div className="rounded-2xl bg-surface-container p-3.5">
@@ -523,10 +687,10 @@ const ProgressView = ({
           )}
 
           <ExecutionLog
-            logs={runState?.logs || []}
+            logs={logs}
             truncated={Boolean(runState?.logsTruncated)}
             logFilePath={runState?.logFilePath || ''}
-            onOpenLogFile={(path) => onOpenPath(path)}
+            onOpenLogFile={onOpenPath}
             debugEnabled={Boolean(config?.enableDebugLog)}
             onToggleDebug={onToggleDebugLog}
           />
@@ -534,6 +698,6 @@ const ProgressView = ({
       </div>
     </div>
   );
-};
+});
 
 export default ProgressView;

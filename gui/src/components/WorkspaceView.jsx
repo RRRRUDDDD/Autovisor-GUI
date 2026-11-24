@@ -1,4 +1,4 @@
-import { useMemo, useState, useCallback, useEffect } from 'react';
+import { memo, useMemo, useState, useCallback, useEffect } from 'react';
 import {
   BookOpen,
   SlidersHorizontal,
@@ -23,6 +23,8 @@ import Input from './ui/Input';
 import Label from './ui/Label';
 import NumberInput from './ui/NumberInput';
 import Switch from './ui/Switch';
+
+const EMPTY_COURSES = [];
 import {
   detectCourseType,
   extractCourseUrlsFromText,
@@ -33,7 +35,6 @@ import {
 } from '../lib/configModel';
 
 const SPEED_PRESETS = [1.0, 1.2, 1.5, 1.8];
-const MASTERY_PRESETS = [80, 90, 100];
 
 const TIME_PRESETS = [
   { label: '不限', value: 0 },
@@ -55,6 +56,8 @@ const WorkspaceView = ({
   starting,
   startError,
   runState,
+  taskRunning: taskRunningProp,
+  hasRunHistory: hasRunHistoryProp,
   onRefreshCourses,
   onRetrySave,
   onStartStudy,
@@ -79,13 +82,23 @@ const WorkspaceView = ({
     });
   }, []);
 
-  const courses = config.courses || [];
+  const courses = config.courses || EMPTY_COURSES;
   const enabledCount = useMemo(() => courses.filter((c) => c.enabled).length, [courses]);
-  const taskRunning = runState?.status === 'running';
-  const hasRunHistory = runState && runState.status !== 'idle';
+  const courseIndexMap = useMemo(() => {
+    const map = new Map();
+    courses.forEach((c, idx) => map.set(c.id, idx));
+    return map;
+  }, [courses]);
+  const taskRunning =
+    taskRunningProp !== undefined
+      ? Boolean(taskRunningProp)
+      : runState?.status === 'running' || runState?.status === 'stopping';
+  const hasRunHistory =
+    hasRunHistoryProp !== undefined
+      ? Boolean(hasRunHistoryProp)
+      : Boolean(runState && runState.status !== 'idle');
   const proxyValid = isValidProxyUrl(config.proxy);
   const llmBaseValid = isValidLlmApiBase(config.llm?.apiBase);
-  const showMasteryTarget = config.enableMastery !== false || config.enableExamApi !== false;
 
   const filteredCourses = useMemo(() => {
     const q = query.trim().toLowerCase();
@@ -386,7 +399,7 @@ const WorkspaceView = ({
         ) : (
           <ul className="min-h-0 flex-1 space-y-1.5 overflow-y-auto overscroll-contain px-3 pb-3">
             {filteredCourses.map((course) => {
-              const realIndex = courses.findIndex((c) => c.id === course.id);
+              const realIndex = courseIndexMap.get(course.id) ?? -1;
               const courseType = detectCourseType(course.url);
               const isDone = course.progress === '100%' || course.progress === '已完成';
               return (
@@ -759,96 +772,18 @@ const WorkspaceView = ({
                   label="隐藏浏览器窗口"
                   description="移出屏幕后台学习（遇安全验证会自动前置）"
                 />
-              </div>
-
-              {/* 答题与 AI 智慧课 */}
-              <div className="space-y-0 border-t border-outline-variant/60 pt-2">
                 <Switch
-                  id="enableZhidaoQuiz"
-                  checked={config.enableZhidaoQuiz !== false}
-                  onChange={(enableZhidaoQuiz) => updateField({ enableZhidaoQuiz })}
-                  label="课中弹题优先用智慧树 AI"
-                  description="自动答题时先试智慧树 AI，失败回退所配置的大模型"
+                  id="shutdownOnComplete"
+                  checked={config.shutdownOnComplete === true}
+                  onChange={(shutdownOnComplete) => updateField({ shutdownOnComplete })}
+                  label="刷课任务完成后自动关机"
+                  description="仅正常完成或达到单课时长上限时倒计时 60 秒自动关机；手动停止或出错不会关机"
                 />
-                <Switch
-                  id="enableMastery"
-                  checked={config.enableMastery !== false}
-                  onChange={(enableMastery) => {
-                    updateField({ enableMastery });
-                    if (!enableMastery && config.enableExamApi === false) {
-                      setFieldValid('masteryTarget', true);
-                    }
-                  }}
-                  label="AI 智慧课自动刷掌握度"
-                  description="视频刷完后自动刷知识点掌握度题目（仅对 AI 智慧课生效）"
-                />
-                <Switch
-                  id="enableExamApi"
-                  checked={config.enableExamApi !== false}
-                  onChange={(enableExamApi) => {
-                    updateField({ enableExamApi });
-                    if (!enableExamApi && config.enableMastery === false) {
-                      setFieldValid('masteryTarget', true);
-                    }
-                  }}
-                  label="接口版自动完成计分考试"
-                  description="视频刷完后通过接口作答并交卷，成绩达标即跳过该知识点（仅对 AI 智慧课生效）"
-                />
-                {showMasteryTarget && (
-                  <div className="mb-1.5 mt-1.5 space-y-1.5 rounded-2xl bg-surface-container px-3.5 py-3 animate-fade-in">
-                    <div className="flex items-center justify-between">
-                      <Label htmlFor="masteryTarget" className="text-on-surface">
-                        掌握度目标（%）
-                      </Label>
-                      <span className="rounded-full bg-tertiary-container px-2.5 py-0.5 font-mono text-xs font-semibold text-on-tertiary-container tnum">
-                        {Math.round(Number(config.masteryTarget) || 100)}%
-                      </span>
-                    </div>
-                    <p className="text-[11px] leading-relaxed text-on-surface-variant">
-                      同时用于接口版计分考试与知识点掌握度刷题
-                    </p>
-                    <NumberInput
-                      id="masteryTarget"
-                      min={1}
-                      max={100}
-                      step="5"
-                      value={config.masteryTarget ?? 100}
-                      onValueChange={(masteryTarget) => updateField({ masteryTarget })}
-                      onValidityChange={(valid) => setFieldValid('masteryTarget', valid)}
-                      className="h-9"
-                    />
-                    <div className="flex flex-wrap gap-1.5 pt-0.5">
-                      {MASTERY_PRESETS.map((pct) => {
-                        const active = Math.round(Number(config.masteryTarget) || 100) === pct;
-                        return (
-                          <button
-                            key={pct}
-                            type="button"
-                            onClick={() => {
-                              updateField({ masteryTarget: pct });
-                              setFieldValid('masteryTarget', true);
-                            }}
-                            className={`inline-flex items-center gap-1 rounded-full px-2.5 py-0.5 font-mono text-xs font-medium transition-colors ease-m3 tnum ${
-                              active
-                                ? 'bg-secondary-container text-on-secondary-container'
-                                : 'border border-outline/50 bg-transparent text-on-surface-variant hover:bg-on-surface/[0.06]'
-                            }`}
-                          >
-                            {active && <Check className="h-3 w-3" strokeWidth={2.8} />}
-                            {pct}%
-                          </button>
-                        );
-                      })}
-                    </div>
+                {config.shutdownOnComplete === true && (
+                  <div className="mb-1 mt-1 rounded-2xl bg-warning-container/65 px-3.5 py-2.5 text-xs leading-relaxed text-on-warning-container animate-fade-in">
+                    已开启完成后自动关机，刷课结束后将倒计时 60 秒关闭计算机，期间可在运行监控页随时取消。
                   </div>
                 )}
-                <Switch
-                  id="enableReviewExamApi"
-                  checked={config.enableReviewExamApi === true}
-                  onChange={(enableReviewExamApi) => updateField({ enableReviewExamApi })}
-                  label="复习 / 模拟考试接口作答"
-                  description="捕获新打开的复习、模拟考试页并直接作答交卷（默认关闭，正式考试请勿开启）"
-                />
               </div>
             </div>
           </div>
@@ -948,4 +883,4 @@ const WorkspaceView = ({
   );
 };
 
-export default WorkspaceView;
+export default memo(WorkspaceView);

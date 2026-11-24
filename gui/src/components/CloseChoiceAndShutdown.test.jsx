@@ -154,7 +154,7 @@ describe('SettingsView close behavior & shutdown on complete integration', () =>
     vi.restoreAllMocks();
   });
 
-  it('exposes close-behavior selector and shutdown-on-complete switch in System Settings and shows global shutdown banner off progress tab', async () => {
+  it('exposes close-behavior selector in System Settings and shutdown-on-complete switch in Study Parameters with global shutdown banner', async () => {
     let emitRunState;
     const runtime = {
       backendPhase: 'ready',
@@ -235,10 +235,16 @@ describe('SettingsView close behavior & shutdown on complete integration', () =>
     render(<App />);
     await waitFor(() => expect(screen.getByText('课程队列')).toBeTruthy());
 
-    // Open 系统设置
+    // Enable shutdownOnComplete in 学习参数 (WorkspaceView) and verify auto-save
+    fireEvent.click(screen.getByRole('checkbox', { name: /刷课任务完成后自动关机/ }));
+    await waitFor(() => {
+      expect(saveConfigSpy).toHaveBeenCalled();
+      expect(saveConfigSpy.mock.calls.at(-1)[0].shutdownOnComplete).toBe(true);
+    });
+
+    // Open 系统设置 and verify 桌面窗口 close-behavior selector
     fireEvent.click(screen.getByRole('button', { name: '系统设置' }));
     expect(screen.getByText('桌面窗口')).toBeTruthy();
-    expect(screen.getByText('完成后关机')).toBeTruthy();
 
     // Change close behavior
     const closeSelect = screen.getByLabelText('关闭窗口时');
@@ -247,13 +253,6 @@ describe('SettingsView close behavior & shutdown on complete integration', () =>
     await waitFor(() => {
       expect(setCloseSpy).toHaveBeenCalledWith('minimize');
       expect(closeSelect.value).toBe('minimize');
-    });
-
-    // Enable shutdownOnComplete and verify auto-save
-    fireEvent.click(screen.getByRole('checkbox', { name: /刷课任务完成后自动关机/ }));
-    await waitFor(() => {
-      expect(saveConfigSpy).toHaveBeenCalled();
-      expect(saveConfigSpy.mock.calls.at(-1)[0].shutdownOnComplete).toBe(true);
     });
 
     // Global scheduled shutdown banner appears even on settings tab and can be cancelled

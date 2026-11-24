@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react';
 import {
   GraduationCap,
   Github,
@@ -32,8 +32,15 @@ import {
   normalizeConfig,
 } from './lib/configModel';
 import { useTheme } from './lib/theme';
+import { createRunStateStore, RunStateContext } from './lib/runStateStore';
 
 const AUTO_SAVE_DELAY_MS = 250;
+
+const isActiveRunStatus = (status) => status === 'running' || status === 'stopping';
+const selectTaskRunning = (s) => isActiveRunStatus(s?.status);
+const selectHasRunHistory = (s) => Boolean(s && s.status !== 'idle');
+const selectShutdownScheduled = (s) => s?.shutdown?.state === 'scheduled';
+const selectShutdownInfo = (s) => s?.shutdown ?? null;
 
 const NAV_ITEMS = [
   { id: 'study', label: '自动学习', heading: '选择课程并配置刷课参数', icon: BookOpen },
@@ -67,12 +74,34 @@ export default function App() {
   const [updateError, setUpdateError] = useState('');
   const [updateDismissed, setUpdateDismissed] = useState(false);
   const [startError, setStartError] = useState('');
-  const [runState, setRunState] = useState(null);
   const [cookieImportState, setCookieImportState] = useState({
     importing: false,
     error: '',
     nonce: 0,
   });
+
+  const runStateStoreRef = useRef(null);
+  if (!runStateStoreRef.current) {
+    runStateStoreRef.current = createRunStateStore(null);
+  }
+  const runStateStore = runStateStoreRef.current;
+
+  const taskRunning = useSyncExternalStore(
+    runStateStore.subscribe,
+    () => selectTaskRunning(runStateStore.getSnapshot())
+  );
+  const hasRunHistory = useSyncExternalStore(
+    runStateStore.subscribe,
+    () => selectHasRunHistory(runStateStore.getSnapshot())
+  );
+  const shutdownScheduled = useSyncExternalStore(
+    runStateStore.subscribe,
+    () => selectShutdownScheduled(runStateStore.getSnapshot())
+  );
+  const shutdownInfo = useSyncExternalStore(
+    runStateStore.subscribe,
+    () => selectShutdownInfo(runStateStore.getSnapshot())
+  );
 
   const latestConfigRef = useRef(config);
   latestConfigRef.current = config;
@@ -82,6 +111,44 @@ export default function App() {
   const savePromiseRef = useRef(null);
   const mountedRef = useRef(true);
   const autoUpdateCheckedRef = useRef(false);
+  const prevRunStatusRef = useRef('idle');
+  const cookieImportAttemptRef = useRef(0);
+  const cookieImportHandledKeyRef = useRef('');
+  const cookieImportInFlightKeyRef = useRef('');
+
+  const getCookieImportResultKey = useCallback((nextState) => {
+    if (!nextState || nextState.mode !== 'import_cookies' || isActiveRunStatus(nextState.status)) {
+      return '';
+    }
+    return nextState.startedAt || nextState.finishedAt
+      ? `${nextState.startedAt ?? ''}:${nextState.finishedAt ?? ''}:${nextState.status}`
+      : `attempt:${cookieImportAttemptRef.current}:${nextState.status}`;
+  }, []);
+
+  const finalizeCookieImport = useCallback((nextState) => {
+    const key = getCookieImportResultKey(nextState);
+    if (!key || cookieImportHandledKeyRef.current === key) {
+      return false;
+    }
+    cookieImportHandledKeyRef.current = key;
+    if (nextState.status === 'completed') {
+      setAutoRestoreCookie(true);
+      setCookieImportState((prev) => ({
+        importing: false,
+        error: '',
+        nonce: prev.nonce + 1,
+      }));
+    } else if (nextState.status === 'error') {
+      setCookieImportState((prev) => ({
+        ...prev,
+        importing: false,
+        error: nextState.errorMessage || '导入 Cookie 失败，请检查文件格式',
+      }));
+    } else {
+      setCookieImportState((prev) => ({ ...prev, importing: false }));
+    }
+    return true;
+  }, []);
 
   useEffect(() => {
     mountedRef.current = true;
@@ -119,8 +186,9 @@ export default function App() {
       ]);
       setRuntime(rt);
       applyBackendConfig(cfg);
-      setRunState(st);
-      if (st?.status === 'running') {
+      runStateStore.reset(st);
+      prevRunStatusRef.current = st?.status || 'idle';
+      if (isActiveRunStatus(st?.status)) {
         setSession(rt?.session || { loggedIn: true, displayName: '智慧树学员' });
         setView('shell');
         setActiveTab('progress');
@@ -130,7 +198,7 @@ export default function App() {
     } finally {
       setLoading(false);
     }
-  }, [applyBackendConfig]);
+  }, [applyBackendConfig, runStateStore]);
 
   useEffect(() => {
     loadAll();
@@ -141,41 +209,49 @@ export default function App() {
     let unlistenBackend = () => {};
     let active = true;
     tauriApi
-      .listenRunState((nextState) => {
+      .listenRunState((payload) => {
         if (!active) return;
-        setRunState(nextState);
+        const prevStatus = prevRunStatusRef.current;
+        const nextState = runStateStore.applyPayload(payload);
+        const nextStatus = nextState?.status || 'idle';
+        prevRunStatusRef.current = nextStatus;
+
         if (nextState?.shutdown?.state !== 'scheduled' && !nextState?.shutdownOnComplete) {
           setCancelShutdownError('');
         }
-        if (nextState?.status !== 'running') {
+        if (!isActiveRunStatus(nextStatus)) {
           setStopping(false);
+        }
+        const transitionedToTerminal =
+          isActiveRunStatus(prevStatus) && !isActiveRunStatus(nextStatus);
+        const cookieResultKey = getCookieImportResultKey(nextState);
+        const isPendingCookieImportResult = Boolean(
+          cookieResultKey &&
+            cookieImportHandledKeyRef.current !== cookieResultKey &&
+            cookieImportInFlightKeyRef.current !== cookieResultKey
+        );
+
+        if (transitionedToTerminal || isPendingCookieImportResult) {
+          if (isPendingCookieImportResult) {
+            cookieImportInFlightKeyRef.current = cookieResultKey;
+          }
           tauriApi
             .getRuntimeInfo()
             .then((rt) => {
               if (!active) return;
               if (rt) setRuntime(rt);
-              if (nextState?.mode === 'import_cookies') {
-                if (nextState.status === 'completed') {
-                  setAutoRestoreCookie(true);
-                  setCookieImportState((prev) => ({
-                    importing: false,
-                    error: '',
-                    nonce: prev.nonce + 1,
-                  }));
-                } else if (nextState.status === 'error') {
-                  setCookieImportState((prev) => ({
-                    ...prev,
-                    importing: false,
-                    error: nextState.errorMessage || '导入 Cookie 失败，请检查文件格式',
-                  }));
-                } else {
-                  setCookieImportState((prev) => ({ ...prev, importing: false }));
-                }
+              if (isPendingCookieImportResult) {
+                finalizeCookieImport(nextState);
               }
             })
             .catch(() => {
-              if (active && nextState?.mode === 'import_cookies') {
-                setCookieImportState((prev) => ({ ...prev, importing: false }));
+              if (active && isPendingCookieImportResult) {
+                finalizeCookieImport(nextState);
+              }
+            })
+            .finally(() => {
+              if (cookieImportInFlightKeyRef.current === cookieResultKey) {
+                cookieImportInFlightKeyRef.current = '';
               }
             });
         }
@@ -208,14 +284,18 @@ export default function App() {
       unlistenState();
       unlistenBackend();
     };
-  }, []);
+  }, [runStateStore, getCookieImportResultKey, finalizeCookieImport]);
 
+  const [settingsFieldsValid, setSettingsFieldsValid] = useState(true);
   const currentSnapshot = useMemo(() => configSnapshot(config), [config]);
   const dirty = savedSnapshot !== null && currentSnapshot !== savedSnapshot;
   const visibleSaveStatus = saveStatus && saveStatus.snapshot === currentSnapshot ? saveStatus : null;
   const configValidForSave = useMemo(
-    () => isValidProxyUrl(config.proxy) && isValidLlmApiBase(config.llm?.apiBase),
-    [config.proxy, config.llm?.apiBase]
+    () =>
+      settingsFieldsValid &&
+      isValidProxyUrl(config.proxy) &&
+      isValidLlmApiBase(config.llm?.apiBase),
+    [settingsFieldsValid, config.proxy, config.llm?.apiBase]
   );
 
   const persistConfigNow = useCallback(async ({ force = false } = {}) => {
@@ -375,9 +455,10 @@ export default function App() {
     setStartError('');
     try {
       await persistConfigNow();
-      if (runState?.status === 'running') {
+      if (isActiveRunStatus(runStateStore.getSnapshot()?.status)) {
         const stopped = await tauriApi.stopAutovisor();
-        setRunState(stopped);
+        runStateStore.applyPayload(stopped);
+        prevRunStatusRef.current = stopped?.status || 'idle';
       }
       const rt = await tauriApi.logoutZhs();
       setRuntime(rt);
@@ -391,7 +472,7 @@ export default function App() {
     } finally {
       setLoggingOut(false);
     }
-  }, [loggingOut, persistConfigNow, runState?.status]);
+  }, [loggingOut, persistConfigNow, runStateStore]);
 
   const handleStartStudy = useCallback(async () => {
     setStartError('');
@@ -403,26 +484,28 @@ export default function App() {
         return;
       }
       const nextState = await tauriApi.startAutovisor();
-      setRunState(nextState);
+      runStateStore.applyPayload(nextState);
+      prevRunStatusRef.current = nextState?.status || 'running';
       setActiveTab('progress');
     } catch (err) {
       setStartError(err?.message || String(err) || '启动 Autovisor GUI 失败');
     } finally {
       setStarting(false);
     }
-  }, [persistConfigNow]);
+  }, [persistConfigNow, runStateStore]);
 
   const handleStop = useCallback(async () => {
     setStopping(true);
     try {
       const nextState = await tauriApi.stopAutovisor();
-      setRunState(nextState);
+      runStateStore.applyPayload(nextState);
+      prevRunStatusRef.current = nextState?.status || 'cancelled';
     } catch (err) {
       setStartError(err?.message || String(err) || '停止任务失败');
     } finally {
       setStopping(false);
     }
-  }, []);
+  }, [runStateStore]);
 
   const handleCancelShutdown = useCallback(async () => {
     if (cancellingShutdown) return;
@@ -430,7 +513,10 @@ export default function App() {
     setCancelShutdownError('');
     try {
       const nextState = await tauriApi.cancelShutdown();
-      if (nextState) setRunState(nextState);
+      if (nextState) {
+        runStateStore.applyPayload(nextState);
+        prevRunStatusRef.current = nextState.status || prevRunStatusRef.current;
+      }
     } catch (err) {
       setCancelShutdownError(
         err?.message || String(err) || '取消关机失败，可在命令提示符运行 shutdown /a 手动取消'
@@ -438,7 +524,7 @@ export default function App() {
     } finally {
       setCancellingShutdown(false);
     }
-  }, [cancellingShutdown]);
+  }, [cancellingShutdown, runStateStore]);
 
   const handleChangeCloseBehavior = useCallback(async (behavior) => {
     const rt = await tauriApi.setCloseBehavior(behavior);
@@ -452,13 +538,14 @@ export default function App() {
       try {
         await persistConfigNow();
         const nextState = await tauriApi.runDiagnostic('check_course', url);
-        setRunState(nextState);
+        runStateStore.applyPayload(nextState);
+        prevRunStatusRef.current = nextState?.status || 'running';
         setActiveTab('progress');
       } catch (err) {
         setStartError(err?.message || String(err) || '启动课程检查失败');
       }
     },
-    [persistConfigNow]
+    [persistConfigNow, runStateStore]
   );
 
   const handleCheckBrowser = useCallback(async () => {
@@ -466,12 +553,13 @@ export default function App() {
     try {
       await persistConfigNow();
       const nextState = await tauriApi.runDiagnostic('check_browser', '');
-      setRunState(nextState);
+      runStateStore.applyPayload(nextState);
+      prevRunStatusRef.current = nextState?.status || 'running';
       setActiveTab('progress');
     } catch (err) {
       setStartError(err?.message || String(err) || '启动浏览器检测失败');
     }
-  }, [persistConfigNow]);
+  }, [persistConfigNow, runStateStore]);
 
   const handleOpenPath = useCallback((target) => tauriApi.openPath(target), []);
   const handleListLogFiles = useCallback(() => tauriApi.listLogFiles(), []);
@@ -546,30 +634,20 @@ export default function App() {
     try {
       const picked = await tauriApi.pickCookieFile();
       if (!picked) return;
+      cookieImportAttemptRef.current += 1;
       if (view === 'login') {
         setAutoRestoreCookie(true);
         setCookieImportState((prev) => ({ ...prev, importing: true, error: '' }));
       }
       const nextState = await tauriApi.runDiagnostic('import_cookies', picked);
-      setRunState(nextState);
+      runStateStore.applyPayload(nextState);
+      prevRunStatusRef.current = nextState?.status || 'idle';
       if (view !== 'login') {
         setActiveTab('progress');
-      } else if (nextState?.status && nextState.status !== 'running') {
+      } else if (nextState?.status && !isActiveRunStatus(nextState.status)) {
         const rt = await tauriApi.getRuntimeInfo().catch(() => null);
         if (rt) setRuntime(rt);
-        if (nextState.status === 'completed') {
-          setCookieImportState((prev) => ({
-            importing: false,
-            error: '',
-            nonce: prev.nonce + 1,
-          }));
-        } else {
-          setCookieImportState((prev) => ({
-            ...prev,
-            importing: false,
-            error: nextState.errorMessage || '导入 Cookie 失败，请检查文件格式',
-          }));
-        }
+        finalizeCookieImport(nextState);
       }
     } catch (err) {
       const msg = err?.message || String(err) || '导入 Cookie 失败';
@@ -579,7 +657,13 @@ export default function App() {
         setStartError(msg);
       }
     }
-  }, [view]);
+  }, [view, runStateStore, finalizeCookieImport]);
+
+  const handleClearSavedLogin = useCallback(async (mode = '') => {
+    const rt = await tauriApi.clearSavedLogin(mode);
+    if (rt) setRuntime(rt);
+    return rt;
+  }, []);
 
   const handleClearCookies = useCallback(async () => {
     try {
@@ -673,8 +757,14 @@ export default function App() {
     void handleCheckUpdate({ silent: true });
   }, [loading, runtime?.backendPhase, handleCheckUpdate]);
 
-  const taskRunning = runState?.status === 'running';
-  const shutdownScheduled = runState?.shutdown?.state === 'scheduled';
+  const handleReturnToProgress = useCallback(() => setActiveTab('progress'), []);
+  const handleBackToStudy = useCallback(() => setActiveTab('study'), []);
+  const handleOpenSettings = useCallback(() => setActiveTab('settings'), []);
+  const handleManualCheckUpdate = useCallback(
+    () => handleCheckUpdate({ silent: false }),
+    [handleCheckUpdate]
+  );
+
   const enabledCount = (config.courses || []).filter((c) => c.enabled).length;
   const canQuickStart =
     enabledCount > 0 &&
@@ -706,7 +796,7 @@ export default function App() {
           <div className="bg-surface px-4 pt-4">
             <div className="mx-auto max-w-5xl">
               <ScheduledShutdownBanner
-                shutdownInfo={runState.shutdown}
+                shutdownInfo={shutdownInfo}
                 cancelling={cancellingShutdown}
                 cancelError={cancelShutdownError}
                 onCancel={handleCancelShutdown}
@@ -728,6 +818,7 @@ export default function App() {
           onPickBrowserExe={handlePickBrowserExe}
           onImportCookies={handleImportCookies}
           onSaveProxy={handleSaveProxy}
+          onClearSavedLogin={handleClearSavedLogin}
         />
       </>
     );
@@ -954,7 +1045,7 @@ export default function App() {
 
           {shutdownScheduled && activeTab !== 'progress' && (
             <ScheduledShutdownBanner
-              shutdownInfo={runState.shutdown}
+              shutdownInfo={shutdownInfo}
               cancelling={cancellingShutdown}
               cancelError={cancelShutdownError}
               onCancel={handleCancelShutdown}
@@ -1001,23 +1092,25 @@ export default function App() {
               courseSyncNotice={courseSyncNotice}
               starting={starting}
               startError={startError}
-              runState={runState}
+              taskRunning={taskRunning}
+              hasRunHistory={hasRunHistory}
               onRefreshCourses={handleRefreshCourses}
               onRetrySave={handleRetrySave}
               onStartStudy={handleStartStudy}
-              onReturnToProgress={() => setActiveTab('progress')}
+              onReturnToProgress={handleReturnToProgress}
               onCheckCourse={handleRunCourseCheck}
             />
           )}
 
           {activeTab === 'progress' && (
             <ProgressView
-              runState={runState}
               config={config}
-              onBack={() => setActiveTab('study')}
+              onBack={handleBackToStudy}
               onStop={handleStop}
               onRestart={handleStartStudy}
               onOpenPath={handleOpenPath}
+              onOpenSettings={handleOpenSettings}
+              onRelogin={handleLogout}
               onCancelShutdown={handleCancelShutdown}
               onToggleDebugLog={handleToggleDebugLog}
               stopping={stopping}
@@ -1035,6 +1128,7 @@ export default function App() {
               saving={saving}
               saveStatus={visibleSaveStatus}
               onRetrySave={handleRetrySave}
+              onValidityChange={setSettingsFieldsValid}
               taskRunning={taskRunning}
               onSelectBrowser={handleSelectBrowser}
               onRedetectBrowsers={handleRedetectBrowsers}
@@ -1057,7 +1151,7 @@ export default function App() {
               onReadLogFile={handleReadLogFile}
               onChangeCloseBehavior={handleChangeCloseBehavior}
               onToggleDebugLog={handleToggleDebugLog}
-              onCheckUpdate={() => handleCheckUpdate({ silent: false })}
+              onCheckUpdate={handleManualCheckUpdate}
               checkingUpdate={checkingUpdate}
               updateInfo={updateInfo}
               updateError={updateError}
@@ -1070,9 +1164,9 @@ export default function App() {
   }
 
   return (
-    <>
+    <RunStateContext.Provider value={runStateStore}>
       {content}
       <CloseChoiceDialog onRuntimeUpdated={setRuntime} />
-    </>
+    </RunStateContext.Provider>
   );
 }
