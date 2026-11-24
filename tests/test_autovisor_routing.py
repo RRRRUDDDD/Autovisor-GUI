@@ -588,7 +588,19 @@ class ZhidaoSharedCourseAssessmentTests(unittest.IsolatedAsyncioTestCase):
         page = MagicMock()
         page.goto = AsyncMock()
         page.context = MagicMock()
-        page.context.cookies = AsyncMock(return_value=[{"name": "CASLOGC", "value": "v2"}])
+        page.context.cookies = AsyncMock(
+            return_value=[
+                {
+                    "name": "CASLOGC",
+                    "value": "v2",
+                    "domain": ".zhihuishu.com",
+                    "path": "/",
+                    "expires": 1893456000,
+                    "secure": True,
+                    "httpOnly": True,
+                }
+            ]
+        )
         client = MagicMock()
         client.session = MagicMock()
 
@@ -627,7 +639,15 @@ class ZhidaoSharedCourseAssessmentTests(unittest.IsolatedAsyncioTestCase):
                 logger,
             )
         settle.assert_awaited_once_with(page, cfg)
-        client.session.cookies.set.assert_called_with("CASLOGC", "v2")
+        client.session.cookies.set.assert_called_with(
+            "CASLOGC",
+            "v2",
+            secure=True,
+            rest={"HttpOnly": None},
+            domain=".zhihuishu.com",
+            path="/",
+            expires=1893456000,
+        )
         client.reset_exam_sso.assert_called_once()
         self.assertEqual(summary["homework"]["done"], 1)
         self.assertEqual(hw_worker.run.call_count, 2)

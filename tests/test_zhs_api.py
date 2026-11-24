@@ -329,6 +329,42 @@ class CasSsoTests(unittest.TestCase):
         self.assertEqual(info.get("uuid"), "u-xyz")
         self.assertEqual(info.get("realName"), "张三")
 
+    def test_build_session_and_export_preserve_cookie_security_and_expiry(self):
+        from modules.qr_login import requests_cookies_to_playwright
+
+        future_exp = 1893456000
+        cookies = [
+            {
+                "name": "CASTGC",
+                "value": "TGT-secure-1",
+                "domain": ".zhihuishu.com",
+                "path": "/",
+                "expires": future_exp,
+                "secure": True,
+                "httpOnly": True,
+            },
+            {
+                "name": "CASLOGC",
+                "value": "%7B%22uuid%22%3A%22u-keep%22%7D",
+                "domain": ".zhihuishu.com",
+                "path": "/",
+                "expires": future_exp + 100,
+                "secure": False,
+                "httpOnly": False,
+            },
+        ]
+        session = zhs_api.build_session(cookies)
+        exported = {c["name"]: c for c in requests_cookies_to_playwright(session.cookies)}
+        self.assertIn("CASTGC", exported)
+        self.assertEqual(exported["CASTGC"]["expires"], float(future_exp))
+        self.assertTrue(exported["CASTGC"]["secure"])
+        self.assertTrue(exported["CASTGC"]["httpOnly"])
+
+        self.assertIn("CASLOGC", exported)
+        self.assertEqual(exported["CASLOGC"]["expires"], float(future_exp + 100))
+        self.assertFalse(exported["CASLOGC"]["secure"])
+        self.assertFalse(exported["CASLOGC"]["httpOnly"])
+
 
 if __name__ == "__main__":
     unittest.main()

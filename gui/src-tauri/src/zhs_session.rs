@@ -1057,9 +1057,13 @@ fn build_course_from_json_object(
         let is_ai_smart = obj.contains_key("aiCourseId")
             || ai_hint.contains("ai-smart")
             || ai_hint.contains("aicourse")
+            || ai_hint.contains("ai_course")
             || ai_hint.contains("ai智慧")
             || ai_hint.contains("ai 智慧")
-            || (ai_hint.contains("ai") && !ai_hint.contains("aided"));
+            || ai_hint.contains("querystudentaicourselist")
+            || ai_hint
+                .split(|c: char| !c.is_ascii_alphabetic())
+                .any(|t| t == "ai");
         if !course_id.is_empty() && !class_id.is_empty() && is_ai_smart {
             url = Some(format!(
                 "https://ai-smart-course-student-pro.zhihuishu.com/learnPage?courseId={course_id}&classId={class_id}"
@@ -1819,7 +1823,32 @@ fn merge_cookies(base: &[PlaywrightCookie], updates: &[PlaywrightCookie]) -> Vec
                 && c.domain.trim().to_ascii_lowercase() == upd_domain
                 && (if c.path.is_empty() { "/" } else { c.path.as_str() }) == upd_path
         }) {
-            *slot = upd.clone();
+            let upd_exp = upd.expires.filter(|&e| e > 0.0);
+            let slot_exp = slot.expires.filter(|&e| e > 0.0);
+            if upd.value == slot.value {
+                if slot_exp.is_none() {
+                    slot.expires = upd_exp;
+                } else if let (Some(s), Some(u)) = (slot_exp, upd_exp) {
+                    if u > s {
+                        slot.expires = Some(u);
+                    }
+                }
+                if slot.same_site.is_none() {
+                    slot.same_site = upd.same_site.clone();
+                }
+                slot.secure = slot.secure || upd.secure;
+                slot.http_only = slot.http_only || upd.http_only;
+            } else {
+                slot.value = upd.value.clone();
+                if upd_exp.is_some() {
+                    slot.expires = upd_exp;
+                }
+                if upd.same_site.is_some() {
+                    slot.same_site = upd.same_site.clone();
+                }
+                slot.secure = slot.secure || upd.secure;
+                slot.http_only = slot.http_only || upd.http_only;
+            }
         } else {
             out.push(upd.clone());
         }
@@ -2721,6 +2750,120 @@ mod tests {
         let merged = merge_cookies(&base, &parsed.cookies);
         assert_eq!(merged.len(), 2);
         assert_eq!(merged[0].value, "new-online-sess");
+        assert!(merged[0].http_only);
+        assert!(merged[0].secure);
         assert_eq!(merged[1].value, "hike-sess");
+    }
+
+    #[test]
+    fn merge_cookies_preserves_metadata_without_downgrade() {
+        let base = vec![
+            PlaywrightCookie {
+                name: "CASTGC".into(),
+                value: "tgt-1".into(),
+                domain: ".zhihuishu.com".into(),
+                path: "/".into(),
+                expires: Some(1893456000.0),
+                http_only: true,
+                secure: true,
+                same_site: Some("Lax".into()),
+            },
+            PlaywrightCookie {
+                name: "SESSION".into(),
+                value: "old-sess".into(),
+                domain: "onlineservice-api.zhihuishu.com".into(),
+                path: "/".into(),
+                expires: Some(1893456500.0),
+                http_only: true,
+                secure: true,
+                same_site: Some("None".into()),
+            },
+        ];
+        let updates = vec![
+            // Same value with degraded/missing metadata must NOT downgrade
+            PlaywrightCookie {
+                name: "CASTGC".into(),
+                value: "tgt-1".into(),
+                domain: ".zhihuishu.com".into(),
+                path: "/".into(),
+                expires: None,
+                http_only: false,
+                secure: false,
+                same_site: None,
+            },
+            // New value with missing metadata inherits original expires/same_site/flags
+            PlaywrightCookie {
+                name: "SESSION".into(),
+                value: "new-sess".into(),
+                domain: "onlineservice-api.zhihuishu.com".into(),
+                path: "/".into(),
+                expires: None,
+                http_only: false,
+                secure: false,
+                same_site: None,
+            },
+        ];
+        let merged = merge_cookies(&base, &updates);
+        assert_eq!(merged.len(), 2);
+        assert_eq!(merged[0].value, "tgt-1");
+        assert_eq!(merged[0].expires, Some(1893456000.0));
+        assert!(merged[0].http_only);
+        assert!(merged[0].secure);
+        assert_eq!(merged[0].same_site.as_deref(), Some("Lax"));
+
+        assert_eq!(merged[1].value, "new-sess");
+        assert_eq!(merged[1].expires, Some(1893456500.0));
+        assert!(merged[1].http_only);
+        assert!(merged[1].secure);
+        assert_eq!(merged[1].same_site.as_deref(), Some("None"));
+    }
+
+    #[test]
+    fn extracts_shared_course_from_detail_url_without_ai_false_positive() {
+        let payload = json!({
+            "mainCourseList": [
+                {
+                    "courseId": 101,
+                    "recruitId": 202,
+                    "secret": "shareDetailSec1",
+                    "courseName": "大学英语"
+                }
+            ],
+            "aiCourseList": [
+                {
+                    "courseId": 303,
+                    "classId": 404,
+                    "secret": "aiSecretIgnored",
+                    "courseName": "AI 智慧物理"
+                }
+            ]
+        });
+        let mut courses = Vec::new();
+        let mut name = String::new();
+        let mut school = String::new();
+        extract_courses_and_profile_from_json_with_context(
+            &payload,
+            "",
+            "https://onlineservice-api.zhihuishu.com/courseDetail",
+            &mut courses,
+            &mut name,
+            &mut school,
+        );
+        let shared = courses
+            .iter()
+            .find(|c| c.title == "大学英语")
+            .expect("shared course extracted");
+        assert_eq!(
+            shared.url,
+            "https://studyvideoh5.zhihuishu.com/stuStudy?recruitAndCourseId=shareDetailSec1"
+        );
+        let ai = courses
+            .iter()
+            .find(|c| c.title == "AI 智慧物理")
+            .expect("ai course extracted");
+        assert_eq!(
+            ai.url,
+            "https://ai-smart-course-student-pro.zhihuishu.com/learnPage?courseId=303&classId=404"
+        );
     }
 }

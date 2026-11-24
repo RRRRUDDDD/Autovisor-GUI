@@ -371,7 +371,215 @@ class CourseFetcherTests(unittest.TestCase):
             urls,
         )
 
-    def test_fetch_courses_via_api_marks_expired_when_only_hike_returns_200(self):
+    def test_extract_shared_course_not_misclassified_as_ai_on_detail_or_main_hints(self):
+        payload = {
+            "mainCourseList": [
+                {
+                    "courseId": 1001,
+                    "recruitId": 2002,
+                    "secret": "shareSecret999",
+                    "courseName": "高等数学（上）",
+                }
+            ],
+            "aiCourseList": [
+                {
+                    "courseId": 3001,
+                    "classId": 4002,
+                    "secret": "aiSecretShouldNotOverride",
+                    "courseName": "AI 智慧微积分",
+                }
+            ],
+            "otherCourses": [
+                {
+                    "courseId": 5001,
+                    "classId": 6002,
+                    "typeName": "AI 课程",
+                    "courseName": "AI 课程实战",
+                },
+                {
+                    "courseId": 7001,
+                    "recruitId": 8002,
+                    "secret": "trainSecret888",
+                    "typeName": "training",
+                    "courseName": "工程训练",
+                },
+            ],
+        }
+        courses = extract_courses_from_json(
+            payload,
+            source_url="https://onlineservice-api.zhihuishu.com/courseDetail",
+        )
+        by_title = {c.title: c for c in courses}
+        self.assertEqual(
+            by_title["高等数学（上）"].url,
+            "https://studyvideoh5.zhihuishu.com/stuStudy?recruitAndCourseId=shareSecret999",
+        )
+        self.assertEqual(
+            by_title["工程训练"].url,
+            "https://studyvideoh5.zhihuishu.com/stuStudy?recruitAndCourseId=trainSecret888",
+        )
+        self.assertEqual(
+            by_title["AI 智慧微积分"].url,
+            "https://ai-smart-course-student-pro.zhihuishu.com/learnPage?courseId=3001&classId=4002",
+        )
+        self.assertEqual(
+            by_title["AI 课程实战"].url,
+            "https://ai-smart-course-student-pro.zhihuishu.com/learnPage?courseId=5001&classId=6002",
+        )
+
+        # queryStudentAICourseList 来源 URL 下的 AI 课程也能识别
+        ai_from_source = extract_courses_from_json(
+            {"rt": [{"courseId": "9101", "classId": "9202", "courseName": "接口来源AI课"}]},
+            source_url="https://onlineservice-api.zhihuishu.com/gateway/t/v1/student/queryStudentAICourseList",
+        )
+        self.assertEqual(len(ai_from_source), 1)
+        self.assertEqual(
+            ai_from_source[0].url,
+            "https://ai-smart-course-student-pro.zhihuishu.com/learnPage?courseId=9101&classId=9202",
+        )
+
+    def test_fetch_courses_via_api_refreshes_sso_on_expired_session_and_recovers_hike_and_bad_total(self):
+        import threading
+        from requests.cookies import RequestsCookieJar, create_cookie
+        from modules.course_fetcher import (
+            AI_COURSE_LIST_URL,
+            HIKE_COURSE_LIST_URL,
+            HIKE_SERVICE_SSO_URL,
+            LOGIN_USER_INFO_URL,
+            ONLINE_SERVICE_SSO_URL,
+            SHARE_COURSE_LIST_URL,
+            fetch_courses_via_api,
+        )
+        from modules.zhs_api import ZhsApiClient
+
+        class _FakeResp:
+            def __init__(self, payload=None, status_code=200, text="", raise_json=False):
+                self._payload = payload
+                self.status_code = status_code
+                self.text = text or (json.dumps(payload, ensure_ascii=False) if payload is not None else "")
+                self._raise_json = raise_json
+                self.headers = {}
+
+            def json(self):
+                if self._raise_json:
+                    raise ValueError("html login page")
+                return self._payload
+
+            def raise_for_status(self):
+                if self.status_code >= 400:
+                    import requests
+
+                    err = requests.HTTPError(f"HTTP {self.status_code}")
+                    err.response = self
+                    raise err
+
+        class _ExpiredOnlineThenRefreshSession:
+            def __init__(self):
+                self.cookies = RequestsCookieJar()
+                # 存在已过期的 onlineservice SESSION 且 CASLOGC 不含 uuid
+                self.cookies.set_cookie(
+                    create_cookie("SESSION", "expired-online", domain="onlineservice-api.zhihuishu.com")
+                )
+                self.cookies.set_cookie(
+                    create_cookie("CASTGC", "TGT-valid", domain=".zhihuishu.com")
+                )
+                self.headers = {}
+                self.online_refreshed = False
+                self.hike_refreshed = False
+                self.user_info_calls = 0
+                self.hike_calls = 0
+
+            def get(self, url, params=None, timeout=None, allow_redirects=True):
+                if url.startswith(LOGIN_USER_INFO_URL):
+                    self.user_info_calls += 1
+                    if not self.online_refreshed:
+                        return _FakeResp({"code": 401, "result": None}, status_code=401)
+                    return _FakeResp(
+                        {
+                            "code": 200,
+                            "result": {
+                                "uuid": "u-refreshed",
+                                "realName": "刷新用户",
+                                "schoolName": "工大",
+                            },
+                        }
+                    )
+                if url == HIKE_COURSE_LIST_URL:
+                    self.hike_calls += 1
+                    if not self.hike_refreshed:
+                        # 模拟 302 跳转登录页返回 200 HTML
+                        return _FakeResp(None, status_code=200, text="<html>login</html>", raise_json=True)
+                    return _FakeResp(
+                        {
+                            "code": 200,
+                            "result": {
+                                "startInngcourseList": [
+                                    {"courseId": 5566, "courseName": "刷新后拉到的翻转课"}
+                                ]
+                            },
+                        }
+                    )
+                return _FakeResp({}, status_code=200)
+
+            def post(self, url, data=None, headers=None, timeout=None):
+                if url == SHARE_COURSE_LIST_URL:
+                    return _FakeResp(
+                        {
+                            "code": 200,
+                            "result": {
+                                "totalCount": "bad",
+                                "courseOpenDtos": [
+                                    {"courseName": "第一页共享课", "secret": "page1sec99"}
+                                ],
+                            },
+                        }
+                    )
+                if url == AI_COURSE_LIST_URL:
+                    return _FakeResp({"status": "200", "rt": []})
+                return _FakeResp({}, status_code=404)
+
+        client = ZhsApiClient([])
+        fake_sess = _ExpiredOnlineThenRefreshSession()
+        client.session = fake_sess
+        client.lock = threading.RLock()
+        sso_services = []
+
+        def _fake_ensure_sso(service: str) -> bool:
+            sso_services.append(service)
+            if service == ONLINE_SERVICE_SSO_URL:
+                fake_sess.online_refreshed = True
+                fake_sess.cookies.set_cookie(
+                    create_cookie("SESSION", "fresh-online", domain="onlineservice-api.zhihuishu.com")
+                )
+            elif service == HIKE_SERVICE_SSO_URL:
+                fake_sess.hike_refreshed = True
+                fake_sess.cookies.set_cookie(
+                    create_cookie("SESSION", "fresh-hike", domain="hikeservice.zhihuishu.com")
+                )
+            return True
+
+        client.ensure_service_sso = _fake_ensure_sso
+
+        res = fetch_courses_via_api([], client=client)
+        self.assertTrue(res.session_valid)
+        self.assertEqual(res.display_name, "刷新用户")
+        self.assertEqual(res.school_name, "工大")
+        self.assertEqual(fake_sess.user_info_calls, 2)
+        self.assertEqual(fake_sess.hike_calls, 2)
+        self.assertEqual(sso_services, [ONLINE_SERVICE_SSO_URL, HIKE_SERVICE_SSO_URL])
+        self.assertEqual(res.sources["zhidao"], 1)
+        self.assertEqual(res.sources["hike"], 1)
+        urls = [c.url for c in res.courses]
+        self.assertIn(
+            "https://studyvideoh5.zhihuishu.com/stuStudy?recruitAndCourseId=page1sec99",
+            urls,
+        )
+        self.assertIn(
+            "https://hike.zhihuishu.com/aidedteaching/sourceLearning/sourceLearning?courseId=5566",
+            urls,
+        )
+
+    def test_fetch_courses_via_api_marks_valid_when_only_hike_succeeds_and_expired_on_all_fail(self):
         import threading
         from urllib.parse import quote
         from requests.cookies import RequestsCookieJar, create_cookie
@@ -383,13 +591,16 @@ class CourseFetcherTests(unittest.TestCase):
         from modules.zhs_api import ZhsApiClient
 
         class _FakeResp:
-            def __init__(self, payload, status_code=200):
+            def __init__(self, payload=None, status_code=200, text="", raise_json=False):
                 self._payload = payload
                 self.status_code = status_code
-                self.text = json.dumps(payload, ensure_ascii=False)
+                self.text = text or (json.dumps(payload, ensure_ascii=False) if payload is not None else "")
+                self._raise_json = raise_json
                 self.headers = {}
 
             def json(self):
+                if self._raise_json:
+                    raise ValueError("not json")
                 return self._payload
 
             def raise_for_status(self):
@@ -400,10 +611,11 @@ class CourseFetcherTests(unittest.TestCase):
                     err.response = self
                     raise err
 
-        class _ExpiredSession:
-            def __init__(self):
+        class _OnlyHikeSession:
+            def __init__(self, hike_ok: bool):
+                self.hike_ok = hike_ok
                 self.cookies = RequestsCookieJar()
-                caslogc = quote(json.dumps({"uuid": "u-exp"}))
+                caslogc = quote(json.dumps({"uuid": "u-hike"}))
                 self.cookies.set_cookie(create_cookie("CASLOGC", caslogc, domain=".zhihuishu.com"))
                 self.headers = {}
 
@@ -411,12 +623,14 @@ class CourseFetcherTests(unittest.TestCase):
                 if url.startswith(LOGIN_USER_INFO_URL):
                     return _FakeResp({"code": 403, "result": None}, status_code=200)
                 if url == HIKE_COURSE_LIST_URL:
+                    if not self.hike_ok:
+                        return _FakeResp(None, status_code=200, text="<html>login</html>", raise_json=True)
                     return _FakeResp(
                         {
                             "code": 200,
                             "result": {
                                 "startInngcourseList": [
-                                    {"courseId": 123, "courseName": "仅UUID可见的校内课"}
+                                    {"courseId": 123, "courseName": "仅Hike有效的校内课"}
                                 ]
                             },
                         }
@@ -426,15 +640,21 @@ class CourseFetcherTests(unittest.TestCase):
             def post(self, url, data=None, headers=None, timeout=None):
                 return _FakeResp({"code": 401, "message": "Forbidden"}, status_code=401)
 
-        client = ZhsApiClient([])
-        client.session = _ExpiredSession()
-        client.lock = threading.RLock()
+        client_ok = ZhsApiClient([])
+        client_ok.session = _OnlyHikeSession(hike_ok=True)
+        client_ok.lock = threading.RLock()
+        res_ok = fetch_courses_via_api([], client=client_ok)
+        self.assertTrue(res_ok.session_valid)
+        self.assertEqual(res_ok.sources["zhidao"], 0)
+        self.assertEqual(res_ok.sources["ai"], 0)
+        self.assertEqual(res_ok.sources["hike"], 1)
 
-        res = fetch_courses_via_api([], client=client)
-        self.assertFalse(res.session_valid)
-        self.assertEqual(res.sources["zhidao"], 0)
-        self.assertEqual(res.sources["ai"], 0)
-        self.assertEqual(res.sources["hike"], 1)
+        client_exp = ZhsApiClient([])
+        client_exp.session = _OnlyHikeSession(hike_ok=False)
+        client_exp.lock = threading.RLock()
+        res_exp = fetch_courses_via_api([], client=client_exp)
+        self.assertFalse(res_exp.session_valid)
+        self.assertEqual(res_exp.sources["hike"], 0)
 
 
 if __name__ == "__main__":

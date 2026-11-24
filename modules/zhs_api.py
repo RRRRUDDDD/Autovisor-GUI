@@ -134,6 +134,28 @@ def extract_caslogc_info(cookies) -> dict:
     return parsed if isinstance(parsed, dict) else {}
 
 
+def set_cookie_dict(cookie_jar, cookie: dict) -> None:
+    """将 Playwright 风格 Cookie 字典写入 CookieJar, 完整保留 domain/path/expires/secure/httpOnly."""
+    name = cookie.get("name")
+    value = cookie.get("value")
+    if not name or value is None:
+        return
+    kwargs: dict = {
+        "secure": bool(cookie.get("secure", False)),
+        "rest": {"HttpOnly": None} if bool(cookie.get("httpOnly")) else {},
+    }
+    domain = str(cookie.get("domain") or "").strip()
+    if domain:
+        kwargs["domain"] = domain
+    path = str(cookie.get("path") or "").strip()
+    if path:
+        kwargs["path"] = path
+    expires = cookie.get("expires")
+    if isinstance(expires, (int, float)) and not isinstance(expires, bool) and expires > 0:
+        kwargs["expires"] = int(expires) if float(expires).is_integer() else float(expires)
+    cookie_jar.set(name, value, **kwargs)
+
+
 def build_session(cookies, proxy: str = "", user_agent: str = "") -> requests.Session:
     """用浏览器导出的 Cookie 构造带代理/重试的 requests 会话."""
     session = create_retry_session(proxy, headers=dict(DEFAULT_HEADERS))
@@ -142,22 +164,14 @@ def build_session(cookies, proxy: str = "", user_agent: str = "") -> requests.Se
     if isinstance(cookies, dict):
         cookies = [{"name": name, "value": value} for name, value in cookies.items()]
     for cookie in cookies or []:
-        name = cookie.get("name")
-        value = cookie.get("value")
-        if not name or value is None:
-            continue
-        kwargs = {}
-        domain = str(cookie.get("domain") or "").strip()
-        if domain:
-            kwargs["domain"] = domain
-        path = str(cookie.get("path") or "").strip()
-        if path:
-            kwargs["path"] = path
-        session.cookies.set(name, value, **kwargs)
+        if isinstance(cookie, dict):
+            set_cookie_dict(session.cookies, cookie)
     caslogc = extract_caslogc_info(session.cookies)
     uuid = str(caslogc.get("uuid") or "").strip()
     if uuid:
-        session.cookies.set(f"exitRecod_{uuid}", "2", domain=".zhihuishu.com", path="/")
+        session.cookies.set(
+            f"exitRecod_{uuid}", "2", domain=".zhihuishu.com", path="/", rest={}
+        )
     return session
 
 

@@ -589,18 +589,11 @@ def sync_zhs_client_cookies(client, cookies) -> None:
     session = getattr(client, "session", None)
     if session is None:
         return
+    from modules.zhs_api import set_cookie_dict
+
     for cookie in cookies or []:
-        name = cookie.get("name")
-        value = cookie.get("value")
-        if name and value is not None:
-            kwargs = {}
-            domain = str(cookie.get("domain") or "").strip()
-            if domain:
-                kwargs["domain"] = domain
-            path = str(cookie.get("path") or "").strip()
-            if path:
-                kwargs["path"] = path
-            session.cookies.set(name, value, **kwargs)
+        if isinstance(cookie, dict):
+            set_cookie_dict(session.cookies, cookie)
     reset = getattr(client, "reset_exam_sso", None)
     if callable(reset):
         reset()

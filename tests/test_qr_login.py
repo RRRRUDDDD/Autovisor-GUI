@@ -74,11 +74,24 @@ class QrLoginTests(unittest.TestCase):
 
     def test_requests_cookies_to_playwright_filters_domain(self):
         jar = RequestsCookieJar()
-        jar.set_cookie(create_cookie("CASLOGC", "abc", domain=".zhihuishu.com"))
+        jar.set_cookie(create_cookie("CASLOGC", "abc", domain=".zhihuishu.com", rest={}))
+        jar.set_cookie(
+            create_cookie(
+                "CASTGC",
+                "tgt-1",
+                domain=".zhihuishu.com",
+                secure=True,
+                expires=1893456000,
+                rest={"HttpOnly": None},
+            )
+        )
         jar.set_cookie(create_cookie("OTHER", "xyz", domain=".example.com"))
-        converted = requests_cookies_to_playwright(jar)
-        self.assertEqual(len(converted), 1)
-        self.assertEqual(converted[0]["name"], "CASLOGC")
+        converted = {c["name"]: c for c in requests_cookies_to_playwright(jar)}
+        self.assertEqual(set(converted.keys()), {"CASLOGC", "CASTGC"})
+        self.assertFalse(converted["CASLOGC"]["httpOnly"])
+        self.assertTrue(converted["CASTGC"]["httpOnly"])
+        self.assertTrue(converted["CASTGC"]["secure"])
+        self.assertEqual(converted["CASTGC"]["expires"], 1893456000.0)
 
     def test_qr_login_full_flow_with_refresh(self):
         png_b64 = b64encode(_sample_qr_png()).decode("ascii")

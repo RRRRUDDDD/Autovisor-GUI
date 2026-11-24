@@ -239,6 +239,9 @@ def _format_progress(raw: str) -> str:
     return text
 
 
+_AI_WORD_RE = re.compile(r"(?<![a-z])ai(?![a-z])")
+
+
 def _build_course_from_dict(
     obj: dict,
     *,
@@ -288,9 +291,11 @@ def _build_course_from_dict(
             bool(obj.get("aiCourseId"))
             or "ai-smart" in ai_hint
             or "aicourse" in ai_hint
+            or "ai_course" in ai_hint
             or "ai智慧" in ai_hint
             or "ai 智慧" in ai_hint
-            or ("ai" in ai_hint and "aided" not in ai_hint)
+            or "querystudentaicourselist" in ai_hint
+            or bool(_AI_WORD_RE.search(ai_hint))
         )
         if course_id and class_id and is_ai_smart:
             url = (
@@ -627,32 +632,46 @@ def fetch_courses_via_api(
         session_valid = False
 
         # 1) 用户基础信息（补充姓名 / 学校 / uuid）
-        try:
+        def _fetch_login_user_info() -> tuple[int, dict | None]:
             with client.lock:
                 u_resp = client.session.get(
                     f"{LOGIN_USER_INFO_URL}?time={int(time.time() * 1000)}",
                     timeout=15,
                 )
-            if u_resp.status_code == 200:
+            u_status = int(getattr(u_resp, "status_code", 0) or 0)
+            if u_status != 200:
+                return u_status, None
+            try:
                 u_body = u_resp.json()
-                u_res = u_body.get("result") if isinstance(u_body, dict) else None
-                if isinstance(u_res, dict) and (
-                    u_res.get("uuid") or u_res.get("username") or u_res.get("realName")
-                ):
-                    session_valid = True
-                    uuid = uuid or str(u_res.get("uuid") or "").strip()
-                    display_name = (
-                        str(
-                            u_res.get("realName")
-                            or u_res.get("nickName")
-                            or u_res.get("username")
-                            or ""
-                        ).strip()
-                        or display_name
-                    )
-                    school_name = (
-                        str(u_res.get("schoolName") or "").strip() or school_name
-                    )
+            except ValueError:
+                return u_status, None
+            u_res = u_body.get("result") if isinstance(u_body, dict) else None
+            if isinstance(u_res, dict) and (
+                u_res.get("uuid") or u_res.get("username") or u_res.get("realName")
+            ):
+                return u_status, u_res
+            return u_status, None
+
+        try:
+            u_status, u_res = _fetch_login_user_info()
+            if (u_status != 200 or not u_res) and not sso_refreshed:
+                _ensure_online_sso_once()
+                u_status, u_res = _fetch_login_user_info()
+            if u_res:
+                session_valid = True
+                uuid = uuid or str(u_res.get("uuid") or "").strip()
+                display_name = (
+                    str(
+                        u_res.get("realName")
+                        or u_res.get("nickName")
+                        or u_res.get("username")
+                        or ""
+                    ).strip()
+                    or display_name
+                )
+                school_name = (
+                    str(u_res.get("schoolName") or "").strip() or school_name
+                )
         except Exception as exc:
             if logger:
                 logger.debug(f"拉取智慧树用户信息失败: {exc}")
@@ -682,8 +701,11 @@ def fetch_courses_via_api(
                 if isinstance(first_page.get("result"), dict)
                 else {}
             )
-            total_count = int(res.get("totalCount") or 0)
             dtos = list(res.get("courseOpenDtos") or [])
+            try:
+                total_count = int(res.get("totalCount") or 0)
+            except (TypeError, ValueError):
+                total_count = len(dtos)
             total_pages = min(
                 max(1, math.ceil(total_count / _SHARE_PAGE_SIZE)) if total_count > 0 else 1,
                 _MAX_SHARE_PAGES,
@@ -749,35 +771,80 @@ def fetch_courses_via_api(
         hike_courses: list[FetchedCourse] = []
         if uuid:
             try:
+                hike_sso_refreshed = False
+
+                def _ensure_hike_sso_once() -> None:
+                    nonlocal hike_sso_refreshed
+                    if hike_sso_refreshed:
+                        return
+                    hike_sso_refreshed = True
+                    client.ensure_service_sso(HIKE_SERVICE_SSO_URL)
+
+                if own_client and not _has_host_cookie(
+                    client.session, "hikeservice.zhihuishu.com", "SESSION"
+                ):
+                    _ensure_hike_sso_once()
+
                 now = datetime.now(timezone.utc)
                 params = {
                     "uuid": uuid,
                     "data": now.strftime("%Y-%m-%dT%H:%M:%S.")
                     + f"{now.microsecond // 1000:03d}Z",
                 }
-                with client.lock:
-                    h_resp = client.session.get(
-                        HIKE_COURSE_LIST_URL, params=params, timeout=15
-                    )
-                if h_resp.status_code in (401, 403):
-                    client.ensure_service_sso(HIKE_SERVICE_SSO_URL)
+
+                def _fetch_hike() -> tuple[int, dict | None, bool]:
                     with client.lock:
                         h_resp = client.session.get(
                             HIKE_COURSE_LIST_URL, params=params, timeout=15
                         )
-                if h_resp.status_code == 200:
-                    h_body = h_resp.json()
+                    h_status = int(getattr(h_resp, "status_code", 0) or 0)
+                    if h_status in (401, 403):
+                        return h_status, None, True
+                    if h_status != 200:
+                        return h_status, None, False
+                    try:
+                        h_body = h_resp.json()
+                    except ValueError:
+                        return h_status, None, True
+                    if not isinstance(h_body, dict):
+                        return h_status, None, True
+                    h_code = h_body.get("code")
+                    h_st = str(h_body.get("status") or "").strip()
+                    h_msg = str(h_body.get("message") or h_body.get("msg") or "").lower()
+                    if (
+                        h_code in (401, 403)
+                        or h_st in ("401", "403")
+                        or any(
+                            tok in h_msg
+                            for tok in ("未登录", "unauthorized", "forbidden")
+                        )
+                    ):
+                        return h_status, h_body, True
+                    return h_status, h_body, False
+
+                h_status, h_body, need_retry = _fetch_hike()
+                if need_retry and not hike_sso_refreshed:
+                    _ensure_hike_sso_once()
+                    h_status, h_body, need_retry = _fetch_hike()
+
+                if h_status == 200 and isinstance(h_body, dict) and not need_retry:
+                    h_code = h_body.get("code")
                     h_res = (
                         h_body.get("result")
-                        if isinstance(h_body, dict) and isinstance(h_body.get("result"), dict)
-                        else {}
+                        if isinstance(h_body.get("result"), dict)
+                        else None
                     )
-                    items = h_res.get("startInngcourseList") or []
-                    if isinstance(items, list) and items:
-                        hike_courses = extract_courses_from_json(
-                            {"startInngcourseList": items},
-                            source_url=HIKE_COURSE_LIST_URL,
-                        )
+                    if h_code in (0, 200, "0", "200") or (
+                        isinstance(h_res, dict) and bool(h_res)
+                    ):
+                        session_valid = True
+                    if isinstance(h_res, dict):
+                        items = h_res.get("startInngcourseList") or []
+                        if isinstance(items, list) and items:
+                            hike_courses = extract_courses_from_json(
+                                {"startInngcourseList": items},
+                                source_url=HIKE_COURSE_LIST_URL,
+                            )
             except Exception as exc:
                 if logger:
                     logger.debug(f"API 拉取翻转/校内课列表失败: {exc}")

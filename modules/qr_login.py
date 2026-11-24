@@ -117,6 +117,19 @@ def display_qr_image(
     return saved_path
 
 
+def _is_cookie_http_only(cookie) -> bool:
+    """从 Cookie._rest 或 nonstandard_attr 还原 HttpOnly 标记."""
+    rest = getattr(cookie, "_rest", None)
+    if isinstance(rest, dict):
+        for key, val in rest.items():
+            if str(key).lower() == "httponly":
+                return val is not False
+    has_nonstd = getattr(cookie, "has_nonstandard_attr", None)
+    if callable(has_nonstd):
+        return bool(has_nonstd("HttpOnly") or has_nonstd("httponly"))
+    return False
+
+
 def requests_cookies_to_playwright(cookie_jar) -> list[dict]:
     """将 requests.CookieJar 转换为 Playwright context.add_cookies 可用格式。"""
     raw_cookies = []
@@ -132,10 +145,10 @@ def requests_cookies_to_playwright(cookie_jar) -> list[dict]:
             "domain": str(domain),
             "path": str(getattr(cookie, "path", None) or "/"),
             "secure": bool(getattr(cookie, "secure", False)),
-            "httpOnly": False,
+            "httpOnly": _is_cookie_http_only(cookie),
         }
         expires = getattr(cookie, "expires", None)
-        if isinstance(expires, (int, float)) and expires > 0:
+        if isinstance(expires, (int, float)) and not isinstance(expires, bool) and expires > 0:
             item["expires"] = float(expires)
         raw_cookies.append(item)
     return filter_zhihuishu_cookies(raw_cookies)
