@@ -463,7 +463,7 @@ class BackendServerProcessTests(unittest.TestCase):
                 with urllib.request.urlopen(req_sse, timeout=5) as resp:
                     event_line = resp.readline().decode("utf-8").strip()
                     data_line = resp.readline().decode("utf-8").strip()
-                self.assertEqual(event_line, "event: state")
+                self.assertEqual(event_line, "event: snapshot")
                 self.assertTrue(data_line.startswith("data: "))
                 sse_state = json.loads(data_line[len("data: "):])
                 self.assertEqual(sse_state["status"], "idle")
@@ -694,6 +694,650 @@ class BackendServerProcessTests(unittest.TestCase):
                 server.shutdown()
                 server.server_close()
                 thread.join(timeout=3)
+
+    def test_security_fail_closed_host_origin_content_type_ssrf_and_paths(self):
+        import http.client
+        import threading
+        import backend_server
+
+        with tempfile.TemporaryDirectory() as tmp:
+            class _FakeManager:
+                def __init__(self, data_dir):
+                    self.data_dir = data_dir
+
+                def snapshot(self):
+                    return {"status": "idle"}
+
+                def shutdown(self):
+                    pass
+
+            mgr = _FakeManager(tmp)
+
+            # 1. Fail-closed when server token is empty and allow_insecure_dev=False
+            empty_srv = backend_server.BackendHTTPServer(
+                ("127.0.0.1", 0),
+                backend_server.BackendRequestHandler,
+                mgr,
+                "",
+                "1.0.0-test",
+            )
+            empty_port = empty_srv.server_address[1]
+            empty_thread = threading.Thread(target=empty_srv.serve_forever, daemon=True)
+            empty_thread.start()
+            try:
+                conn = http.client.HTTPConnection("127.0.0.1", empty_port, timeout=5)
+                conn.request("GET", "/api/health")
+                resp = conn.getresponse()
+                self.assertEqual(resp.status, 401)
+                conn.close()
+            finally:
+                empty_srv.shutdown()
+                empty_srv.server_close()
+                empty_thread.join(timeout=3)
+
+            # 2. Full security checks with valid token
+            token = "strict-test-token-abcdef"
+            srv = backend_server.BackendHTTPServer(
+                ("127.0.0.1", 0),
+                backend_server.BackendRequestHandler,
+                mgr,
+                token,
+                "1.0.0-test",
+            )
+            port = srv.server_address[1]
+            thread = threading.Thread(target=srv.serve_forever, daemon=True)
+            thread.start()
+            try:
+                # 2a. Invalid Host header -> 403
+                conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+                conn.putrequest("GET", "/api/health", skip_host=True)
+                conn.putheader("Host", "evil.example.com:80")
+                conn.putheader("X-Autovisor-Token", token)
+                conn.endheaders()
+                resp = conn.getresponse()
+                self.assertEqual(resp.status, 403)
+                conn.close()
+
+                # 2b. Malicious Origin header -> 403
+                conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+                conn.request(
+                    "GET",
+                    "/api/health",
+                    headers={
+                        "X-Autovisor-Token": token,
+                        "Origin": "https://evil.example.com",
+                    },
+                )
+                resp = conn.getresponse()
+                self.assertEqual(resp.status, 403)
+                conn.close()
+
+                # 2c. Valid Tauri Origin allowed -> 200
+                conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+                conn.request(
+                    "GET",
+                    "/api/health",
+                    headers={
+                        "X-Autovisor-Token": token,
+                        "Origin": "http://tauri.localhost",
+                    },
+                )
+                resp = conn.getresponse()
+                self.assertEqual(resp.status, 200)
+                conn.close()
+
+                # 2d. POST without application/json Content-Type -> 415
+                conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+                conn.request(
+                    "POST",
+                    "/api/tasks/start",
+                    body=b'{"mode":"study"}',
+                    headers={
+                        "X-Autovisor-Token": token,
+                        "Content-Type": "text/plain",
+                    },
+                )
+                resp = conn.getresponse()
+                self.assertEqual(resp.status, 415)
+                conn.close()
+
+                # 2e. /api/captcha/solve rejects non-loopback cdpUrl -> 400
+                for bad_cdp in (
+                    "http://169.254.169.254/latest/meta-data",
+                    "ws://evil.example.com:9222/devtools/browser",
+                    "http://192.168.1.10:9222",
+                ):
+                    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+                    conn.request(
+                        "POST",
+                        "/api/captcha/solve",
+                        body=json.dumps({"cdpUrl": bad_cdp}).encode("utf-8"),
+                        headers={
+                            "X-Autovisor-Token": token,
+                            "Content-Type": "application/json",
+                        },
+                    )
+                    resp = conn.getresponse()
+                    self.assertEqual(resp.status, 400, bad_cdp)
+                    conn.close()
+
+                # 2f. /api/tasks/start import_cookies & /api/qr-login/* reject traversal/UNC
+                for endpoint, payload in (
+                    ("/api/tasks/start", {"mode": "import_cookies", "target": "../secret.json"}),
+                    ("/api/tasks/start", {"mode": "import_cookies", "target": r"\\evil\share\c.json"}),
+                    ("/api/qr-login/start", {"saveDir": "../escape"}),
+                    ("/api/qr-login/save", {"sessionId": "s1", "saveDir": "../escape"}),
+                ):
+                    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+                    conn.request(
+                        "POST",
+                        endpoint,
+                        body=json.dumps(payload).encode("utf-8"),
+                        headers={
+                            "X-Autovisor-Token": token,
+                            "Content-Type": "application/json",
+                        },
+                    )
+                    resp = conn.getresponse()
+                    self.assertEqual(resp.status, 400, f"{endpoint} {payload}")
+                    conn.close()
+            finally:
+                srv.shutdown()
+                srv.server_close()
+                thread.join(timeout=3)
+
+    def test_auth_stdin_handshake_and_auto_fail_closed_token(self):
+        repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        script = os.path.join(repo_root, "backend_server.py")
+        token = "stdin-secret-token-9876543210"
+
+        with tempfile.TemporaryDirectory() as tmp:
+            env = os.environ.copy()
+            env.pop("AUTOVISOR_BACKEND_TOKEN", None)
+            env["PYTHONUNBUFFERED"] = "1"
+            proc = subprocess.Popen(
+                [
+                    sys.executable,
+                    script,
+                    "--data-dir",
+                    tmp,
+                    "--resources-dir",
+                    os.path.join(repo_root, "resources"),
+                    "--auth-stdin",
+                ],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding="utf-8",
+                env=env,
+            )
+            try:
+                proc.stdin.write(json.dumps({"authToken": token}) + "\n")
+                proc.stdin.flush()
+
+                line = proc.stdout.readline()
+                self.assertTrue(line.strip(), "backend did not emit handshake after stdin auth")
+                handshake = json.loads(line)
+                port = int(handshake["port"])
+                base_url = f"http://127.0.0.1:{port}"
+
+                # Missing token rejected with 401
+                with self.assertRaises(urllib.error.HTTPError) as ctx:
+                    urllib.request.urlopen(f"{base_url}/api/health", timeout=5)
+                self.assertEqual(ctx.exception.code, 401)
+
+                # Valid stdin token accepted
+                req = urllib.request.Request(
+                    f"{base_url}/api/health",
+                    headers={"X-Autovisor-Token": token},
+                )
+                with urllib.request.urlopen(req, timeout=5) as resp:
+                    health = json.loads(resp.read().decode("utf-8"))
+                self.assertTrue(health["ok"])
+
+                # Closing stdin still triggers graceful exit
+                proc.stdin.close()
+                self.assertEqual(proc.wait(timeout=8), 0)
+            finally:
+                if proc.poll() is None:
+                    proc.kill()
+                    proc.wait(timeout=5)
+                for stream in (proc.stdin, proc.stdout, proc.stderr):
+                    if stream is not None:
+                        try:
+                            stream.close()
+                        except Exception:
+                            pass
+
+        # Starting without env token or --allow-insecure-dev auto-generates token (Fail-Closed)
+        with tempfile.TemporaryDirectory() as tmp:
+            env = os.environ.copy()
+            env.pop("AUTOVISOR_BACKEND_TOKEN", None)
+            env["PYTHONUNBUFFERED"] = "1"
+            proc = subprocess.Popen(
+                [
+                    sys.executable,
+                    script,
+                    "--data-dir",
+                    tmp,
+                    "--resources-dir",
+                    os.path.join(repo_root, "resources"),
+                ],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding="utf-8",
+                env=env,
+            )
+            try:
+                line = proc.stdout.readline()
+                self.assertTrue(line.strip())
+                port = int(json.loads(line)["port"])
+                with self.assertRaises(urllib.error.HTTPError) as ctx:
+                    urllib.request.urlopen(f"http://127.0.0.1:{port}/api/health", timeout=5)
+                self.assertEqual(ctx.exception.code, 401)
+                proc.stdin.close()
+                self.assertEqual(proc.wait(timeout=8), 0)
+            finally:
+                if proc.poll() is None:
+                    proc.kill()
+                    proc.wait(timeout=5)
+                for stream in (proc.stdin, proc.stdout, proc.stderr):
+                    if stream is not None:
+                        try:
+                            stream.close()
+                        except Exception:
+                            pass
+
+
+class Phase2TaskCancellationTests(unittest.TestCase):
+    def test_stopping_status_rejects_start_until_active_future_finishes_and_isolates_run_id(self):
+        import asyncio
+        import threading
+        import time
+        from unittest import mock
+
+        with tempfile.TemporaryDirectory() as tmp:
+            os.makedirs(os.path.join(tmp, "data"), exist_ok=True)
+            with open(os.path.join(tmp, "data", "mirrors.json"), "w", encoding="utf-8") as f:
+                f.write('{"Official": "https://pypi.org"}')
+
+            entered = threading.Event()
+            allow_exit = threading.Event()
+
+            async def slow_cleanup_check_browser(config, logger, cookie_path):
+                entered.set()
+                try:
+                    await asyncio.sleep(60)
+                finally:
+                    # 模拟退出收尾耗时，超出 stop_task(wait_timeout)
+                    while not allow_exit.is_set():
+                        await asyncio.sleep(0.02)
+                return 0
+
+            mgr = TaskManager(tmp)
+            try:
+                with mock.patch(
+                    "modules.diagnostics.check_browser",
+                    side_effect=slow_cleanup_check_browser,
+                ):
+                    mgr.start_task("check_browser")
+                    self.assertTrue(entered.wait(timeout=5.0))
+                    first_run_id = mgr._run_id
+
+                    # stop_task 在超时后应保持 stopping 而非提前变回 cancelled
+                    stopping_snap = mgr.stop_task(wait_timeout=0.1)
+                    self.assertEqual(stopping_snap["status"], "stopping")
+
+                    # 任务仍在收尾（_active_future 未完成），禁止启动新任务
+                    with self.assertRaises(RuntimeError):
+                        mgr.start_task("check_browser")
+
+                    # 旧 run_id 的事件与新 run_id 隔离
+                    mgr.on_logger_event(
+                        "log",
+                        {"level": "error", "message": "stale run error"},
+                        run_id=first_run_id - 1,
+                    )
+                    self.assertEqual(mgr.snapshot()["errorMessage"], "")
+
+                    # 放行收尾，状态最终变为 cancelled 且 _loop 可正常继续运行
+                    allow_exit.set()
+                    deadline = time.time() + 5.0
+                    while time.time() < deadline and mgr.snapshot()["status"] == "stopping":
+                        time.sleep(0.02)
+                    self.assertEqual(mgr.snapshot()["status"], "cancelled")
+            finally:
+                allow_exit.set()
+                mgr.shutdown()
+                self.assertTrue(mgr._loop.is_closed())
+                self.assertFalse(mgr._loop_thread.is_alive())
+
+    def test_solve_captcha_timeout_cancels_future_and_closes_cdp_browser(self):
+        import asyncio
+        import threading
+        from unittest import mock
+        import backend_server
+
+        with tempfile.TemporaryDirectory() as tmp:
+            mgr = TaskManager(tmp)
+            closed_event = threading.Event()
+            try:
+                class HangingBrowser:
+                    contexts = []
+
+                    async def close(self):
+                        closed_event.set()
+
+                class HangingChromium:
+                    async def connect_over_cdp(self, url):
+                        return HangingBrowser()
+
+                class FakePlaywrightCtx:
+                    chromium = HangingChromium()
+
+                    async def __aenter__(self):
+                        return self
+
+                    async def __aexit__(self, exc_type, exc, tb):
+                        return False
+
+                async def never_finish(*args, **kwargs):
+                    await asyncio.sleep(30)
+                    return None
+
+                fake_page = mock.MagicMock()
+                fake_page.url = "https://passport.zhihuishu.com/login"
+                fake_ctx = mock.MagicMock()
+                fake_ctx.pages = [fake_page]
+                HangingBrowser.contexts = [fake_ctx]
+
+                with (
+                    mock.patch.object(backend_server, "_load_captcha_modules", return_value=object()),
+                    mock.patch("playwright.async_api.async_playwright", return_value=FakePlaywrightCtx()),
+                    mock.patch("modules.slider.resolve_captcha_target", side_effect=never_finish),
+                ):
+                    with self.assertRaises(Exception):
+                        mgr.solve_captcha(
+                            "http://127.0.0.1:9222",
+                            "https://passport.zhihuishu.com/login",
+                            10000,
+                            1,
+                            timeout=0.5,
+                        )
+                self.assertTrue(closed_event.wait(timeout=3.0))
+            finally:
+                mgr.shutdown()
+
+    def test_sync_workers_respect_cancel_event_for_early_exit(self):
+        import threading
+        from unittest import mock
+        from modules.exam_ctx import ExamRunner
+        from modules.zhidao_exam_worker import ZhidaoExamWorker
+        from modules.zhidao_homework_worker import ZhidaoHomeworkWorker
+
+        # 1. ExamRunner stops before running remaining nodes
+        ev = threading.Event()
+        api = mock.MagicMock()
+        runner = ExamRunner("c1", "cls1", api, cancel_event=ev)
+        ev.set()
+        summary = runner.run([{"nodeUid": "n1", "name": "Node 1"}])
+        self.assertEqual(summary, {"done": [], "skipped": [], "failed": []})
+        api.query_paper.assert_not_called()
+
+        # 2. ZhidaoHomeworkWorker stops mid-question loop and skips submit
+        hw_ev = threading.Event()
+        hw_api = mock.MagicMock()
+        hw_api.do_homework.return_value = {
+            "rt": {
+                "examBase": {
+                    "homeworkId": "h1",
+                    "totalScore": 100,
+                    "workExamParts": [
+                        {
+                            "questionDtos": [
+                                {
+                                    "id": 101,
+                                    "eid": "E1",
+                                    "questionType": {"id": 1},
+                                    "name": "Q1",
+                                    "questionOptions": [
+                                        {"id": 1, "content": "A"},
+                                        {"id": 2, "content": "B"},
+                                    ],
+                                },
+                                {
+                                    "id": 102,
+                                    "eid": "E2",
+                                    "questionType": {"id": 1},
+                                    "name": "Q2",
+                                    "questionOptions": [
+                                        {"id": 3, "content": "A"},
+                                        {"id": 4, "content": "B"},
+                                    ],
+                                },
+                            ]
+                        }
+                    ],
+                }
+            }
+        }
+        hw_api.save_student_answer.side_effect = lambda **kwargs: (hw_ev.set(), {"status": 1})[1]
+        with tempfile.TemporaryDirectory() as tmp:
+            from modules.answer_store import AiQuestionStore
+
+            store = AiQuestionStore(db_path=os.path.join(tmp, "q.db"), data_root=tmp)
+            hw_worker = ZhidaoHomeworkWorker(
+                hw_api,
+                course_id="c1",
+                store=store,
+                answerer=lambda prompt: '```answer\n["A"]\n```',
+                auto_submit=True,
+                sleep=lambda _: None,
+                cancel_event=hw_ev,
+            )
+            stats = hw_worker.run(
+                recruit_id="r1", course_id="c1", homework_id="h1", stu_exam_id="s1"
+            )
+            self.assertEqual(stats["answered"], 1)
+            self.assertFalse(stats["submitted"])
+            hw_api.submit.assert_not_called()
+
+            # 3. ZhidaoExamWorker stops mid-question loop and skips submit
+            ex_ev = threading.Event()
+            ex_api = mock.MagicMock()
+            ex_api.get_save_answer_lock_result.return_value = {"rt": {"lockState": 0}}
+            ex_api.do_exam.return_value = hw_api.do_homework.return_value
+            ex_api.save_student_answer.side_effect = lambda **kwargs: (ex_ev.set(), {"status": 1})[1]
+            ex_worker = ZhidaoExamWorker(
+                ex_api,
+                course_id="c1",
+                store=store,
+                answerer=lambda prompt: '```answer\n["A"]\n```',
+                auto_submit=True,
+                sleep=lambda _: None,
+                cancel_event=ex_ev,
+            )
+            ex_stats = ex_worker.run(
+                recruit_id="r1", course_id="c1", exam_id="e1", student_exam_id="s1", school_id="1"
+            )
+            self.assertEqual(ex_stats["answered"], 1)
+            self.assertFalse(ex_stats["submitted"])
+            ex_api.submit.assert_not_called()
+
+    def test_question_bank_error_handling_sqlite_500_store_reuse_and_graceful_shutdown(self):
+        import sqlite3
+        import threading
+        from unittest import mock
+        import backend_server
+
+        token = "t21-http-token"
+        with tempfile.TemporaryDirectory() as tmp:
+            mgr = TaskManager(tmp)
+            srv = backend_server.BackendHTTPServer(
+                ("127.0.0.1", 0),
+                backend_server.BackendRequestHandler,
+                mgr,
+                token,
+                "1.0.0-test",
+            )
+            port = srv.server_address[1]
+            thread = threading.Thread(target=srv.serve_forever, daemon=True)
+            thread.start()
+            base_url = f"http://127.0.0.1:{port}"
+
+            try:
+                # 1. Store instance is reused across calls
+                s1 = srv.get_question_store()
+                s2 = srv.get_question_store()
+                self.assertIs(s1, s2)
+
+                # 2. Local SQLite error on /api/cache/stats returns 500
+                with mock.patch.object(s1, "stats", side_effect=sqlite3.OperationalError("disk I/O error")):
+                    req = urllib.request.Request(
+                        f"{base_url}/api/cache/stats",
+                        headers={"X-Autovisor-Token": token},
+                    )
+                    with self.assertRaises(urllib.error.HTTPError) as ctx:
+                        urllib.request.urlopen(req, timeout=5)
+                    self.assertEqual(ctx.exception.code, 500)
+
+                # 3. /api/question-bank/test catches ValueError -> 400 and runtime errors -> 502
+                with mock.patch(
+                    "modules.question_bank.QuestionBankClient.probe",
+                    side_effect=ValueError("invalid url"),
+                ):
+                    req = urllib.request.Request(
+                        f"{base_url}/api/question-bank/test",
+                        data=json.dumps({"token": "t"}).encode("utf-8"),
+                        headers={
+                            "X-Autovisor-Token": token,
+                            "Content-Type": "application/json",
+                        },
+                        method="POST",
+                    )
+                    with self.assertRaises(urllib.error.HTTPError) as ctx:
+                        urllib.request.urlopen(req, timeout=5)
+                    self.assertEqual(ctx.exception.code, 400)
+
+                with mock.patch(
+                    "modules.question_bank.QuestionBankClient.probe",
+                    side_effect=RuntimeError("boom"),
+                ):
+                    req = urllib.request.Request(
+                        f"{base_url}/api/question-bank/test",
+                        data=json.dumps({"token": "t"}).encode("utf-8"),
+                        headers={
+                            "X-Autovisor-Token": token,
+                            "Content-Type": "application/json",
+                        },
+                        method="POST",
+                    )
+                    with self.assertRaises(urllib.error.HTTPError) as ctx:
+                        urllib.request.urlopen(req, timeout=5)
+                    self.assertEqual(ctx.exception.code, 502)
+
+                # 4. graceful_shutdown is idempotent and closes qr_manager + TaskManager loop
+                fake_qr = mock.MagicMock()
+                srv._qr_manager = fake_qr
+                srv.graceful_shutdown(stop_http=True)
+                srv.graceful_shutdown(stop_http=True)
+                fake_qr.close_all.assert_called_once()
+                self.assertTrue(srv.shutdown_event.is_set())
+                self.assertTrue(mgr._loop.is_closed())
+            finally:
+                srv.graceful_shutdown(stop_http=True)
+                srv.server_close()
+                thread.join(timeout=3)
+
+    def test_sse_delta_and_coalescing_window(self):
+        import queue
+        import time
+
+        with tempfile.TemporaryDirectory() as tmp:
+            mgr = TaskManager(tmp)
+            try:
+                q = mgr.subscribe()
+                ev0, snap0 = q.get(timeout=1.0)
+                self.assertEqual(ev0, "snapshot")
+                self.assertIn("logs", snap0)
+
+                with mgr._lock:
+                    mgr._state["status"] = "running"
+
+                # Burst of progress + logs inside 150ms coalesce window
+                mgr.on_progress("播放中", 10.0, 9.0)
+                for i in range(5):
+                    mgr.on_logger_event("log", {"level": "info", "message": f"line-{i}"})
+                mgr.on_progress("播放中", 35.0, 6.0)
+
+                # Wait slightly beyond 150ms coalesce window
+                time.sleep(0.25)
+                frames = []
+                while True:
+                    try:
+                        frames.append(q.get_nowait())
+                    except queue.Empty:
+                        break
+
+                # Should have received lightweight state deltas (without 'logs') and batched log deltas
+                state_frames = [data for ev, data in frames if ev == "state"]
+                log_frames = [data for ev, data in frames if ev == "log"]
+                self.assertTrue(len(state_frames) >= 1)
+                for sf in state_frames:
+                    self.assertNotIn("logs", sf)
+                self.assertAlmostEqual(state_frames[-1]["lessonProgress"], 35.0)
+
+                collected_msgs = [
+                    e["message"] for lf in log_frames for e in lf.get("entries", [])
+                ]
+                self.assertEqual(collected_msgs, [f"line-{i}" for i in range(5)])
+                # Coalescing should batch the burst into far fewer frames than 5 separate events
+                self.assertLessEqual(len(log_frames), 2)
+                self.assertIn("revision", state_frames[-1])
+                self.assertGreater(state_frames[-1]["revision"], snap0.get("revision", 0))
+            finally:
+                mgr.shutdown()
+
+    def test_concurrent_graceful_shutdown_waits_for_first_cleanup_completion(self):
+        import threading
+        import time
+        from backend_server import BackendHTTPServer, BackendRequestHandler
+
+        with tempfile.TemporaryDirectory() as tmp:
+            mgr = TaskManager(tmp)
+            srv = BackendHTTPServer(
+                ("127.0.0.1", 0),
+                BackendRequestHandler,
+                mgr,
+                token="test-token-123",
+                app_version="3.20.0",
+            )
+            cleanup_started = threading.Event()
+            cleanup_finished = threading.Event()
+            orig_shutdown = mgr.shutdown
+
+            def slow_shutdown():
+                cleanup_started.set()
+                time.sleep(0.15)
+                orig_shutdown()
+                cleanup_finished.set()
+
+            mgr.shutdown = slow_shutdown
+            try:
+                t1 = threading.Thread(
+                    target=srv.graceful_shutdown, kwargs={"stop_http": False}
+                )
+                t1.start()
+                self.assertTrue(cleanup_started.wait(timeout=2.0))
+                # Second concurrent caller must wait until first cleanup completes
+                srv.graceful_shutdown(stop_http=False)
+                self.assertTrue(cleanup_finished.is_set())
+                t1.join(timeout=3.0)
+            finally:
+                srv.server_close()
 
 
 if __name__ == "__main__":

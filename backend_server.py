@@ -11,11 +11,15 @@
 import argparse
 import asyncio
 from collections import deque
+import hmac
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import os
+from pathlib import PurePath
 import queue
+import secrets
+import sqlite3
 import sys
 import threading
 import time
@@ -26,6 +30,7 @@ from modules.shutdown import SHUTDOWN_OUTCOMES, ShutdownManager
 
 
 LOG_LIMIT = 800
+SSE_COALESCE_SECS = 0.15
 
 
 def _now_secs() -> float:
@@ -57,6 +62,8 @@ def _parse_cli_args(argv=None):
     parser.add_argument("--resources-dir", default="", help="只读内置资源目录（stealth.min.js）")
     parser.add_argument("--host", default="127.0.0.1", help="监听地址，固定仅允许回环地址")
     parser.add_argument("--port", type=int, default=0, help="监听端口，0 表示系统自动分配")
+    parser.add_argument("--auth-stdin", action="store_true", help="从 stdin 首行 JSON 握手读取认证令牌")
+    parser.add_argument("--allow-insecure-dev", action="store_true", help="仅限本地手动调试：允许无令牌免鉴权访问")
     parser.add_argument("--verify-deps", action="store_true", help="校验内置运行时依赖是否可直接导入并退出")
     args = parser.parse_args(argv)
     if not args.verify_deps and not args.data_dir:
@@ -151,7 +158,7 @@ async def _solve_captcha_via_cdp(
             return {"solved": bool(solved), "type": kind}
         finally:
             try:
-                await browser.close()
+                await asyncio.wait_for(browser.close(), timeout=3.0)
             except Exception:
                 pass
 
@@ -169,13 +176,20 @@ class TaskManager:
         self._log_ring: deque[dict] = deque(maxlen=LOG_LIMIT)
         self._next_seq = 1
         self._run_id = 0
+        self._revision = 0
         self._cancel_requested = False
+        self._cancel_event: threading.Event | None = None
         self._shutdown_cancelled_for_run = False
         self._active_task: asyncio.Task | None = None
         self._active_future = None
         self._active_logger = None
         self._debug_log_enabled = False
         self._closed = False
+        self._pending_state_dirty = False
+        self._pending_snapshot_reset = False
+        self._pending_logs: list[dict] = []
+        self._broadcast_timer: threading.Timer | None = None
+        self._last_flush_at = 0.0
 
         # 独立 asyncio 事件循环线程，避免阻塞 HTTP 服务线程
         self._loop = asyncio.new_event_loop()
@@ -187,7 +201,9 @@ class TaskManager:
     @staticmethod
     def _default_state() -> dict:
         return {
-            "status": "idle",  # idle | running | completed | time_limit | error | cancelled
+            "runId": 0,
+            "revision": 0,
+            "status": "idle",  # idle | running | stopping | completed | time_limit | error | cancelled
             "mode": "study",
             "reviewMode": False,
             "shutdownOnComplete": False,
@@ -223,32 +239,132 @@ class TaskManager:
 
     def _snapshot_locked(self) -> dict:
         snap = dict(self._state)
+        snap["runId"] = self._run_id
+        snap["revision"] = self._revision
         snap["completedLessons"] = list(self._state["completedLessons"])
         snap["logs"] = list(self._log_ring)
         shutdown = self._state.get("shutdown")
         snap["shutdown"] = dict(shutdown) if isinstance(shutdown, dict) else None
         return snap
 
-    def _broadcast_locked(self):
-        snap = self._snapshot_locked()
-        for q in list(self._subscribers):
+    def _state_delta_locked(self) -> dict:
+        delta = dict(self._state)
+        delta["runId"] = self._run_id
+        delta["revision"] = self._revision
+        delta.pop("logs", None)
+        delta["completedLessons"] = list(self._state["completedLessons"])
+        shutdown = self._state.get("shutdown")
+        delta["shutdown"] = dict(shutdown) if isinstance(shutdown, dict) else None
+        return delta
+
+    def _enqueue_subscriber_locked(
+        self, q: queue.Queue, frames: list[tuple[str, dict]]
+    ) -> None:
+        for frame in frames:
             try:
-                q.put_nowait(snap)
+                q.put_nowait(frame)
             except queue.Full:
+                # 慢消费者队列溢出：清空旧增量并下发完整快照自愈，避免丢日志或状态漂移
+                while True:
+                    try:
+                        q.get_nowait()
+                    except queue.Empty:
+                        break
                 try:
-                    q.get_nowait()
-                except queue.Empty:
-                    pass
-                try:
-                    q.put_nowait(snap)
+                    q.put_nowait(("snapshot", self._snapshot_locked()))
                 except queue.Full:
                     pass
+                return
+
+    def _flush_pending_locked(self) -> None:
+        if self._broadcast_timer is not None:
+            self._broadcast_timer.cancel()
+            self._broadcast_timer = None
+        if not self._subscribers:
+            self._pending_snapshot_reset = False
+            self._pending_state_dirty = False
+            self._pending_logs.clear()
+            return
+        frames: list[tuple[str, dict]] = []
+        if self._pending_snapshot_reset:
+            frames.append(("snapshot", self._snapshot_locked()))
+            self._pending_snapshot_reset = False
+            self._pending_state_dirty = False
+            self._pending_logs.clear()
+        else:
+            if self._pending_state_dirty:
+                frames.append(("state", self._state_delta_locked()))
+                self._pending_state_dirty = False
+            if self._pending_logs:
+                frames.append(
+                    (
+                        "log",
+                        {
+                            "runId": self._run_id,
+                            "revision": self._revision,
+                            "entries": list(self._pending_logs),
+                            "logsTruncated": bool(self._state.get("logsTruncated")),
+                        },
+                    )
+                )
+                self._pending_logs.clear()
+        if not frames:
+            return
+        self._last_flush_at = time.monotonic()
+        for q in list(self._subscribers):
+            self._enqueue_subscriber_locked(q, frames)
+
+    def _flush_coalesced(self, timer: threading.Timer) -> None:
+        with self._lock:
+            if self._broadcast_timer is not timer:
+                return
+            self._broadcast_timer = None
+            if self._closed:
+                return
+            self._flush_pending_locked()
+
+    def _broadcast_locked(
+        self,
+        *,
+        state_dirty: bool = True,
+        urgent: bool = False,
+        reset_snapshot: bool = False,
+    ):
+        self._revision += 1
+        self._state["revision"] = self._revision
+        if reset_snapshot:
+            self._pending_snapshot_reset = True
+            self._pending_state_dirty = False
+            self._pending_logs.clear()
+        elif state_dirty:
+            self._pending_state_dirty = True
+
+        if not self._subscribers:
+            self._pending_snapshot_reset = False
+            self._pending_state_dirty = False
+            self._pending_logs.clear()
+            return
+
+        now = time.monotonic()
+        elapsed = now - self._last_flush_at
+        if urgent or reset_snapshot or elapsed >= SSE_COALESCE_SECS:
+            self._flush_pending_locked()
+            return
+
+        if self._broadcast_timer is None and not self._closed:
+            delay = max(0.01, SSE_COALESCE_SECS - elapsed)
+            timer_holder: list[threading.Timer] = []
+            timer = threading.Timer(delay, lambda: self._flush_coalesced(timer_holder[0]))
+            timer_holder.append(timer)
+            timer.daemon = True
+            self._broadcast_timer = timer
+            timer.start()
 
     def subscribe(self) -> queue.Queue:
-        q: queue.Queue = queue.Queue(maxsize=32)
+        q: queue.Queue = queue.Queue(maxsize=64)
         with self._lock:
             self._subscribers.add(q)
-            q.put_nowait(self._snapshot_locked())
+            q.put_nowait(("snapshot", self._snapshot_locked()))
         return q
 
     def unsubscribe(self, q: queue.Queue):
@@ -261,21 +377,31 @@ class TaskManager:
             return
         if len(self._log_ring) >= LOG_LIMIT:
             self._state["logsTruncated"] = True
-        self._log_ring.append(
-            {
-                "seq": self._next_seq,
-                "timestamp": _now_secs(),
-                "level": level,
-                "message": text,
-            }
-        )
+        entry = {
+            "seq": self._next_seq,
+            "timestamp": _now_secs(),
+            "level": level,
+            "message": text,
+        }
+        self._log_ring.append(entry)
+        if self._subscribers:
+            self._pending_logs.append(entry)
         self._next_seq += 1
 
     # ---- Logger & Progress 结构化事件回调 ----
 
-    def on_progress(self, desc: str, percent: float, remaining: float | None):
+    def on_progress(
+        self,
+        desc: str,
+        percent: float,
+        remaining: float | None,
+        *,
+        run_id: int | None = None,
+    ):
         pct = max(0.0, min(100.0, float(percent)))
         with self._lock:
+            if run_id is not None and self._run_id != run_id:
+                return
             if self._state["status"] != "running":
                 return
             changed = (
@@ -290,9 +416,11 @@ class TaskManager:
             if changed:
                 self._broadcast_locked()
 
-    def on_logger_event(self, kind: str, payload: dict):
+    def on_logger_event(self, kind: str, payload: dict, *, run_id: int | None = None):
         with self._lock:
-            if self._state["status"] != "running" and kind != "log_file":
+            if run_id is not None and self._run_id != run_id:
+                return
+            if self._state["status"] not in ("running", "stopping") and kind != "log_file":
                 return
             changed = False
             if kind == "section":
@@ -583,8 +711,9 @@ class TaskManager:
                         )
                         changed = True
                 elif name == "达到课程时限":
-                    self._state["status"] = "time_limit"
-                    changed = True
+                    if self._state["status"] == "running":
+                        self._state["status"] = "time_limit"
+                        changed = True
                 elif name == "人工介入":
                     status_val = str(fields.get("状态") or "").strip()
                     if status_val == "需要":
@@ -617,13 +746,16 @@ class TaskManager:
                 msg = str(payload.get("message") or "").strip()
                 if not msg:
                     return
+                state_dirty = False
                 if level == "error":
                     self._state["errorMessage"] = msg
+                    state_dirty = True
                 self._push_log_locked(level, msg)
-                changed = True
+                self._broadcast_locked(state_dirty=state_dirty)
+                return
 
             if changed:
-                self._broadcast_locked()
+                self._broadcast_locked(state_dirty=True)
 
     # ---- 任务启动 / 停止 / 关闭 ----
 
@@ -642,8 +774,10 @@ class TaskManager:
             with self._lock:
                 if self._closed:
                     raise RuntimeError("内置服务正在关闭")
-                if self._state["status"] == "running":
-                    raise RuntimeError("当前已有任务正在运行，请先停止后再启动新任务")
+                if self._state["status"] in ("running", "stopping"):
+                    raise RuntimeError("当前已有任务正在运行或正在停止，请先等待停止后再启动新任务")
+                if self._active_future is not None and not self._active_future.done():
+                    raise RuntimeError("上一轮任务仍在收尾中，请稍后再启动新任务")
                 prev_shutdown = self._state.get("shutdown")
                 prev_scheduled = (
                     isinstance(prev_shutdown, dict)
@@ -655,13 +789,22 @@ class TaskManager:
                 except Exception:
                     pass
             with self._lock:
+                if self._closed:
+                    raise RuntimeError("内置服务正在关闭")
+                if self._state["status"] in ("running", "stopping") or (
+                    self._active_future is not None and not self._active_future.done()
+                ):
+                    raise RuntimeError("当前已有任务正在运行或正在停止，请先等待停止后再启动新任务")
                 self._log_ring.clear()
                 self._next_seq = 1
                 self._run_id += 1
                 run_id = self._run_id
                 self._cancel_requested = False
+                cancel_event = threading.Event()
+                self._cancel_event = cancel_event
                 self._shutdown_cancelled_for_run = False
                 self._state = self._default_state()
+                self._state["runId"] = run_id
                 self._state["status"] = "running"
                 self._state["mode"] = mode
                 self._state["startedAt"] = _now_secs()
@@ -669,12 +812,12 @@ class TaskManager:
                 if prev_scheduled:
                     self._push_log_locked("info", "已自动取消上一轮任务的系统关机倒计时")
                 self._push_log_locked("info", "内置学习引擎已启动，正在初始化任务...")
+                self._broadcast_locked(reset_snapshot=True, urgent=True)
                 snap = self._snapshot_locked()
-                self._broadcast_locked()
+                self._active_future = asyncio.run_coroutine_threadsafe(
+                    self._execute_task(mode, target, run_id, cancel_event), self._loop
+                )
 
-        self._active_future = asyncio.run_coroutine_threadsafe(
-            self._execute_task(mode, target, run_id), self._loop
-        )
         return snap
 
     def set_debug_log(self, enabled: bool) -> bool:
@@ -700,7 +843,7 @@ class TaskManager:
                     self._state["shutdownOnComplete"] = False
                     self._state["shutdown"] = {"state": "cancelled"}
                     self._push_log_locked("info", "已取消自动关机计划，系统不会自动关闭")
-                    self._broadcast_locked()
+                    self._broadcast_locked(urgent=True)
                     return self._snapshot_locked()
 
             if armed:
@@ -709,7 +852,7 @@ class TaskManager:
                     self._state["shutdownOnComplete"] = False
                     self._state["shutdown"] = {"state": "cancelled"}
                     self._push_log_locked("info", "已取消当前任务的完成后自动关机")
-                    self._broadcast_locked()
+                    self._broadcast_locked(urgent=True)
                     return self._snapshot_locked()
 
             return self.snapshot()
@@ -717,17 +860,23 @@ class TaskManager:
     def stop_task(self, wait_timeout: float = 4.0) -> dict:
         with self._lock:
             self._cancel_requested = True
+            if self._cancel_event is not None:
+                self._cancel_event.set()
             task = self._active_task
             fut = self._active_future
-            was_running = self._state["status"] == "running"
-            if was_running:
+            run_id = self._run_id
+            if self._state["status"] == "running":
+                self._state["status"] = "stopping"
                 self._state["stage"] = "正在停止..."
                 self._state["needsAttention"] = ""
                 self._push_log_locked("warning", "收到停止指令，正在优雅关闭浏览器并保存进度...")
-                self._broadcast_locked()
+                self._broadcast_locked(urgent=True)
 
         if task is not None and not task.done():
-            self._loop.call_soon_threadsafe(task.cancel)
+            try:
+                self._loop.call_soon_threadsafe(task.cancel)
+            except Exception:
+                pass
         elif fut is not None and not fut.done():
             fut.cancel()
 
@@ -738,17 +887,28 @@ class TaskManager:
                 pass
 
         with self._lock:
-            if self._state["status"] == "running":
+            finished = fut is None or fut.done()
+            if finished and self._run_id == run_id and self._state["status"] in ("running", "stopping"):
                 self._state["status"] = "cancelled"
                 self._state["stage"] = "已停止"
                 self._state["finishedAt"] = _now_secs()
                 self._state["needsAttention"] = ""
-                self._broadcast_locked()
+                if self._active_future is fut:
+                    self._active_future = None
+                self._broadcast_locked(urgent=True)
             return self._snapshot_locked()
 
     def shutdown(self):
         with self._lock:
+            if self._closed:
+                return
             self._closed = True
+            self._cancel_requested = True
+            if self._cancel_event is not None:
+                self._cancel_event.set()
+            if self._broadcast_timer is not None:
+                self._broadcast_timer.cancel()
+                self._broadcast_timer = None
         try:
             self.stop_task(wait_timeout=3.0)
         except Exception:
@@ -757,8 +917,40 @@ class TaskManager:
             self._shutdown_manager.reset()
         except Exception:
             pass
+        if (
+            self._loop_thread.is_alive()
+            and threading.current_thread() is not self._loop_thread
+            and not self._loop.is_closed()
+        ):
+            async def _cancel_remaining():
+                current = asyncio.current_task()
+                pending = [
+                    t for t in asyncio.all_tasks() if t is not current and not t.done()
+                ]
+                for t in pending:
+                    t.cancel()
+                if pending:
+                    await asyncio.gather(*pending, return_exceptions=True)
+
+            try:
+                cancel_fut = asyncio.run_coroutine_threadsafe(_cancel_remaining(), self._loop)
+                cancel_fut.result(timeout=2.0)
+            except Exception:
+                pass
+            try:
+                self._loop.call_soon_threadsafe(self._loop.stop)
+            except Exception:
+                pass
+            self._loop_thread.join(timeout=3.0)
+        if not self._loop_thread.is_alive() and not self._loop.is_closed():
+            try:
+                self._loop.close()
+            except Exception:
+                pass
         try:
-            self._loop.call_soon_threadsafe(self._loop.stop)
+            from modules import llm
+
+            llm.close_all_http_sessions()
         except Exception:
             pass
 
@@ -773,13 +965,27 @@ class TaskManager:
         with self._lock:
             if self._closed:
                 raise RuntimeError("后端正在关闭")
+        inner_timeout = max(0.5, float(timeout))
         fut = asyncio.run_coroutine_threadsafe(
-            _solve_captcha_via_cdp(cdp_url, page_url, appear_ms, attempts),
+            asyncio.wait_for(
+                _solve_captcha_via_cdp(cdp_url, page_url, appear_ms, attempts),
+                timeout=inner_timeout,
+            ),
             self._loop,
         )
-        return fut.result(timeout=timeout)
+        try:
+            return fut.result(timeout=inner_timeout + 5.0)
+        except Exception:
+            fut.cancel()
+            raise
 
-    async def _execute_task(self, mode: str, target: str, run_id: int = 0):
+    async def _execute_task(
+        self,
+        mode: str,
+        target: str,
+        run_id: int = 0,
+        cancel_event: threading.Event | None = None,
+    ):
         import platform
         import Autovisor
         from modules import installer, llm, progress
@@ -792,26 +998,43 @@ class TaskManager:
 
         logger = Logger()
         with self._lock:
+            if self._run_id != run_id:
+                return
             logger.emit_debug = self._debug_log_enabled
+            already_cancelled = self._cancel_requested or (
+                cancel_event is not None and cancel_event.is_set()
+            )
+            self._active_task = asyncio.current_task()
+            self._active_logger = logger
         Autovisor.logger = logger
 
         exit_code = 0
         error_msg = ""
         log_file = ""
         try:
+            if already_cancelled:
+                raise asyncio.CancelledError()
             config_path = os.path.join(self.data_dir, "config.ini")
             mirrors_path = os.path.join(self.data_dir, "data", "mirrors.json")
             created_files = ensure_config_files(config_path)
             config = Config(config_path, mirrors_path)
+            if cancel_event is not None:
+                setattr(config, "_cancel_event", cancel_event)
             # 先按用户配置维护旧日志, 再切换本轮日志, 避免用默认保留期误删
             logger.configure_from_config(config)
             log_file = logger.start_new_run()
-            logger.set_event_sink(self.on_logger_event)
-            progress.set_progress_sink(self.on_progress)
+            logger.set_event_sink(
+                lambda kind, payload: self.on_logger_event(kind, payload, run_id=run_id)
+            )
+            progress.set_progress_sink(
+                lambda desc, percent, remaining: self.on_progress(
+                    desc, percent, remaining, run_id=run_id
+                )
+            )
 
             with self._lock:
-                self._active_task = asyncio.current_task()
-                self._active_logger = logger
+                if self._run_id != run_id:
+                    return
                 self._state["logFilePath"] = log_file
                 self._broadcast_locked()
 
@@ -848,7 +1071,8 @@ class TaskManager:
             Autovisor.COOKIE_PATH = cookie_path
             llm.reset_cache()
             llm.set_proxy(getattr(config, "proxy", ""))
-            notifier_preview = Notifier.from_config(config, logger=logger)
+            with Notifier.from_config(config, logger=logger) as notifier_preview:
+                configured_channels = ",".join(notifier_preview.configured_channels()) or "未配置"
             logger.context(配置文件=config_path, 任务模式=mode)
             logger.event(
                 "运行配置",
@@ -868,10 +1092,11 @@ class TaskManager:
                 接口考试=config.enableExamApi,
                 知到作业接口=config.enableHomeworkApi,
                 知到考试接口=config.enableFormalExamApi,
+                已答重做=getattr(config, "forceRedoAnswered", False),
                 掌握度刷题=config.enableMastery,
                 复习考试接口=config.enableReviewExamApi,
                 目标掌握度=config.masteryTarget,
-                消息推送=",".join(notifier_preview.configured_channels()) or "未配置",
+                消息推送=configured_channels,
                 静音=config.soundOff,
                 复习模式=config.reviewMode,
                 倍速=config.limitSpeed,
@@ -912,115 +1137,239 @@ class TaskManager:
             error_msg = f"{type(exc).__name__}: {exc}"
             logger.log_exception("任务执行过程中出现异常.", exc, shift=True)
         finally:
-            logger.emit_debug = False
             with self._lock:
-                if self._active_logger is logger:
+                is_current_run = self._run_id == run_id
+                if is_current_run and self._active_logger is logger:
                     self._active_logger = None
-            try:
-                logger.save(inform=False)
-            except Exception:
-                pass
-            logger.clear_context()
-            logger.set_event_sink(None)
-            progress.set_progress_sink(None)
+            if is_current_run:
+                logger.emit_debug = False
+                try:
+                    logger.save(inform=False)
+                except Exception:
+                    pass
+                logger.clear_context()
+                logger.set_event_sink(None)
+                progress.set_progress_sink(None)
 
-            with self._shutdown_lock:
-                with self._lock:
-                    cancelled = self._cancel_requested or exit_code == -1
-                    if cancelled:
-                        terminal_status = "cancelled"
-                    elif exit_code == 0:
-                        terminal_status = (
-                            "time_limit"
-                            if self._state["status"] == "time_limit"
-                            else "completed"
-                        )
-                    else:
-                        terminal_status = "error"
-                    should_schedule = (
-                        mode == "study"
-                        and terminal_status in SHUTDOWN_OUTCOMES
-                        and bool(self._state.get("shutdownOnComplete"))
-                        and not self._shutdown_cancelled_for_run
-                        and not self._closed
-                    )
-
-                shutdown_info = None
-                if should_schedule:
-                    try:
-                        shutdown_info = self._shutdown_manager.schedule(run_id)
-                    except Exception as exc:
-                        shutdown_info = {
-                            "state": "failed",
-                            "error": str(exc).strip() or "系统拒绝了关机请求",
-                        }
-
-                with self._lock:
-                    self._active_task = None
-                    self._state["finishedAt"] = _now_secs()
-                    self._state["needsAttention"] = ""
-                    if self._cancel_requested or exit_code == -1:
-                        self._state["status"] = "cancelled"
-                        self._state["stage"] = "已停止"
-                        self._state["exitCode"] = None
-                    elif exit_code == 0:
-                        if self._state["status"] != "time_limit":
-                            self._state["status"] = "completed"
-                        self._state["stage"] = "已结束"
-                        self._state["exitCode"] = 0
-                    else:
-                        self._state["status"] = "error"
-                        self._state["stage"] = "异常结束"
-                        self._state["exitCode"] = exit_code
-                        if error_msg and not self._state["errorMessage"]:
-                            self._state["errorMessage"] = error_msg
-                        elif not self._state["errorMessage"]:
-                            self._state["errorMessage"] = (
-                                f"任务异常结束（退出码 {exit_code}），请查看日志"
+                with self._shutdown_lock:
+                    with self._lock:
+                        if self._run_id != run_id:
+                            return
+                        cancelled = self._cancel_requested or exit_code == -1
+                        if cancelled:
+                            terminal_status = "cancelled"
+                        elif exit_code == 0:
+                            terminal_status = (
+                                "time_limit"
+                                if self._state["status"] == "time_limit"
+                                else "completed"
                             )
-
-                    if shutdown_info is not None:
-                        if (
-                            shutdown_info.get("state") == "scheduled"
-                            and (
-                                self._state["status"] == "cancelled"
-                                or self._shutdown_cancelled_for_run
-                                or self._closed
-                            )
-                        ):
-                            try:
-                                self._shutdown_manager.cancel(run_id)
-                            except Exception:
-                                pass
-                            self._state["shutdownOnComplete"] = False
-                            self._state["shutdown"] = {"state": "cancelled"}
                         else:
-                            self._state["shutdown"] = shutdown_info
-                            if shutdown_info.get("state") == "scheduled":
-                                self._push_log_locked(
-                                    "warning",
-                                    f"学习任务已结束，系统将在 {shutdown_info['delaySeconds']} 秒后自动关机，可在运行监控页取消关机",
+                            terminal_status = "error"
+                        should_schedule = (
+                            mode == "study"
+                            and terminal_status in SHUTDOWN_OUTCOMES
+                            and bool(self._state.get("shutdownOnComplete"))
+                            and not self._shutdown_cancelled_for_run
+                            and not self._closed
+                        )
+
+                    shutdown_info = None
+                    if should_schedule:
+                        try:
+                            shutdown_info = self._shutdown_manager.schedule(run_id)
+                        except Exception as exc:
+                            shutdown_info = {
+                                "state": "failed",
+                                "error": str(exc).strip() or "系统拒绝了关机请求",
+                            }
+
+                    with self._lock:
+                        if self._run_id != run_id:
+                            return
+                        self._active_task = None
+                        self._cancel_event = None
+                        self._state["finishedAt"] = _now_secs()
+                        self._state["needsAttention"] = ""
+                        if self._cancel_requested or exit_code == -1:
+                            self._state["status"] = "cancelled"
+                            self._state["stage"] = "已停止"
+                            self._state["exitCode"] = None
+                        elif exit_code == 0:
+                            if self._state["status"] != "time_limit":
+                                self._state["status"] = "completed"
+                            self._state["stage"] = "已结束"
+                            self._state["exitCode"] = 0
+                        else:
+                            self._state["status"] = "error"
+                            self._state["stage"] = "异常结束"
+                            self._state["exitCode"] = exit_code
+                            if error_msg:
+                                self._state["errorMessage"] = error_msg
+                            elif not self._state["errorMessage"]:
+                                # 若运行以非 0 退出但未记录 error 级别日志（如课时进度未确认以 warn 退出），
+                                # 提取最近一条告警/错误日志作为可见原因，避免仅提示“退出码 1”。
+                                fallback_reason = ""
+                                for entry in reversed(self._log_ring):
+                                    if entry.get("level") in ("error", "warning"):
+                                        msg_text = str(entry.get("message") or "").strip()
+                                        if msg_text:
+                                            fallback_reason = msg_text
+                                            break
+                                self._state["errorMessage"] = fallback_reason or (
+                                    f"任务异常结束（退出码 {exit_code}），请查看日志"
                                 )
-                            elif shutdown_info.get("state") == "failed":
-                                self._push_log_locked(
-                                    "error",
-                                    f"自动关机启动失败：{shutdown_info.get('error') or '系统拒绝了关机请求'}",
+
+                        if shutdown_info is not None:
+                            if (
+                                shutdown_info.get("state") == "scheduled"
+                                and (
+                                    self._state["status"] == "cancelled"
+                                    or self._shutdown_cancelled_for_run
+                                    or self._closed
                                 )
-                    self._broadcast_locked()
+                            ):
+                                try:
+                                    self._shutdown_manager.cancel(run_id)
+                                except Exception:
+                                    pass
+                                self._state["shutdownOnComplete"] = False
+                                self._state["shutdown"] = {"state": "cancelled"}
+                            else:
+                                self._state["shutdown"] = shutdown_info
+                                if shutdown_info.get("state") == "scheduled":
+                                    self._push_log_locked(
+                                        "warning",
+                                        f"学习任务已结束，系统将在 {shutdown_info['delaySeconds']} 秒后自动关机，可在运行监控页取消关机",
+                                    )
+                                elif shutdown_info.get("state") == "failed":
+                                    self._push_log_locked(
+                                        "error",
+                                        f"自动关机启动失败：{shutdown_info.get('error') or '系统拒绝了关机请求'}",
+                                    )
+                        self._broadcast_locked(urgent=True)
+
+
+_LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
+_ALLOWED_ORIGIN_HOSTS = frozenset({"127.0.0.1", "localhost", "::1", "tauri.localhost"})
+
+
+def _is_valid_host_header(host: str | None) -> bool:
+    raw = str(host or "").strip()
+    if not raw or any(ch.isspace() or ord(ch) < 32 for ch in raw):
+        return False
+    try:
+        parsed = urlparse(f"http://{raw}")
+    except ValueError:
+        return False
+    if parsed.username is not None or parsed.password is not None:
+        return False
+    if parsed.path or parsed.params or parsed.query or parsed.fragment:
+        return False
+    try:
+        _ = parsed.port
+    except ValueError:
+        return False
+    return (parsed.hostname or "").lower() in _LOOPBACK_HOSTS
+
+
+def _is_valid_origin_header(origin: str | None) -> bool:
+    raw = str(origin or "").strip()
+    if not raw:
+        return True
+    if any(ch.isspace() or ord(ch) < 32 for ch in raw):
+        return False
+    try:
+        parsed = urlparse(raw)
+    except ValueError:
+        return False
+    scheme = (parsed.scheme or "").lower()
+    hostname = (parsed.hostname or "").lower()
+    if scheme == "tauri":
+        return hostname == "localhost"
+    if scheme in ("http", "https"):
+        return hostname in _ALLOWED_ORIGIN_HOSTS
+    return False
+
+
+def _is_loopback_cdp_url(cdp_url: str) -> bool:
+    raw = str(cdp_url or "").strip()
+    if not raw or any(ch.isspace() or ord(ch) < 32 for ch in raw):
+        return False
+    try:
+        parsed = urlparse(raw)
+    except ValueError:
+        return False
+    if parsed.scheme not in ("ws", "wss", "http", "https"):
+        return False
+    return (parsed.hostname or "").lower() in _LOOPBACK_HOSTS
+
+
+def _validate_user_path(raw: str, *, expect_dir: bool) -> str:
+    text = str(raw or "").strip()
+    if not text:
+        raise ValueError("路径不能为空")
+    if any(ord(ch) < 32 for ch in text):
+        raise ValueError("路径包含非法控制字符")
+    if text.startswith("\\\\") or text.startswith("//"):
+        raise ValueError("禁止使用网络 UNC 路径")
+    if ".." in PurePath(text).parts:
+        raise ValueError("路径禁止包含目录遍历片段 (..)")
+    resolved = os.path.realpath(os.path.abspath(text))
+    if expect_dir:
+        if not os.path.isdir(resolved):
+            raise ValueError(f"目录不存在或无效: {text}")
+    else:
+        if not os.path.isfile(resolved):
+            raise ValueError(f"文件不存在或不是普通文件: {text}")
+    return resolved
 
 
 class BackendHTTPServer(ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = True
 
-    def __init__(self, addr, handler_cls, manager: TaskManager, token: str, app_version: str):
+    def __init__(
+        self,
+        addr,
+        handler_cls,
+        manager: TaskManager,
+        token: str,
+        app_version: str,
+        *,
+        allow_insecure_dev: bool = False,
+    ):
         self.manager = manager
         self.token = token
+        self.allow_insecure_dev = bool(allow_insecure_dev)
         self.app_version = app_version
         self.shutdown_event = threading.Event()
+        self._shutdown_once_lock = threading.Lock()
+        self._shutdown_done = False
+        self._shutdown_complete = threading.Event()
         self._qr_manager_lock = threading.Lock()
         self._qr_manager = None
+        self._question_store_lock = threading.Lock()
+        self._question_store = None
+        self._question_store_db_path = ""
         super().__init__(addr, handler_cls)
+
+    def get_question_store(self):
+        data_root = os.path.join(self.manager.data_dir, "data")
+        db_path = os.path.join(data_root, "questions_bank.db")
+        with self._question_store_lock:
+            if (
+                self._question_store is None
+                or self._question_store_db_path != db_path
+            ):
+                from modules.answer_store import AiQuestionStore
+
+                self._question_store = AiQuestionStore(
+                    db_path=db_path,
+                    data_root=data_root,
+                )
+                self._question_store_db_path = db_path
+            return self._question_store
 
     def get_qr_manager(self):
         with self._qr_manager_lock:
@@ -1040,6 +1389,33 @@ class BackendHTTPServer(ThreadingHTTPServer):
             except Exception:
                 pass
 
+    def graceful_shutdown(self, *, stop_http: bool = True):
+        """幂等统一关停：标记退出、清理二维码会话、关闭任务管理器与事件循环，并按需停止 HTTP 监听。"""
+        with self._shutdown_once_lock:
+            if self._shutdown_done:
+                already_started = True
+            else:
+                self._shutdown_done = True
+                already_started = False
+        if already_started:
+            # 等待首个关停流程完成清理，避免并发调用者（如 main() finally）提前退出进程打断清理
+            self._shutdown_complete.wait(timeout=8.0)
+            return
+        try:
+            self.shutdown_event.set()
+            self.close_qr_manager()
+            try:
+                self.manager.shutdown()
+            except Exception:
+                pass
+            if stop_http:
+                try:
+                    self.shutdown()
+                except Exception:
+                    pass
+        finally:
+            self._shutdown_complete.set()
+
 
 class BackendRequestHandler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
@@ -1048,12 +1424,37 @@ class BackendRequestHandler(BaseHTTPRequestHandler):
         # 无感后端不向控制台输出 HTTP 访问日志
         return
 
+    def _drain_request_body(self, max_bytes: int = 64 * 1024) -> None:
+        """提前拒绝 POST 请求前读取小体积剩余请求体，避免 Windows loopback 关闭时触发 TCP RST (WinError 10053)。"""
+        try:
+            length = int(self.headers.get("Content-Length") or "0")
+        except (TypeError, ValueError):
+            return
+        if 0 < length <= max_bytes:
+            try:
+                self.rfile.read(length)
+            except Exception:
+                pass
+
+    def _validate_request_origin(self) -> bool:
+        if not _is_valid_host_header(self.headers.get("Host")):
+            self._drain_request_body()
+            self._send_json(HTTPStatus.FORBIDDEN, {"error": "forbidden host"})
+            return False
+        if not _is_valid_origin_header(self.headers.get("Origin")):
+            self._drain_request_body()
+            self._send_json(HTTPStatus.FORBIDDEN, {"error": "forbidden origin"})
+            return False
+        return True
+
     def _authorized(self) -> bool:
-        expected = self.server.token
+        expected = getattr(self.server, "token", "") or ""
         if not expected:
-            return True
+            return bool(getattr(self.server, "allow_insecure_dev", False))
         provided = self.headers.get("X-Autovisor-Token", "")
-        return provided == expected
+        if not provided:
+            return False
+        return hmac.compare_digest(provided, expected)
 
     def _send_json(self, status: int, payload: dict):
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
@@ -1080,15 +1481,11 @@ class BackendRequestHandler(BaseHTTPRequestHandler):
         return data
 
     def _question_store(self):
-        from modules.answer_store import AiQuestionStore
-
-        data_root = os.path.join(self.server.manager.data_dir, "data")
-        return AiQuestionStore(
-            db_path=os.path.join(data_root, "questions_bank.db"),
-            data_root=data_root,
-        )
+        return self.server.get_question_store()
 
     def do_GET(self):
+        if not self._validate_request_origin():
+            return
         if not self._authorized():
             self._send_json(HTTPStatus.UNAUTHORIZED, {"error": "unauthorized"})
             return
@@ -1117,8 +1514,10 @@ class BackendRequestHandler(BaseHTTPRequestHandler):
             try:
                 stats = self._question_store().stats(course_id.strip() or None)
                 self._send_json(HTTPStatus.OK, {"ok": True, **stats})
-            except Exception as exc:
-                self._send_json(HTTPStatus.BAD_GATEWAY, {"error": str(exc)})
+            except ValueError as exc:
+                self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+            except (sqlite3.Error, Exception) as exc:
+                self._send_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": str(exc)})
             return
 
         if path == "/api/events":
@@ -1128,11 +1527,29 @@ class BackendRequestHandler(BaseHTTPRequestHandler):
         self._send_json(HTTPStatus.NOT_FOUND, {"error": f"not found: {path}"})
 
     def do_POST(self):
+        if not self._validate_request_origin():
+            return
         if not self._authorized():
+            self._drain_request_body()
             self._send_json(HTTPStatus.UNAUTHORIZED, {"error": "unauthorized"})
             return
 
         path = urlparse(self.path).path
+        try:
+            content_length = int(self.headers.get("Content-Length") or "0")
+        except (TypeError, ValueError):
+            self._send_json(HTTPStatus.BAD_REQUEST, {"error": "无效的 Content-Length"})
+            return
+        content_type = (self.headers.get("Content-Type") or "").split(";", 1)[0].strip().lower()
+        if content_type != "application/json":
+            if not (path == "/api/shutdown" and content_length <= 0):
+                self._drain_request_body()
+                self._send_json(
+                    HTTPStatus.UNSUPPORTED_MEDIA_TYPE,
+                    {"error": "Content-Type 必须为 application/json"},
+                )
+                return
+
         try:
             # 题库缓存导入包含全部历史题目, 单独放宽上限; 其他接口保持 2MB 保护
             body_limit = 20 * 1024 * 1024 if path == "/api/cache/import" else 2 * 1024 * 1024
@@ -1144,6 +1561,12 @@ class BackendRequestHandler(BaseHTTPRequestHandler):
         if path == "/api/tasks/start":
             mode = str(body.get("mode") or "study").strip()
             target = str(body.get("target") or "").strip()
+            if mode == "import_cookies":
+                try:
+                    target = _validate_user_path(target, expect_dir=False)
+                except ValueError as exc:
+                    self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                    return
             try:
                 state = self.server.manager.start_task(mode, target)
                 self._send_json(HTTPStatus.OK, state)
@@ -1193,12 +1616,14 @@ class BackendRequestHandler(BaseHTTPRequestHandler):
             try:
                 payload = self._question_store().export_data(course_id or None)
                 self._send_json(HTTPStatus.OK, {"ok": True, "data": payload})
-            except Exception as exc:
-                self._send_json(HTTPStatus.BAD_GATEWAY, {"error": str(exc)})
+            except ValueError as exc:
+                self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+            except (sqlite3.Error, Exception) as exc:
+                self._send_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": str(exc)})
             return
 
         if path == "/api/cache/import":
-            if self.server.manager.snapshot().get("status") == "running":
+            if self.server.manager.snapshot().get("status") in ("running", "stopping"):
                 self._send_json(
                     HTTPStatus.CONFLICT,
                     {"error": "任务运行中，请先停止当前学习任务后再导入题库缓存"},
@@ -1210,12 +1635,12 @@ class BackendRequestHandler(BaseHTTPRequestHandler):
                 self._send_json(HTTPStatus.OK, {"ok": True, **counts})
             except ValueError as exc:
                 self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
-            except Exception as exc:
-                self._send_json(HTTPStatus.BAD_GATEWAY, {"error": str(exc)})
+            except (sqlite3.Error, Exception) as exc:
+                self._send_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": str(exc)})
             return
 
         if path == "/api/cache/clear":
-            if self.server.manager.snapshot().get("status") == "running":
+            if self.server.manager.snapshot().get("status") in ("running", "stopping"):
                 self._send_json(
                     HTTPStatus.CONFLICT,
                     {"error": "任务运行中，请先停止当前学习任务后再清理题库缓存"},
@@ -1225,20 +1650,33 @@ class BackendRequestHandler(BaseHTTPRequestHandler):
             try:
                 counts = self._question_store().clear(course_id or None)
                 self._send_json(HTTPStatus.OK, {"ok": True, **counts})
-            except Exception as exc:
-                self._send_json(HTTPStatus.BAD_GATEWAY, {"error": str(exc)})
+            except ValueError as exc:
+                self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+            except (sqlite3.Error, Exception) as exc:
+                self._send_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": str(exc)})
             return
 
         if path == "/api/question-bank/test":
             from modules.question_bank import DEFAULT_QUERY_URL, QuestionBankClient
             from modules.llm import question_bank_conf
 
-            conf = question_bank_conf()
-            token = str(body.get("token") or conf.get("token") or "").strip()
-            query_url = str(body.get("url") or conf.get("url") or DEFAULT_QUERY_URL).strip()
-            proxy = str(body.get("proxy") or "").strip()
-            client = QuestionBankClient(token=token, query_url=query_url, proxy=proxy)
-            self._send_json(HTTPStatus.OK, client.probe())
+            try:
+                conf = question_bank_conf()
+                token = str(body.get("token") or conf.get("token") or "").strip()
+                query_url = str(body.get("url") or conf.get("url") or DEFAULT_QUERY_URL).strip()
+                proxy = str(body.get("proxy") or "").strip()
+                client = QuestionBankClient(token=token, query_url=query_url, proxy=proxy)
+                try:
+                    result = client.probe()
+                finally:
+                    close_fn = getattr(client, "close", None)
+                    if callable(close_fn):
+                        close_fn()
+                self._send_json(HTTPStatus.OK, result)
+            except ValueError as exc:
+                self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+            except Exception as exc:
+                self._send_json(HTTPStatus.BAD_GATEWAY, {"error": str(exc)})
             return
 
         if path == "/api/llm/test":
@@ -1278,6 +1716,12 @@ class BackendRequestHandler(BaseHTTPRequestHandler):
         if path == "/api/qr-login/start":
             proxy = str(body.get("proxy") or "").strip()
             save_dir = str(body.get("saveDir") or "").strip()
+            if save_dir:
+                try:
+                    save_dir = _validate_user_path(save_dir, expect_dir=True)
+                except ValueError as exc:
+                    self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                    return
             try:
                 result = self.server.get_qr_manager().start(proxy=proxy, save_dir=save_dir)
                 self._send_json(HTTPStatus.OK, {"ok": True, **result})
@@ -1305,6 +1749,11 @@ class BackendRequestHandler(BaseHTTPRequestHandler):
         if path == "/api/qr-login/save":
             session_id = str(body.get("sessionId") or "").strip()
             save_dir = str(body.get("saveDir") or "").strip()
+            try:
+                save_dir = _validate_user_path(save_dir, expect_dir=True)
+            except ValueError as exc:
+                self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                return
             try:
                 saved_path = self.server.get_qr_manager().save_current_image(
                     session_id, save_dir
@@ -1396,8 +1845,11 @@ class BackendRequestHandler(BaseHTTPRequestHandler):
         if path == "/api/captcha/solve":
             cdp_url = str(body.get("cdpUrl") or "").strip()
             page_url = str(body.get("pageUrl") or "").strip()
-            if not cdp_url.startswith(("ws://", "wss://", "http://", "https://")):
-                self._send_json(HTTPStatus.BAD_REQUEST, {"error": "cdpUrl 无效"})
+            if not _is_loopback_cdp_url(cdp_url):
+                self._send_json(
+                    HTTPStatus.BAD_REQUEST,
+                    {"error": "cdpUrl 无效（仅允许本机回环地址）"},
+                )
                 return
             try:
                 appear_ms = int(body.get("appearMs") or 6000)
@@ -1432,13 +1884,7 @@ class BackendRequestHandler(BaseHTTPRequestHandler):
         self._send_json(HTTPStatus.NOT_FOUND, {"error": f"not found: {path}"})
 
     def _trigger_shutdown(self):
-        self.server.shutdown_event.set()
-        self.server.close_qr_manager()
-        self.server.manager.shutdown()
-        try:
-            self.server.shutdown()
-        except Exception:
-            pass
+        self.server.graceful_shutdown(stop_http=True)
 
     def _handle_sse(self):
         self.send_response(HTTPStatus.OK)
@@ -1451,9 +1897,13 @@ class BackendRequestHandler(BaseHTTPRequestHandler):
         try:
             while not self.server.shutdown_event.is_set():
                 try:
-                    snap = q.get(timeout=15.0)
-                    payload = json.dumps(snap, ensure_ascii=False)
-                    chunk = f"event: state\ndata: {payload}\n\n".encode("utf-8")
+                    item = q.get(timeout=15.0)
+                    if isinstance(item, tuple) and len(item) == 2:
+                        event_name, data = item
+                    else:
+                        event_name, data = "state", item
+                    payload = json.dumps(data, ensure_ascii=False)
+                    chunk = f"event: {event_name}\ndata: {payload}\n\n".encode("utf-8")
                 except queue.Empty:
                     chunk = b": keepalive\n\n"
                 self.wfile.write(chunk)
@@ -1551,13 +2001,7 @@ def _watch_parent_stdin(server: BackendHTTPServer):
         pass
     finally:
         if should_shutdown and not server.shutdown_event.is_set():
-            server.shutdown_event.set()
-            server.close_qr_manager()
-            server.manager.shutdown()
-            try:
-                server.shutdown()
-            except Exception:
-                pass
+            server.graceful_shutdown(stop_http=True)
 
 
 def _preload_builtin_deps():
@@ -1620,7 +2064,24 @@ def main(argv=None) -> int:
     if args.host not in ("127.0.0.1", "localhost"):
         raise SystemExit("安全限制：内置后端仅允许绑定 127.0.0.1")
 
-    token = os.environ.get("AUTOVISOR_BACKEND_TOKEN", "").strip()
+    token = ""
+    if args.auth_stdin:
+        if sys.stdin is None or sys.stdin.isatty():
+            raise SystemExit("安全限制：--auth-stdin 需要通过管道传入首行 JSON 握手令牌")
+        raw_auth = sys.stdin.buffer.readline(4096)
+        if not raw_auth:
+            raise SystemExit("安全限制：未从 stdin 收到认证令牌握手")
+        try:
+            auth_payload = json.loads(raw_auth.decode("utf-8"))
+        except Exception as exc:
+            raise SystemExit(f"安全限制：stdin 认证握手 JSON 无效: {exc}")
+        if not isinstance(auth_payload, dict) or not str(auth_payload.get("authToken") or "").strip():
+            raise SystemExit("安全限制：stdin 认证握手缺少非空 authToken")
+        token = str(auth_payload["authToken"]).strip()
+    else:
+        token = os.environ.get("AUTOVISOR_BACKEND_TOKEN", "").strip()
+        if not token and not args.allow_insecure_dev:
+            token = secrets.token_urlsafe(32)
 
     # 将模块运行时的 print 输出重定向到 stderr，确保 stdout 只输出握手消息
     sys.stdout = sys.stderr
@@ -1637,6 +2098,7 @@ def main(argv=None) -> int:
         manager=manager,
         token=token,
         app_version=__version__,
+        allow_insecure_dev=bool(args.allow_insecure_dev),
     )
     actual_port = server.server_address[1]
 
@@ -1661,8 +2123,7 @@ def main(argv=None) -> int:
     except KeyboardInterrupt:
         pass
     finally:
-        server.shutdown_event.set()
-        manager.shutdown()
+        server.graceful_shutdown(stop_http=False)
         server.server_close()
     return 0
 
