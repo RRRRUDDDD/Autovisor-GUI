@@ -71,6 +71,7 @@ pub struct AppPaths {
     pub data_dir: PathBuf,
     pub resources_dir: PathBuf,
     pub backend_launch: Option<BackendLaunchSpec>,
+    pub is_portable: bool,
 }
 
 pub fn current_platform() -> &'static str {
@@ -165,11 +166,11 @@ pub fn prefs_path() -> PathBuf {
     prefs_path_in_data_dir(&resolve_app_paths().data_dir)
 }
 
-fn is_portable_mode() -> bool {
-    std::env::current_exe()
-        .ok()
-        .and_then(|p| p.parent().map(|dir| dir.join(".portable").is_file()))
-        .unwrap_or(false)
+fn legacy_prefs_path_for(paths: &AppPaths, appdata: &Path) -> Option<PathBuf> {
+    if paths.is_portable || paths.data_dir != appdata.join("userdata") {
+        return None;
+    }
+    Some(appdata.join("gui_prefs.json"))
 }
 
 pub fn load_prefs_from_path(path: &Path) -> GuiPrefs {
@@ -209,12 +210,9 @@ pub fn load_prefs_with_legacy(path: &Path, legacy_path: Option<&Path>) -> GuiPre
 
 pub fn load_prefs() -> GuiPrefs {
     let _guard = prefs_lock().lock().unwrap_or_else(|e| e.into_inner());
-    let path = prefs_path();
-    let legacy = if is_portable_mode() {
-        None
-    } else {
-        Some(appdata_dir().join("gui_prefs.json"))
-    };
+    let paths = resolve_app_paths();
+    let path = prefs_path_in_data_dir(&paths.data_dir);
+    let legacy = legacy_prefs_path_for(&paths, &appdata_dir());
     load_prefs_with_legacy(&path, legacy.as_deref())
 }
 
@@ -237,12 +235,9 @@ pub fn load_close_action() -> CloseAction {
 
 pub fn save_close_action(action: CloseAction) -> Result<(), String> {
     let _guard = prefs_lock().lock().unwrap_or_else(|e| e.into_inner());
-    let path = prefs_path();
-    let legacy = if is_portable_mode() {
-        None
-    } else {
-        Some(appdata_dir().join("gui_prefs.json"))
-    };
+    let paths = resolve_app_paths();
+    let path = prefs_path_in_data_dir(&paths.data_dir);
+    let legacy = legacy_prefs_path_for(&paths, &appdata_dir());
     let mut prefs = load_prefs_with_legacy(&path, legacy.as_deref());
     prefs.close_behavior = Some(action.as_str().to_string());
     save_prefs_to_path(&path, &prefs)
@@ -383,13 +378,13 @@ fn ensure_data_dir_initialized(data_dir: &Path, resources_dir: Option<&Path>) {
     }
 }
 
-fn resolve_frozen_data_dir(exe_dir: &Path) -> PathBuf {
+fn resolve_frozen_data_dir(exe_dir: &Path) -> (PathBuf, bool) {
     let portable_marker = exe_dir.join(".portable");
     let portable_data = exe_dir.join("userdata");
     if portable_marker.is_file() && dir_is_writable(&portable_data) {
-        portable_data
+        (portable_data, true)
     } else {
-        appdata_dir().join("userdata")
+        (appdata_dir().join("userdata"), false)
     }
 }
 
@@ -410,12 +405,13 @@ fn resolve_app_paths_uncached() -> AppPaths {
     if let Ok(exe) = std::env::current_exe() {
         if let Some(exe_dir) = exe.parent() {
             if let Some((backend_exe, resources_dir)) = find_frozen_backend(exe_dir) {
-                let data_dir = resolve_frozen_data_dir(exe_dir);
+                let (data_dir, is_portable) = resolve_frozen_data_dir(exe_dir);
                 ensure_data_dir_initialized(&data_dir, Some(&resources_dir));
                 return AppPaths {
                     data_dir,
                     resources_dir,
                     backend_launch: Some(BackendLaunchSpec::FrozenExe(backend_exe)),
+                    is_portable,
                 };
             }
 
@@ -427,6 +423,7 @@ fn resolve_app_paths_uncached() -> AppPaths {
                     data_dir: repo_root,
                     resources_dir,
                     backend_launch: Some(BackendLaunchSpec::PythonScript { python, script }),
+                    is_portable: false,
                 };
             }
         }
@@ -441,6 +438,7 @@ fn resolve_app_paths_uncached() -> AppPaths {
                 data_dir: repo_root,
                 resources_dir,
                 backend_launch: Some(BackendLaunchSpec::PythonScript { python, script }),
+                is_portable: false,
             };
         }
     }
@@ -452,6 +450,7 @@ fn resolve_app_paths_uncached() -> AppPaths {
         data_dir: fallback_data.clone(),
         resources_dir: fallback_data,
         backend_launch: None,
+        is_portable: false,
     }
 }
 
@@ -686,12 +685,60 @@ mod tests {
     #[test]
     fn uses_portable_userdata_only_when_marker_exists() {
         let root = make_temp_dir("portable");
-        let default_dir = resolve_frozen_data_dir(&root);
+        let (default_dir, default_portable) = resolve_frozen_data_dir(&root);
         assert_eq!(default_dir, appdata_dir().join("userdata"));
+        assert!(!default_portable);
 
         fs::write(root.join(".portable"), b"").unwrap();
-        let portable_dir = resolve_frozen_data_dir(&root);
+        let (portable_dir, is_portable) = resolve_frozen_data_dir(&root);
         assert_eq!(portable_dir, root.join("userdata"));
+        assert!(is_portable);
+
+        // Even if .portable is removed mid-run, cached AppPaths keeps portable isolation.
+        let cached_paths = AppPaths {
+            data_dir: portable_dir.clone(),
+            resources_dir: root.clone(),
+            backend_launch: None,
+            is_portable,
+        };
+        let _ = fs::remove_file(root.join(".portable"));
+        assert_eq!(legacy_prefs_path_for(&cached_paths, &appdata_dir()), None);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn legacy_prefs_path_only_applies_to_installed_appdata_userdata() {
+        let root = make_temp_dir("legacy_scope");
+        let appdata = root.join("appdata");
+
+        let installed = AppPaths {
+            data_dir: appdata.join("userdata"),
+            resources_dir: root.join("res"),
+            backend_launch: None,
+            is_portable: false,
+        };
+        assert_eq!(
+            legacy_prefs_path_for(&installed, &appdata),
+            Some(appdata.join("gui_prefs.json"))
+        );
+
+        let portable = AppPaths {
+            data_dir: root.join("portable_app").join("userdata"),
+            resources_dir: root.join("portable_app"),
+            backend_launch: None,
+            is_portable: true,
+        };
+        assert_eq!(legacy_prefs_path_for(&portable, &appdata), None);
+
+        // Dev mode (repo_root != appdata/userdata) must not pull installed AppData prefs either.
+        let dev_repo = AppPaths {
+            data_dir: root.join("repo"),
+            resources_dir: root.join("repo").join("resources"),
+            backend_launch: None,
+            is_portable: false,
+        };
+        assert_eq!(legacy_prefs_path_for(&dev_repo, &appdata), None);
 
         let _ = fs::remove_dir_all(&root);
     }
