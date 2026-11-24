@@ -1,6 +1,6 @@
 # Autovisor 跨端 IPC 与配置契约文档（Single Source of Truth）
 
-> 生效版本：Phase 3（方案 A：Rust `config_ini.rs` 为配置权威源，Python `course_fetcher.py` 为课程解析权威源，`resources/llm_providers.json` 为大模型厂商预设权威源）。
+> 生效版本：Phase 3–4（方案 A：Rust `config/` 模块为配置权威源，Python `course_fetcher.py` 为课程解析权威源，`resources/llm_providers.json` 为大模型厂商预设权威源）。
 > 适用范围：React WebView (`gui/src`) ↔ Tauri Rust 宿主 (`gui/src-tauri/src`) ↔ Python 本地无感后端 (`backend_server.py`)。
 
 ---
@@ -9,7 +9,7 @@
 
 ### 1.1 方案 A 权威源分工
 
-- **桌面端读写权威源**：`gui/src-tauri/src/config_ini.rs`（`AutovisorConfig`、`LlmConfig`、`CourseItem`）。未启动 Python 后端时即可独立读写。
+- **桌面端读写权威源**：`gui/src-tauri/src/config/`（`AutovisorConfig`、`LlmConfig`、`CourseItem`）。未启动 Python 后端时即可独立读写。
 - **Python 运行时消费端**：`modules/configs.py` 与 `modules/llm.py`，严格对齐 Rust 的布尔解析（`true`/`1`/`yes` 与 `false`/`0`/`no`）、数值类型与上下界、`CONFIG_TEMPLATE` 键集。
 - **前端视图规范化层**：`gui/src/lib/configModel.js`，负责表单校验与与 Rust `camelCase` 字段映射。
 - **共享静态目录**：`resources/llm_providers.json`，由 Rust (`include_str!`)、React (ES JSON import)、Python (`modules/paths.py:get_resource_path`) 三端共享。

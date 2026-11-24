@@ -8,7 +8,7 @@
 
 一个开箱即用的桌面客户端：登录账号 → 自动识别课程 → 一键开始，学习进度、日志与提醒全部可视化。
 
-[![Release](https://img.shields.io/badge/release-v1.1.0-2563eb)](https://github.com/RRRRUDDDD/Autovisor-GUI/releases)
+[![Release](https://img.shields.io/badge/release-v1.2.0-2563eb)](https://github.com/RRRRUDDDD/Autovisor-GUI/releases)
 [![Tauri](https://img.shields.io/badge/Tauri-2-24C8DB?logo=tauri&logoColor=white)](https://tauri.app)
 [![React](https://img.shields.io/badge/React-18-61DAFB?logo=react&logoColor=black)](https://react.dev)
 [![Rust](https://img.shields.io/badge/Rust-stable-000000?logo=rust)](https://www.rust-lang.org)
@@ -213,8 +213,8 @@ flowchart LR
 - 所有数据（配置、Cookie、SQLite 题库缓存、日志）**仅保存在本机**数据目录，不上传任何服务器；
 - 启用视觉模型后，作业/考试题目截图会发送给你在设置中配置的大模型服务商；不填写视觉模型则不会发送；
 - 第三方题库默认关闭；仅在填写 Token 后向你配置的地址查询题目文本，请求会话与智慧树 Cookie 完全隔离；
-- 密码**默认不保存**，仅在勾选「记住账号密码」时以明文保存在本机，可在设置中随时清除；
-- 内置引擎只监听本地回环地址，并使用每次启动随机生成的令牌鉴权；
+- 登录密码**默认不保存**；勾选「记住账号密码」时通过系统凭据库加密保存（Windows DPAPI / macOS Keychain / Linux Secret Service，无密钥链环境降级为 `0o600` 权限受限文件），且不向前端 WebView 下发明文密码；如在设置中手动配置了挂机「自动重登凭证」，则保存在本机 `config.ini`，均可随时清除；
+- 内置引擎只监听本地回环地址，启动时通过 `stdin` 握手传递随机鉴权令牌（Fail-Closed 鉴权并校验 `Host` / `Origin`）；
 - 日志写入与复制时都会自动遮盖手机号、密码、Cookie、Bearer Token、API Key 等常见敏感字段，分享前仍建议自行检查；
 - 网络代理同时作用于登录、课程拉取、浏览器学习、更新检查与推送通知。
 
@@ -239,11 +239,11 @@ flowchart LR
 
 | 层 | 技术 | 职责 |
 | --- | --- | --- |
-| 前端 | React 18、Tailwind CSS、Vite、Vitest | 界面、配置模型、自动保存、题库缓存管理、日志展示 |
-| 宿主 | Tauri 2、Rust | 窗口 / 托盘 / 单实例、浏览器自动检测、CDP 登录、课程直拉与配置读写、引擎生命周期 |
-| 引擎 | Python、Playwright、OpenCV、SQLite | 任务路由、课程播放与切换、验证码处理、作业/考试加密 API、弹题拦截、题库缓存、推送、日志轮转 |
+| 前端 | React 18、Tailwind CSS、Vite、ESLint、Vitest | 界面、运行态存储隔离、配置模型、自动保存、题库缓存管理、日志展示 |
+| 宿主 | Tauri 2、Rust | 窗口 / 托盘 / 单实例、浏览器自动检测、CDP 登录、凭据加密存储与配置读写、引擎生命周期 |
+| 引擎 | Python、Playwright、OpenCV、SQLite | 课程直拉与解析、任务路由、课程播放与切换、验证码处理、作业/考试加密 API、弹题拦截、题库缓存、推送、日志轮转 |
 
-- 宿主启动时在后台拉起引擎，通过 JSON 握手获取端口与令牌，再经 SSE 实时接收进度、日志和提醒；
+- 宿主启动时在后台拉起引擎，通过 `stdin` 首行握手传递随机令牌并经 JSON 握手获取监听端口，再通过增量 SSE 状态流实时接收进度、日志和提醒；
 - 通过 `stdin` 生命周期监听与 Windows Job Object 管理进程树，窗口关闭或任务停止时不会残留浏览器 / 引擎进程；
 - 引擎异常退出时可在界面中一键重启。
 
@@ -253,18 +253,20 @@ flowchart LR
 .
 ├── gui/                        # 桌面客户端
 │   ├── src/                    #   React 前端
-│   │   ├── components/         #     登录 / 工作台 / 监控 / 设置等页面
-│   │   └── lib/                #     Tauri 调用封装、配置模型、大模型预设
+│   │   ├── components/         #     登录 / 工作台 / 监控 / 设置及子组件
+│   │   ├── hooks/              #     自动保存、SSE 状态流、更新检查等 Hooks
+│   │   └── lib/                #     Tauri 调用封装、运行态存储、配置模型、大模型预设
 │   ├── src-tauri/              #   Rust 宿主
-│   │   └── src/                #     backend / browser_detect / zhs_session / process_tree ...
+│   │   └── src/                #     backend / commands / config / credentials / zhs / process_tree ...
 │   ├── build-installer.ps1     #   构建 NSIS 安装包
 │   └── build-portable.ps1      #   构建便携版
 ├── backend_server.py           # 内置学习引擎入口
 ├── build_backend.py            # 打包引擎为 autovisor-backend.exe
-├── modules/                    # 引擎核心模块（播放、路由、加密接口、作业/考试、题库缓存、验证码、日志……）
+├── modules/                    # 引擎核心模块（课程解析、播放、路由、加密接口、作业/考试、题库缓存、验证码、日志……）
+├── scripts/                    # PyInstaller 共享构建工具
 ├── Autovisor.py                # 命令行入口
-├── docs/                       # 智慧树接口契约速查文档
-├── resources/                  # 引擎资源
+├── docs/                       # 智慧树接口契约与跨端 IPC / 配置契约文档
+├── resources/                  # 引擎脚本资源与三端共享大模型厂商目录
 ├── data/                       # 默认镜像源 / 大模型配置模板
 └── tests/                      # Python 单元测试
 ```
@@ -283,7 +285,7 @@ flowchart LR
 
 ```powershell
 # 1. 安装引擎依赖（会在仓库根目录创建 .venv）
-uv sync --extra captcha
+uv sync
 
 # 2. 安装前端依赖并启动 Tauri 开发模式
 cd gui
@@ -296,15 +298,16 @@ npm run tauri dev
 > [!NOTE]
 > 只调试界面时可运行 `npm run dev`，在普通浏览器中打开；此时所有 Tauri 调用会回退到内置的演示数据。
 
-### 运行测试
+### 运行测试与检查
 
 ```powershell
-uv run python -m unittest discover -s tests -v   # 引擎
-cd gui; npm test                                 # 前端
-cd src-tauri; cargo test                         # 宿主
+uv run --no-sync python backend_server.py --verify-deps    # 引擎依赖自检
+uv run --no-sync python -m unittest discover -s tests -v   # 引擎单测
+cd gui; npm run lint; npm test; npm run build              # 前端静态检查、单测与构建
+cd src-tauri; cargo clippy --all-targets -- -D warnings; cargo test  # 宿主静态检查与单测
 ```
 
-CI 会在 Windows、macOS、Ubuntu 上执行以上三组测试与构建检查。
+CI 会在 Windows、macOS、Ubuntu 上执行以上三端测试、Lint / Clippy 与构建检查。
 
 ### 打包发布
 
@@ -318,7 +321,7 @@ powershell -ExecutionPolicy Bypass -File .\build-portable.ps1
 powershell -ExecutionPolicy Bypass -File .\build-installer.ps1
 ```
 
-两个脚本都会先构建内置引擎（`build_backend.py`），再构建前端与 Tauri Release；加 `-SkipBackendBuild` 可复用已构建的引擎。版本号以 `gui/src-tauri/tauri.conf.json` 为准。
+两个脚本都会先构建内置引擎（`build_backend.py`），再构建前端与 Tauri Release；加 `-SkipBackendBuild` 可复用已构建的引擎。发布流水线会校验 `modules/version.py`（`__gui_version__`）、`gui/package.json`、`gui/src-tauri/Cargo.toml` 与 `gui/src-tauri/tauri.conf.json` 四处版本号保持一致。
 
 > [!NOTE]
 > GitHub Actions 发布流水线会自动并行构建 Windows（NSIS 安装包 + 便携版 `.zip`）、macOS（`arm64` / `x64` `.dmg`）与 Linux（`.deb` + 便携版 `.tar.gz`）三端发行包。
