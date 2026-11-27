@@ -697,7 +697,10 @@ class OpenAiStreamTests(unittest.TestCase):
         resp = _StreamResponse([_sse_delta({"content": "never"})], delay=1.5)
         conf = dict(self.CONF, stream_idle_timeout=0.15, stream_timeout=3)
         started = time.monotonic()
-        with patch("modules.llm.requests.post", return_value=resp):
+        with (
+            patch("modules.llm_client.DEFAULT_STREAM_RETRIES", 0),
+            patch("modules.llm.requests.post", return_value=resp),
+        ):
             with self.assertRaises(RuntimeError) as ctx:
                 llm.chat_sync("题目", conf_override=conf, stream=True)
         elapsed = time.monotonic() - started
@@ -712,13 +715,73 @@ class OpenAiStreamTests(unittest.TestCase):
         resp = _StreamResponse(lines, delay=0.03)
         conf = dict(self.CONF, stream_idle_timeout=0.4, stream_timeout=0.5)
         started = time.monotonic()
-        with patch("modules.llm.requests.post", return_value=resp):
+        with (
+            patch("modules.llm_client.DEFAULT_STREAM_RETRIES", 0),
+            patch("modules.llm.requests.post", return_value=resp),
+        ):
             with self.assertRaises(RuntimeError) as ctx:
                 llm.chat_sync("题目", conf_override=conf, stream=True)
         elapsed = time.monotonic() - started
         self.assertIn("总时长", str(ctx.exception))
         self.assertTrue(resp.closed)
         self.assertLess(elapsed, 1.5)
+
+    def test_arbitrary_empty_content_delta_refreshes_idle_timeout(self):
+        # thinking / role / 空 delta 等非 reasoning_content 字段也应发送心跳刷新 idle 超时
+        lines = [
+            _sse_delta({"thinking": f"步{i}"}) for i in range(12)
+        ] + [
+            _sse_delta({"role": "assistant", "content": ""}),
+            _sse_delta({}),
+            _sse_delta({"content": '```answer\n[{"id": 7}]\n```'}),
+        ]
+        resp = _StreamResponse(lines, delay=0.04)
+        conf = dict(self.CONF, stream_idle_timeout=0.25, stream_timeout=4)
+        started = time.monotonic()
+        with patch("modules.llm.requests.post", return_value=resp):
+            reply = llm.chat_sync("题目", conf_override=conf, stream=True)
+        elapsed = time.monotonic() - started
+        self.assertIn('"id": 7', reply)
+        self.assertGreater(elapsed, conf["stream_idle_timeout"])
+
+    def test_stream_retries_on_transient_consume_error_and_timeout(self):
+        class _BrokenStreamResponse(_StreamResponse):
+            def iter_lines(self, decode_unicode=False):
+                yield _sse_delta({"content": "半截"}).encode("utf-8")
+                raise requests.ConnectionError("mid-stream disconnect")
+
+        broken = _BrokenStreamResponse([])
+        slow = _StreamResponse([_sse_delta({"content": "too-late"})], delay=1.0)
+        good = _StreamResponse([_sse_delta({"content": '```answer\n[{"id": 9}]\n```'})], delay=0.01)
+        conf = dict(self.CONF, stream_idle_timeout=0.1, stream_timeout=2)
+        with (
+            patch("modules.llm.requests.post", side_effect=[broken, slow, good]) as post,
+            patch("modules.llm_client._retry_delay", return_value=0.0),
+        ):
+            reply = llm.chat_sync("题目", conf_override=conf, stream=True)
+        self.assertIn('"id": 9', reply)
+        self.assertEqual(post.call_count, 3)
+
+    def test_stream_does_not_retry_non_retryable_or_stream_not_supported(self):
+        # 401 NonRetryableLLMError 立即上抛，不重试
+        unauth = _mock_response({"error": {"message": "bad key"}}, status_code=401)
+        with (
+            patch("modules.llm.requests.post", return_value=unauth) as post,
+            patch("modules.llm_client._retry_delay", return_value=0.0),
+        ):
+            with self.assertRaises(llm.NonRetryableLLMError):
+                llm.chat_sync("题目", conf_override=self.CONF, stream=True)
+        self.assertEqual(post.call_count, 1)
+
+        # StreamNotSupportedError 立即回退非流式解析，不在流式重试循环里重复请求
+        plain = _JsonResponse({"choices": [{"message": {"content": "非流式直接成功"}}]})
+        with (
+            patch("modules.llm.requests.post", return_value=plain) as post,
+            patch("modules.llm_client._retry_delay", return_value=0.0),
+        ):
+            reply = llm.chat_sync("题目", conf_override=self.CONF, stream=True)
+        self.assertEqual(reply, "非流式直接成功")
+        self.assertEqual(post.call_count, 1)
 
     def test_utf8_bytes_sse_with_comments_and_metadata_streams(self):
         lines = [

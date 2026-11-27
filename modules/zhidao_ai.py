@@ -12,6 +12,8 @@ from modules import llm, zhidao_crypto
 from modules.answer_parser import parse_answer_ids
 from modules.exam_api import ExamApiError
 from modules.http_utils import build_requests_proxies
+from modules.llm_client import _ThinkAwareAimTracker
+from modules.text_utils import strip_think_tags as _strip_think_tags
 
 ZHIDAO_AI_CHAT = (
     "https://dmb-chat.zhihuishu.com/gateway/t/v1/completions/chat/stream"
@@ -86,10 +88,19 @@ class ZhidaoAnswerer:
         return "", None, False
 
     @classmethod
-    def _consume_response(cls, response) -> str:
+    def _consume_response(
+        cls,
+        response,
+        *,
+        aim_start: str = "```answer",
+        aim_end: str = "```",
+        timeout: float = 60.0,
+    ) -> str:
         chunks: list[str] = []
         final_answer: str | None = None
         parsed_any = False
+        deadline = time.monotonic() + max(float(timeout), 0.001)
+        tracker = _ThinkAwareAimTracker(aim_start, aim_end)
 
         if hasattr(response, "iter_lines"):
             raw_lines = response.iter_lines()
@@ -97,6 +108,10 @@ class ZhidaoAnswerer:
             raw_lines = (getattr(response, "text", "") or "").splitlines()
 
         for raw in raw_lines:
+            if time.monotonic() > deadline:
+                raise RuntimeError(
+                    f"智慧树 AI 流式响应超时: 总时长超过 {float(timeout):g} 秒"
+                )
             if not raw:
                 continue
             line = raw.decode("utf-8", errors="replace") if isinstance(raw, bytes) else str(raw)
@@ -117,12 +132,14 @@ class ZhidaoAnswerer:
             chunk, final, is_end = cls._parse_sse_payload(payload)
             if chunk:
                 chunks.append(chunk)
+                if tracker.feed(chunk):
+                    break
             if final:
                 final_answer = final
             if is_end:
                 break
 
-        content = (final_answer or "".join(chunks)).strip()
+        content = _strip_think_tags(final_answer or "".join(chunks)).strip()
         if not content:
             if not parsed_any:
                 raise ValueError("智慧树 AI 返回格式无法解析或为空")
@@ -148,7 +165,7 @@ class ZhidaoAnswerer:
             response = self.session.post(url, **post_kwargs)
         try:
             response.raise_for_status()
-            return self._consume_response(response)
+            return self._consume_response(response, timeout=self.timeout)
         finally:
             close = getattr(response, "close", None)
             if callable(close):

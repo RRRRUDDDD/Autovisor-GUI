@@ -26,6 +26,7 @@ from modules.utils import (
     get_runtime_path,
     save_cookies,
 )
+from modules.zhs_api import SessionStatus, ZhsApiClient
 
 # 运行期间周期性落盘 Cookies 的间隔(秒): 服务器中途续期后, 崩溃/断电也不丢凭证
 COOKIE_SYNC_INTERVAL_SECONDS = 300
@@ -189,6 +190,15 @@ async def auto_login(
     log.info(f"已保存登录凭证到: {cookie_path},下次可免密登录.")
 
 
+def _verify_cookie_status(cookies, proxy: str = "") -> SessionStatus:
+    """使用 CAS + getLoginUserInfo 二次校验 Cookie 状态，异常时视为不可用避免误删凭证。"""
+    try:
+        with ZhsApiClient(cookies, proxy=proxy) as client:
+            return client.verify_session_status()
+    except Exception:
+        return SessionStatus.UNAVAILABLE
+
+
 async def ensure_login(
     context: BrowserContext,
     page: Page,
@@ -212,11 +222,27 @@ async def ensure_login(
             log.event("登录状态", 结果="Cookies 有效", 地址=page.url)
             await persist_login_cookies(context, ctx=ctx)
             return True
-        log.warn("检测到 Cookies 已失效, 将重新登录.", shift=True)
-        log.event("登录状态", 结果="Cookies 失效", 地址=page.url)
-        clear_cookies(cookie_path)
-        remember_login_cookies(None, ctx=ctx)
-        cookies = None
+        status = await asyncio.to_thread(
+            _verify_cookie_status, cookies, getattr(config, "proxy", "")
+        )
+        if status is SessionStatus.EXPIRED:
+            log.warn("检测到 Cookies 已失效, 将重新登录.", shift=True)
+            log.event("登录状态", 结果="Cookies 失效", 地址=page.url)
+            clear_cookies(cookie_path)
+            remember_login_cookies(None, ctx=ctx)
+            cookies = None
+        elif status is SessionStatus.UNAVAILABLE:
+            log.warn(
+                "校验登录状态时网络波动或服务端异常, 已保留本地 Cookies 不予删除, 将继续登录流程.",
+                shift=True,
+            )
+            log.event("登录状态", 结果="校验不可用(保留Cookies)", 地址=page.url)
+        else:
+            log.warn(
+                "服务端会话仍有效但登录页跳转超时, 已保留本地 Cookies 不予删除, 将继续等待登录.",
+                shift=True,
+            )
+            log.event("登录状态", 结果="页面超时(保留Cookies)", 地址=page.url)
 
     if not config.username or not config.password:
         log.info("请手动填写账号密码...")

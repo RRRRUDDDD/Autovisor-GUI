@@ -507,14 +507,14 @@ def _consume_openai_stream(
                 if not choices:
                     continue
                 choice = choices[0] if isinstance(choices[0], dict) else {}
-                delta = choice.get("delta") or {}
-                content = delta.get("content")
-                reasoning = delta.get("reasoning_content") or delta.get("reasoning")
-                if content:
-                    _emit(("chunk", str(content)))
-                elif reasoning:
-                    # 推理模型思考期间 content 为空, 用空心跳刷新 idle 超时.
-                    _emit(("heartbeat", None))
+                delta = choice.get("delta")
+                if isinstance(delta, dict):
+                    content = delta.get("content")
+                    if content:
+                        _emit(("chunk", str(content)))
+                    else:
+                        # 任意空 content 的合法 delta（如 role/reasoning_content/thinking/空包）均刷新 idle 超时.
+                        _emit(("heartbeat", None))
                 if choice.get("finish_reason"):
                     _emit(("done", None))
                     return
@@ -592,7 +592,7 @@ def _chat_openai_stream(
     aim_end: str = "```",
     total_timeout: float = DEFAULT_STREAM_TIMEOUT,
     idle_timeout: float = DEFAULT_STREAM_IDLE_TIMEOUT,
-    retries: int = DEFAULT_STREAM_RETRIES,
+    retries: int | None = None,
 ) -> str:
     """OpenAI 兼容接口的流式作答; 双超时 + 命中目标代码块立即断开."""
     stream_body = dict(body)
@@ -602,6 +602,7 @@ def _chat_openai_stream(
     if idle_timeout > total_timeout:
         idle_timeout = total_timeout
     socket_read_timeout = max(0.5, min(idle_timeout + 2.0, total_timeout + 2.0))
+    max_retries = DEFAULT_STREAM_RETRIES if retries is None else max(0, int(retries))
 
     attempt = 0
     while True:
@@ -616,7 +617,7 @@ def _chat_openai_stream(
         try:
             resp = _http_post(endpoint, **kwargs)
         except Exception as exc:
-            if attempt >= retries:
+            if attempt >= max_retries:
                 raise RuntimeError(f"流式请求失败: {exc}") from exc
             time.sleep(_retry_delay(attempt))
             attempt += 1
@@ -629,20 +630,32 @@ def _chat_openai_stream(
             message = _http_error_message(status, detail)
             if status in NON_RETRYABLE_STATUS:
                 raise NonRetryableLLMError(message, status=status)
-            if _is_retryable_status(status) and attempt < retries:
+            if _is_retryable_status(status) and attempt < max_retries:
                 logger.debug(f"流式接口返回 {status}, 第 {attempt + 1} 次退避重试: {endpoint}")
                 time.sleep(_retry_delay(attempt))
                 attempt += 1
                 continue
             raise RuntimeError(message)
 
-        return _consume_openai_stream(
-            resp,
-            aim_start=aim_start,
-            aim_end=aim_end,
-            total_timeout=total_timeout,
-            idle_timeout=idle_timeout,
-        )
+        try:
+            return _consume_openai_stream(
+                resp,
+                aim_start=aim_start,
+                aim_end=aim_end,
+                total_timeout=total_timeout,
+                idle_timeout=idle_timeout,
+            )
+        except (NonRetryableLLMError, StreamNotSupportedError):
+            raise
+        except Exception as exc:
+            if attempt >= max_retries:
+                raise
+            logger.debug(
+                f"流式读取中断/超时, 第 {attempt + 1} 次退避重试: {exc}"
+            )
+            time.sleep(_retry_delay(attempt))
+            attempt += 1
+            continue
 
 
 def _chat_sync(

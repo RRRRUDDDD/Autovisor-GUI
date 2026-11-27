@@ -198,5 +198,85 @@ class SaveCookiesAtomicTests(unittest.TestCase):
             self.assertEqual(leftovers, [])
 
 
+class EnsureLoginCookieSafetyTests(unittest.IsolatedAsyncioTestCase):
+    async def _run_ensure_login(self, verify_status):
+        from types import SimpleNamespace
+        from playwright.async_api import TimeoutError as PlaywrightTimeoutError
+        from modules import auth_flow
+
+        class _FakePage:
+            url = "https://passport.zhihuishu.com/login"
+
+            async def goto(self, _url, **_kwargs):
+                return None
+
+        class _FakeLog:
+            def __init__(self):
+                self.warns = []
+                self.events = []
+
+            def info(self, *_a, **_kw):
+                pass
+
+            def warn(self, msg, **_kw):
+                self.warns.append(msg)
+
+            def event(self, name, **fields):
+                self.events.append((name, fields))
+
+        fake_log = _FakeLog()
+        cfg = SimpleNamespace(
+            login_url="https://passport.zhihuishu.com/login",
+            username="u",
+            password="p",
+            proxy="",
+        )
+        with (
+            mock.patch.object(auth_flow, "_get_logger", return_value=fake_log),
+            mock.patch.object(auth_flow, "_get_cookie_path", return_value="fake/cookies.json"),
+            mock.patch.object(auth_flow, "wait_for_login_complete", side_effect=PlaywrightTimeoutError("timeout")),
+            mock.patch.object(auth_flow, "_verify_cookie_status", return_value=verify_status),
+            mock.patch.object(auth_flow, "clear_cookies") as clear_mock,
+            mock.patch.object(auth_flow, "remember_login_cookies") as remember_mock,
+            mock.patch.object(auth_flow, "auto_login", new=mock.AsyncMock()) as auto_login_mock,
+        ):
+            res = await auth_flow.ensure_login(_Context([]), _FakePage(), [_cookie("CASTGC")], cfg)
+        return res, clear_mock, remember_mock, auto_login_mock, fake_log
+
+    async def test_deletes_cookies_only_when_verify_returns_expired(self):
+        from modules.zhs_api import SessionStatus
+
+        res, clear_mock, remember_mock, auto_login_mock, _log = await self._run_ensure_login(
+            SessionStatus.EXPIRED
+        )
+        self.assertFalse(res)
+        clear_mock.assert_called_once_with("fake/cookies.json")
+        remember_mock.assert_called_once_with(None, ctx=None)
+        auto_login_mock.assert_awaited_once()
+
+    async def test_preserves_cookies_when_verify_returns_unavailable(self):
+        from modules.zhs_api import SessionStatus
+
+        res, clear_mock, remember_mock, auto_login_mock, log = await self._run_ensure_login(
+            SessionStatus.UNAVAILABLE
+        )
+        self.assertFalse(res)
+        clear_mock.assert_not_called()
+        remember_mock.assert_not_called()
+        auto_login_mock.assert_awaited_once()
+        self.assertTrue(any("保留" in msg for msg in log.warns))
+
+    async def test_preserves_cookies_when_verify_returns_ok(self):
+        from modules.zhs_api import SessionStatus
+
+        res, clear_mock, remember_mock, auto_login_mock, _log = await self._run_ensure_login(
+            SessionStatus.OK
+        )
+        self.assertFalse(res)
+        clear_mock.assert_not_called()
+        remember_mock.assert_not_called()
+        auto_login_mock.assert_awaited_once()
+
+
 if __name__ == "__main__":
     unittest.main()
