@@ -53,6 +53,7 @@ from modules.course_runner import (
 )
 from modules.diagnostics import check_browser, check_course
 from modules.hike_navigation import (
+    complete_hike_document_nodes,
     is_hike_404_page,
     needs_hike_file_id_resolution,
     parse_hike_course_url,
@@ -473,6 +474,17 @@ async def _main_impl(
                 if getattr(config, "reviewMode", False) is True:
                     logger.info("复习模式下跳过知到作业与正式考试阶段.")
                     continue
+                if (
+                    catalog.name == "hike"
+                    or parse_hike_course_url(course_url)
+                    or parse_hike_course_url(getattr(page, "url", ""))
+                ):
+                    try:
+                        await complete_hike_document_nodes(
+                            page, course_url, config=config, logger=logger
+                        )
+                    except Exception as exc:
+                        logger.log_exception("Hike 非视频文档标记已读失败.", exc)
                 assessment_parsed = parsed
                 if not assessment_parsed.get("recruitAndCourseId"):
                     assessment_parsed = parse_url(getattr(page, "url", ""))

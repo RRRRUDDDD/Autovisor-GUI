@@ -9,11 +9,15 @@ from unittest.mock import AsyncMock, MagicMock, patch
 from modules.hike_navigation import (
     HIKE_LAST_STUDY_FILE_URL,
     HIKE_RESOURCE_MENU_TREE_URL,
+    HIKE_STU_VIEW_FILE_URL,
     STUDYRESOURCES_SSO_URL,
     build_hike_play_url,
     build_hike_resource_url,
+    collect_hike_document_nodes,
+    complete_hike_document_nodes,
     fetch_hike_file_id_via_api,
     is_hike_404_page,
+    mark_hike_documents_read_via_api,
     needs_hike_file_id_resolution,
     parse_hike_course_url,
     pick_hike_file_id_from_last_study,
@@ -335,6 +339,113 @@ class HikeLessonReloadTests(unittest.IsolatedAsyncioTestCase):
         ok = await wait_for_lesson_active(_ReloadingLocator(), HIKE_CATALOG, timeout_ms=3000)
         self.assertTrue(ok)
         self.assertEqual(calls, 3)
+
+
+class HikeDocumentMarkingTests(unittest.IsolatedAsyncioTestCase):
+    def test_collect_hike_document_nodes_filters_videos_finished_and_quizzes(self):
+        tree = [
+            {
+                "id": 10,
+                "type": 0,
+                "name": "课件资料",
+                "childList": [
+                    {"id": 1001, "type": 1, "dataType": 1, "name": "1.静电场.pdf", "totalTime": 1, "studyTime": 0},
+                    {"id": 1002, "type": 1, "dataType": 1, "name": "已读讲义.pdf", "totalTime": 1, "studyTime": 1},
+                    {"id": 1003, "fileId": 2003, "dataType": None, "name": "附件文档.docx"},
+                    {"id": 1004, "fileId": None, "dataType": None, "name": "章节讨论"},
+                    {"id": 1005, "type": 1, "dataType": 3, "name": "教学视频.mp4", "totalTime": 300, "studyTime": 0},
+                    {"id": 1006, "type": 1, "dataType": 2, "name": "已完成标记.pptx", "isFinish": 1},
+                ],
+            }
+        ]
+        docs = collect_hike_document_nodes(tree)
+        self.assertEqual(
+            [(d["fileId"], d["name"]) for d in docs],
+            [("1001", "1.静电场.pdf"), ("2003", "附件文档.docx")],
+        )
+
+    def test_mark_hike_documents_read_via_api_calls_stu_view_file_with_sso_retry(self):
+        class _FakeSession:
+            def __init__(self):
+                self.cookies = []
+                self.authed = False
+                self.calls = []
+
+            def get(self, url, params=None, headers=None, timeout=None):
+                self.calls.append((url, dict(params or {})))
+                if not self.authed:
+                    return _FakeResp(None, status_code=401)
+                if url == HIKE_RESOURCE_MENU_TREE_URL:
+                    return _FakeResp(
+                        {
+                            "status": 200,
+                            "rt": [
+                                {
+                                    "id": 1,
+                                    "type": 0,
+                                    "childList": [
+                                        {"id": 1001, "type": 1, "dataType": 1, "name": "讲义.pdf"},
+                                        {"id": 1002, "type": 1, "dataType": 3, "name": "视频.mp4"},
+                                    ],
+                                }
+                            ],
+                        }
+                    )
+                if url == HIKE_STU_VIEW_FILE_URL:
+                    return _FakeResp({"status": 200, "rt": {"fileId": 1001, "totalTime": 1}})
+                return _FakeResp({}, status_code=404)
+
+        sess = _FakeSession()
+        sso_calls = []
+
+        class _FakeClient:
+            def __init__(self):
+                self.session = sess
+                self.lock = threading.RLock()
+
+            def ensure_service_sso(self, service: str) -> bool:
+                sso_calls.append(service)
+                sess.authed = True
+                return True
+
+        summary = mark_hike_documents_read_via_api(
+            _FakeClient(), "11559973", delay=0.0
+        )
+        self.assertEqual(summary, {"found": 1, "done": 1, "failed": 0})
+        self.assertEqual(sso_calls, [STUDYRESOURCES_SSO_URL])
+        view_calls = [p for u, p in sess.calls if u == HIKE_STU_VIEW_FILE_URL]
+        self.assertEqual(view_calls, [{"courseId": "11559973", "fileId": "1001"}])
+
+    async def test_complete_hike_document_nodes_skips_review_mode_and_non_hike(self):
+        hike_url = "https://hike.zhihuishu.com/aidedteaching/sourceLearning/sourceLearning?courseId=11559973&fileId=35338435"
+        context = MagicMock()
+        context.cookies = AsyncMock(
+            return_value=[{"name": "CASTGC", "value": "tgt", "domain": ".zhihuishu.com"}]
+        )
+        page = SimpleNamespace(context=context, url=hike_url)
+
+        with patch(
+            "modules.hike_navigation._mark_hike_documents_from_cookies",
+            return_value={"found": 2, "done": 2, "failed": 0},
+        ) as m_mark:
+            res_review = await complete_hike_document_nodes(
+                page, hike_url, config=SimpleNamespace(reviewMode=True)
+            )
+            self.assertEqual(res_review, {"found": 0, "done": 0, "failed": 0})
+            m_mark.assert_not_called()
+
+            res_other = await complete_hike_document_nodes(
+                SimpleNamespace(context=context, url="https://studyvideoh5.zhihuishu.com/stuStudy"),
+                "https://studyvideoh5.zhihuishu.com/stuStudy",
+            )
+            self.assertEqual(res_other, {"found": 0, "done": 0, "failed": 0})
+            m_mark.assert_not_called()
+
+            res_ok = await complete_hike_document_nodes(
+                page, hike_url, config=SimpleNamespace(reviewMode=False), logger=MagicMock()
+            )
+            self.assertEqual(res_ok, {"found": 2, "done": 2, "failed": 0})
+            m_mark.assert_called_once()
 
 
 if __name__ == "__main__":

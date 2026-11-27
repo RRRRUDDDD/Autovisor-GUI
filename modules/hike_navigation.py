@@ -28,6 +28,9 @@ HIKE_RESOURCE_MENU_TREE_URL = (
 HIKE_LAST_STUDY_FILE_URL = (
     "https://studyresources.zhihuishu.com/studyResources/stuResouce/queryLastStudyFile"
 )
+HIKE_STU_VIEW_FILE_URL = (
+    "https://studyresources.zhihuishu.com/studyResources/stuResouce/stuViewFile"
+)
 
 _API_TIMEOUT = 15
 _VIDEO_EXTS = (".mp4", ".m3u8", ".flv", ".webm", ".mov")
@@ -141,11 +144,79 @@ def _is_video_node(node: dict) -> bool:
 
 
 def _is_node_finished(node: dict) -> bool:
+    if str(node.get("isFinish") or node.get("studyStatus") or "").strip() == "1":
+        return True
     total = _to_float(node.get("totalTime"))
     studied = _to_float(node.get("studyTime"))
     if total > 0 and studied >= total * _HIKE_FINISH_THRESHOLD:
         return True
     return False
+
+
+def collect_hike_document_nodes(nodes) -> list[dict]:
+    """从 Hike 资源树中收集尚未完成的非视频文档节点（供 stuViewFile 标记已读）。
+
+    规则对齐 zhs HikeVideoPlayer._traverse:
+    - 跳过目录节点、视频节点（dataType == 3 或视频后缀）和已完成节点；
+    - dataType 为 None 时仅在存在 fileId 时视为文件（跳过无 fileId 的测验/讨论）；
+    - 其他非视频类型需有有效 fileId（或 type == 1 的叶节点 id）且具备非空名称。
+    """
+    if isinstance(nodes, dict):
+        nodes = nodes.get("rt") if isinstance(nodes.get("rt"), list) else [nodes]
+    if not isinstance(nodes, list):
+        return []
+
+    docs: list[dict] = []
+    seen: set[str] = set()
+
+    def _walk(items, depth: int = 0) -> None:
+        if depth > 20 or not isinstance(items, list):
+            return
+        for node in items:
+            if not isinstance(node, dict):
+                continue
+            children = node.get("childList")
+            if isinstance(children, list) and children:
+                _walk(children, depth + 1)
+                continue
+            node_type = str(node.get("type") if node.get("type") is not None else "").strip()
+            if node_type == "0" and not node.get("fileId"):
+                continue
+            if _is_video_node(node) or _is_node_finished(node):
+                continue
+
+            data_type = node.get("dataType")
+            explicit_fid = _extract_id(node.get("fileId"))
+            file_name = str(node.get("fileName") or node.get("name") or "").strip()
+            if data_type is None:
+                if not explicit_fid:
+                    continue
+                fid = explicit_fid
+            else:
+                if explicit_fid:
+                    if not file_name:
+                        continue
+                    fid = explicit_fid
+                else:
+                    if node_type != "1" or not file_name:
+                        continue
+                    fid = _extract_id(node.get("id"))
+                    if not fid:
+                        continue
+
+            if fid in seen:
+                continue
+            seen.add(fid)
+            docs.append(
+                {
+                    "fileId": fid,
+                    "name": file_name or fid,
+                    "dataType": data_type,
+                }
+            )
+
+    _walk(nodes)
+    return docs
 
 
 def pick_hike_file_id_from_tree(nodes, *, review_mode: bool = False) -> str:
@@ -236,21 +307,19 @@ def _is_studyresources_auth_error(status: int, body: dict | None, *, non_json: b
     )
 
 
-def fetch_hike_file_id_via_api(
+def _studyresources_get_json(
     client,
-    course_id: str,
+    url: str,
+    params: dict,
     *,
-    uuid: str = "",
-    review_mode: bool = False,
+    state: dict,
     own_client: bool = False,
-    sso_state: dict | None = None,
-    logger=None,
-) -> str:
-    """通过 studyresources 官方接口查询 Hike 课程的可播放 fileId（失败返回空字符串）。"""
-    cid = str(course_id or "").strip()
-    if not cid or client is None:
-        return ""
-    state = sso_state if sso_state is not None else {"refreshed": False}
+) -> tuple[int, dict | None, bool]:
+    """带 studyresources 单次 SSO 预热/重试的只读 GET 请求封装。"""
+    headers = {
+        "Origin": "https://hike.zhihuishu.com",
+        "Referer": "https://hike.zhihuishu.com/",
+    }
 
     def _ensure_sso_once() -> None:
         if state.get("refreshed"):
@@ -260,12 +329,7 @@ def fetch_hike_file_id_via_api(
         if callable(ensure_fn):
             ensure_fn(STUDYRESOURCES_SSO_URL)
 
-    headers = {
-        "Origin": "https://hike.zhihuishu.com",
-        "Referer": "https://hike.zhihuishu.com/",
-    }
-
-    def _get_json(url: str, params: dict) -> tuple[int, dict | None, bool]:
+    def _once() -> tuple[int, dict | None, bool]:
         lock = getattr(client, "lock", None)
         if lock is not None:
             with lock:
@@ -289,17 +353,43 @@ def fetch_hike_file_id_via_api(
             return status, None, True
         return status, body, _is_studyresources_auth_error(status, body)
 
-    try:
-        if own_client and not _has_host_cookie(
-            client.session, "studyresources.zhihuishu.com", "SESSION"
-        ):
-            _ensure_sso_once()
+    if own_client and not state.get("refreshed") and not _has_host_cookie(
+        client.session, "studyresources.zhihuishu.com", "SESSION"
+    ):
+        _ensure_sso_once()
 
+    status, body, need_retry = _once()
+    if need_retry and not state.get("refreshed"):
+        _ensure_sso_once()
+        status, body, need_retry = _once()
+    return status, body, need_retry
+
+
+def fetch_hike_file_id_via_api(
+    client,
+    course_id: str,
+    *,
+    uuid: str = "",
+    review_mode: bool = False,
+    own_client: bool = False,
+    sso_state: dict | None = None,
+    logger=None,
+) -> str:
+    """通过 studyresources 官方接口查询 Hike 课程的可播放 fileId（失败返回空字符串）。"""
+    cid = str(course_id or "").strip()
+    if not cid or client is None:
+        return ""
+    state = sso_state if sso_state is not None else {"refreshed": False}
+
+    try:
         tree_params = {"courseId": cid, "_": int(time.time() * 1000)}
-        status, body, need_retry = _get_json(HIKE_RESOURCE_MENU_TREE_URL, tree_params)
-        if need_retry and not state.get("refreshed"):
-            _ensure_sso_once()
-            status, body, need_retry = _get_json(HIKE_RESOURCE_MENU_TREE_URL, tree_params)
+        status, body, need_retry = _studyresources_get_json(
+            client,
+            HIKE_RESOURCE_MENU_TREE_URL,
+            tree_params,
+            state=state,
+            own_client=own_client,
+        )
 
         if status == 200 and isinstance(body, dict) and not need_retry:
             fid = pick_hike_file_id_from_tree(body.get("rt"), review_mode=review_mode)
@@ -312,10 +402,13 @@ def fetch_hike_file_id_via_api(
                 "uuid": uuid,
                 "dateFormate": int(time.time() * 1000),
             }
-            l_status, l_body, l_retry = _get_json(HIKE_LAST_STUDY_FILE_URL, last_params)
-            if l_retry and not state.get("refreshed"):
-                _ensure_sso_once()
-                l_status, l_body, l_retry = _get_json(HIKE_LAST_STUDY_FILE_URL, last_params)
+            l_status, l_body, l_retry = _studyresources_get_json(
+                client,
+                HIKE_LAST_STUDY_FILE_URL,
+                last_params,
+                state=state,
+                own_client=own_client,
+            )
             if l_status == 200 and isinstance(l_body, dict) and not l_retry:
                 fid = pick_hike_file_id_from_last_study(l_body)
                 if fid:
@@ -324,6 +417,165 @@ def fetch_hike_file_id_via_api(
         if logger:
             logger.debug(f"接口解析翻转课 fileId 失败 (courseId={cid}): {exc}")
     return ""
+
+
+def mark_hike_documents_read_via_api(
+    client,
+    course_id: str,
+    *,
+    nodes=None,
+    own_client: bool = False,
+    sso_state: dict | None = None,
+    delay: float = 0.2,
+    sleep=time.sleep,
+    logger=None,
+) -> dict:
+    """通过 GET stuViewFile 将 Hike 课程中未完成的非视频文档节点标记已读。"""
+    cid = str(course_id or "").strip()
+    if not cid or client is None:
+        return {"found": 0, "done": 0, "failed": 0}
+    state = sso_state if sso_state is not None else {"refreshed": False}
+
+    try:
+        if nodes is None:
+            tree_params = {"courseId": cid, "_": int(time.time() * 1000)}
+            status, body, auth_err = _studyresources_get_json(
+                client,
+                HIKE_RESOURCE_MENU_TREE_URL,
+                tree_params,
+                state=state,
+                own_client=own_client,
+            )
+            if status != 200 or not isinstance(body, dict) or auth_err:
+                return {"found": 0, "done": 0, "failed": 0}
+            nodes = body.get("rt")
+
+        docs = collect_hike_document_nodes(nodes)
+        if not docs:
+            return {"found": 0, "done": 0, "failed": 0}
+
+        done = 0
+        failed = 0
+        for doc in docs:
+            fid = doc["fileId"]
+            try:
+                status, body, auth_err = _studyresources_get_json(
+                    client,
+                    HIKE_STU_VIEW_FILE_URL,
+                    {"courseId": cid, "fileId": fid},
+                    state=state,
+                    own_client=own_client,
+                )
+            except Exception as exc:
+                failed += 1
+                if logger:
+                    logger.debug(f"Hike 文档标记已读失败 (fileId={fid}): {exc}")
+                continue
+            ok = (
+                status == 200
+                and isinstance(body, dict)
+                and not auth_err
+                and (
+                    body.get("rt") is not None
+                    or str(body.get("status") or body.get("code") or "").strip()
+                    in ("200", "0", "1")
+                )
+            )
+            if ok:
+                done += 1
+                if logger:
+                    logger.info(f"Hike 文档已标记已读: {doc['name']}")
+            else:
+                failed += 1
+                if logger:
+                    logger.debug(
+                        f"Hike 文档标记已读未确认 (fileId={fid}, status={status})"
+                    )
+            if delay > 0 and callable(sleep):
+                sleep(delay)
+        return {"found": len(docs), "done": done, "failed": failed}
+    except Exception as exc:
+        if logger:
+            logger.debug(f"Hike 文档扫描/已读补齐失败 (courseId={cid}): {exc}")
+        return {"found": 0, "done": 0, "failed": 0}
+
+
+def _mark_hike_documents_from_cookies(
+    cookies,
+    course_id: str,
+    *,
+    proxy: str = "",
+    logger=None,
+) -> dict:
+    from modules.zhs_api import ZhsApiClient
+
+    if not cookies:
+        return {"found": 0, "done": 0, "failed": 0}
+    client = ZhsApiClient(
+        cookies,
+        proxy=proxy,
+        total_retries=1,
+        timeout=_API_TIMEOUT,
+    )
+    try:
+        return mark_hike_documents_read_via_api(
+            client,
+            course_id,
+            own_client=True,
+            logger=logger,
+        )
+    finally:
+        client.close()
+
+
+async def complete_hike_document_nodes(
+    page,
+    course_url: str,
+    *,
+    config=None,
+    logger=None,
+    proxy: str = "",
+) -> dict:
+    """扫描 Hike 课程中的非视频文档节点并调用 stuViewFile 补齐阅读进度。"""
+    if getattr(config, "reviewMode", False) is True:
+        return {"found": 0, "done": 0, "failed": 0}
+    info = parse_hike_course_url(course_url) or parse_hike_course_url(
+        getattr(page, "url", "")
+    )
+    course_id = str(info.get("courseId") or "").strip()
+    if not course_id:
+        return {"found": 0, "done": 0, "failed": 0}
+    context = getattr(page, "context", None)
+    if context is None or not hasattr(context, "cookies"):
+        return {"found": 0, "done": 0, "failed": 0}
+    effective_proxy = proxy or str(getattr(config, "proxy", "") or "").strip()
+    try:
+        cookies = await context.cookies()
+        if not cookies:
+            return {"found": 0, "done": 0, "failed": 0}
+        summary = await asyncio.to_thread(
+            _mark_hike_documents_from_cookies,
+            cookies,
+            course_id,
+            proxy=effective_proxy,
+            logger=logger,
+        )
+    except Exception as exc:
+        if logger:
+            logger.debug(f"补齐 Hike 文档阅读进度失败 (courseId={course_id}): {exc}")
+        return {"found": 0, "done": 0, "failed": 0}
+    if logger and summary.get("found"):
+        logger.info(
+            f"Hike 非视频文档补齐完成: 已读 {summary['done']}/{summary['found']} 项"
+            + (f", 失败 {summary['failed']} 项." if summary.get("failed") else ".")
+        )
+        logger.event(
+            "Hike 文档补齐",
+            发现=summary["found"],
+            已读=summary["done"],
+            失败=summary["failed"],
+        )
+    return summary
 
 
 def _resolve_file_id_from_cookies(
