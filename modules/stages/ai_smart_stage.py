@@ -19,7 +19,7 @@ from modules.ai_smart_mastery import (
     run_course_mastery,
 )
 from modules.answer_store import AiQuestionStore
-from modules.exam_api import is_free_exam
+from modules.exam_api import complete_non_video_resources_via_api, is_free_exam
 from modules.exam_ctx import AiFormalExamCtx, ExamApi, ExamRunner
 from modules.runtime_bootstrap import build_page_exam_api, resolve_cancel_event
 from modules.url_router import (
@@ -69,13 +69,30 @@ def course_route(parsed: dict, course_url: str) -> str:
     return "catalog"
 
 
+async def _try_build_resource_api(page: Page, config, build_api_fn, logger):
+    """尝试构造用于 AI 非视频资源快速完成的 ExamApi；不可用时静默返回 None 回退 DOM。"""
+    try:
+        return await build_api_fn(page, config)
+    except Exception as exc:
+        logger.debug(f"资源补齐阶段未启用 API 快速通道, 回退浏览器 DOM: {exc}")
+        return None
+
+
 async def run_resources_stage(
     page: Page, course_url: str, config, logger, playback_enabled
 ) -> dict:
-    """按知识点逐个核对「必学资源」, 把漏掉的视频/文档/PPT 补齐."""
+    """按知识点逐个核对「必学资源」, 把漏掉的视频/文档/PPT 补齐.
+
+    非视频资源优先尝试 studyRecord/completed 安全通道（绝不跳过视频播放），
+    API 不可用或存在未完成视频/失败项时无缝回退 Playwright DOM 处理。
+    """
     enum_fn = _av("enumerate_nodes", enumerate_nodes)
     build_url_fn = _av("build_learn_url", build_learn_url)
     complete_fn = _av("complete_resources_for_node", complete_resources_for_node)
+    build_api_fn = _av("build_page_exam_api", build_page_exam_api)
+    api_complete_fn = _av(
+        "complete_non_video_resources_via_api", complete_non_video_resources_via_api
+    )
 
     logger.section("必学资源补齐")
     payload = await enum_fn(page, course_url)
@@ -83,33 +100,80 @@ async def run_resources_stage(
     logger.event("资源补齐范围", 知识点=len(nodes))
     started_at = time.monotonic()
     total_done = total_failed = 0
-    for index, node in enumerate(nodes, 1):
-        if getattr(config, "limitMaxTime", 0) and (
-            time.monotonic() - started_at
-        ) / 60 >= config.limitMaxTime:
-            logger.warn("达到单课时限, 停止补齐资源.")
-            break
-        name = node.get("name") or node["nodeUid"]
-        learn_url = build_url_fn(
-            payload["courseId"], node["nodeUid"], payload["classId"]
-        )
-        result = await complete_fn(
-            page, learn_url, config, logger, playback_enabled, started_at
-        )
-        if result.get("ok"):
-            total_done += result.get("done", 0)
-            total_failed += result.get("failed", 0)
-            if result.get("done") or result.get("failed"):
-                logger.event(
-                    "资源补齐",
-                    序号=f"{index}/{len(nodes)}",
-                    名称=name,
-                    补齐=result.get("done"),
-                    已完成=result.get("skipped"),
-                    失败=result.get("failed"),
-                )
-        else:
-            logger.debug(f"跳过 {name}: {result.get('reason')}")
+    api = await _try_build_resource_api(page, config, build_api_fn, logger)
+    try:
+        for index, node in enumerate(nodes, 1):
+            if getattr(config, "limitMaxTime", 0) and (
+                time.monotonic() - started_at
+            ) / 60 >= config.limitMaxTime:
+                logger.warn("达到单课时限, 停止补齐资源.")
+                break
+            name = node.get("name") or node["nodeUid"]
+            api_done = 0
+            if (
+                api is not None
+                and payload.get("courseId")
+                and payload.get("classId")
+                and node.get("nodeUid")
+            ):
+                try:
+                    api_result = await asyncio.to_thread(
+                        api_complete_fn,
+                        api,
+                        payload["courseId"],
+                        payload["classId"],
+                        node["nodeUid"],
+                        logger=logger,
+                    )
+                except Exception as exc:
+                    logger.debug(f"知识点「{name}」非视频 API 通道失败, 回退 DOM: {exc}")
+                    api_result = None
+                if isinstance(api_result, dict) and api_result.get("ok"):
+                    api_done = int(api_result.get("done") or 0)
+                    total_done += api_done
+                    if (
+                        int(api_result.get("total") or 0) > 0
+                        and not api_result.get("has_incomplete_video")
+                        and int(api_result.get("failed") or 0) == 0
+                    ):
+                        if api_done:
+                            logger.event(
+                                "资源补齐",
+                                序号=f"{index}/{len(nodes)}",
+                                名称=name,
+                                补齐=api_done,
+                                已完成=api_result.get("skipped", 0),
+                                失败=0,
+                                方式="API",
+                            )
+                        continue
+            learn_url = build_url_fn(
+                payload["courseId"], node["nodeUid"], payload["classId"]
+            )
+            result = await complete_fn(
+                page, learn_url, config, logger, playback_enabled, started_at
+            )
+            if result.get("ok"):
+                dom_done = int(result.get("done", 0) or 0)
+                dom_failed = int(result.get("failed", 0) or 0)
+                total_done += dom_done
+                total_failed += dom_failed
+                if (api_done + dom_done) or dom_failed:
+                    logger.event(
+                        "资源补齐",
+                        序号=f"{index}/{len(nodes)}",
+                        名称=name,
+                        补齐=api_done + dom_done,
+                        已完成=result.get("skipped"),
+                        失败=dom_failed,
+                    )
+            else:
+                logger.debug(f"跳过 {name}: {result.get('reason')}")
+    finally:
+        if api is not None:
+            close_fn = getattr(api, "close", None)
+            if callable(close_fn):
+                close_fn()
     logger.info(f"必学资源补齐完成: 补齐 {total_done} 项, 失败 {total_failed} 项.")
     logger.event("资源补齐汇总", 补齐=total_done, 失败=total_failed)
     return {"done": total_done, "failed": total_failed}
@@ -301,6 +365,7 @@ async def run_exam_stage(
                         target=int(config.masteryTarget),
                         enable_ppt=getattr(config, "enablePptReference", True),
                         cancel_event=cancel_event,
+                        skip_free_exam=bool(getattr(config, "skip_ai_free_exam", True)),
                     )
                     logger.info(
                         f"开始接口考试: 知识点 {len(nodes)} 个, 目标掌握度 {int(config.masteryTarget)}%"
@@ -434,6 +499,7 @@ async def run_learn_page_route(
             target=int(config.masteryTarget),
             enable_ppt=getattr(config, "enablePptReference", True),
             cancel_event=cancel_event,
+            skip_free_exam=bool(getattr(config, "skip_ai_free_exam", True)),
         )
         node = {"nodeUid": node_uid, "name": f"知识点 {node_uid}"}
         try:
@@ -508,5 +574,6 @@ async def run_mastery_stage(page: Page, course_url: str, config, logger) -> dict
         target=target,
         max_attempts=3,
         force_redo=bool(getattr(config, "forceRedoAnswered", False)),
+        skip_free_exam=bool(getattr(config, "skip_ai_free_exam", True)),
     )
     return summary

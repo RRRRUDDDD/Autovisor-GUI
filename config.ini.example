@@ -66,6 +66,8 @@ soundOff = True
 reviewMode = False
 ;AI智慧课: 视频刷完后是否继续把知识点掌握度(题目)刷满 (默认:True)
 enableMastery = True
+;AI智慧课: 掌握度/作业考核阶段是否跳过免考知识点 (默认:True, 不影响必学资源阶段)
+skip_ai_free_exam = True
 ;AI智慧课: 是否先用接口版 ExamCtx 刷计分考试并交卷 (默认:True)
 enableExamApi = True
 ;复习/模拟考试页: 是否捕获新页面并用接口直接作答交卷 (默认:False, 正式考试勿开)

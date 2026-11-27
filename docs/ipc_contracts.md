@@ -60,6 +60,7 @@
 | `enableReviewExamApi` | `boolean` | `false` | `[course-option] enableReviewExamApi` | 复习/模拟考接口作答 |
 | `enableZhidaoQuiz` | `boolean` | `true` | `[course-option] enableZhidaoQuiz` | 课中弹题智慧树 AI |
 | `enableMastery` | `boolean` | `true` | `[course-option] enableMastery` | 知识点掌握度刷题 |
+| `skipAiFreeExam` | `boolean` | `true` | `[course-option] skip_ai_free_exam` | AI 掌握度/作业考核阶段跳过免考知识点（不影响资源阶段） |
 | `masteryTarget` | `number` | `100.0` | `[course-option] masteryTarget` | `[1, 100]` |
 | `enablePptReference` | `boolean` | `true` | `[course-option] enablePptReference` | PPT 课件文本参考 |
 | `enablePopupIntercept` | `boolean` | `true` | `[course-option] enablePopupIntercept` | 弹题响应只读拦截 |

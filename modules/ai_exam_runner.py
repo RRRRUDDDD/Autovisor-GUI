@@ -54,6 +54,7 @@ class ExamRunner:
         bank: AnswerBank | None = None,
         enable_ppt: bool = True,
         cancel_event: threading.Event | None = None,
+        skip_free_exam: bool = True,
     ):
         self.course_id = course_id
         self.class_id = class_id
@@ -64,6 +65,7 @@ class ExamRunner:
         self.bank = bank or AnswerBank(course_id)
         self.enable_ppt = bool(enable_ppt)
         self.cancel_event = cancel_event
+        self.skip_free_exam = bool(skip_free_exam)
         self.extractor = PptExtractor(
             proxy=getattr(api, "proxy", ""),
             session=getattr(api, "session", None),
@@ -83,7 +85,7 @@ class ExamRunner:
             if deadline is not None and time.monotonic() >= deadline:
                 log.warn("接口考试达到时限, 停止剩余知识点.")
                 break
-            if is_free_exam(node):
+            if self.skip_free_exam and is_free_exam(node):
                 summary["skipped"].append(node.get("name") or node.get("nodeUid"))
                 continue
             knowledge_id = node.get("nodeUid")

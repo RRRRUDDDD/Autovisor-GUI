@@ -253,6 +253,13 @@ export default function AnswerEnhancementCard({
               description="视频刷完后自动刷知识点掌握度题目（仅对 AI 智慧课生效）"
             />
             <Switch
+              id="skipAiFreeExam"
+              checked={config.skipAiFreeExam !== false}
+              onChange={(skipAiFreeExam) => updateField({ skipAiFreeExam })}
+              label="AI 智慧课跳过免考知识点考核"
+              description="仅在掌握度与接口考核阶段跳过免考节点，不影响必学视频与文档资源补齐"
+            />
+            <Switch
               id="enableExamApi"
               checked={config.enableExamApi !== false}
               onChange={(enableExamApi) => updateField({ enableExamApi })}

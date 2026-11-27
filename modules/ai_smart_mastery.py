@@ -1049,6 +1049,7 @@ async def run_course_mastery(
     passes: int = 3,
     *,
     force_redo: bool = False,
+    skip_free_exam: bool = True,
 ) -> dict:
     """遍历课程里所有知识点把掌握度刷到 target.
 
@@ -1070,9 +1071,13 @@ async def run_course_mastery(
         nodes = nodes[:limit]
     logger.info(f"共 {len(nodes)} 个知识点待处理, 目标掌握度 {target}%")
 
-    pending = [node for node in nodes if not is_free_exam(node)]
+    if skip_free_exam:
+        pending = [node for node in nodes if not is_free_exam(node)]
+        skipped_free = [node for node in nodes if is_free_exam(node)]
+    else:
+        pending = list(nodes)
+        skipped_free = []
     records: dict[str, dict] = {}
-    skipped_free = [node for node in nodes if is_free_exam(node)]
     for node in skipped_free:
         summary["skipped"].append(
             {"name": node.get("name") or node["nodeUid"], "reason": "免考"}

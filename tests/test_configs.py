@@ -316,6 +316,7 @@ class ConfigTests(unittest.TestCase):
         self.assertIn("attachExistingChrome = False", CONFIG_TEMPLATE)
         self.assertIn("cdpUrl = http://127.0.0.1:9222", CONFIG_TEMPLATE)
         self.assertIn("enableDebugLog = False", CONFIG_TEMPLATE)
+        self.assertIn("skip_ai_free_exam = True", CONFIG_TEMPLATE)
         self.assertEqual(
             classify_course_url("https://zhihuishu.com/#/dohomework/1/2/3/4/5"),
             "知到作业",
@@ -332,6 +333,32 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(infer_provider("https://api.deepseek.com", "openai"), "deepseek")
         self.assertEqual(infer_provider("https://custom.relay.example", "anthropic"), "anthropic")
 
+
+
+    def test_skip_ai_free_exam_defaults_true_and_supports_both_ini_names(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config_path = os.path.join(directory, "config.ini")
+            mirrors_path = os.path.join(directory, "mirrors.json")
+            with open(mirrors_path, "w", encoding="utf-8") as file:
+                file.write('{"primary":"https://mirror.example/simple"}')
+            template = (
+                "[user-account]\nusername=\npassword=\n"
+                "[browser-option]\ndriver=chrome\nEXE_PATH=\n"
+                "[script-option]\n"
+                "[course-option]\nsoundOff=true\n{option}\n"
+                "[course-url]\nURL1=\n"
+            )
+            for option, expected in (
+                ("", True),
+                ("skip_ai_free_exam=False", False),
+                ("skip_ai_free_exam=True", True),
+                ("skipAiFreeExam=False", False),
+            ):
+                with self.subTest(option=option):
+                    with open(config_path, "w", encoding="utf-8") as file:
+                        file.write(template.format(option=option))
+                    config = Config(config_path, mirrors_path)
+                    self.assertIs(config.skip_ai_free_exam, expected)
 
 
 class EnsureConfigFilesTests(unittest.TestCase):

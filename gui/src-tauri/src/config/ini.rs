@@ -156,6 +156,9 @@ pub fn parse_ini_str(content: &str) -> (AutovisorConfig, Vec<String>) {
                 }
                 "enablezhidaoquiz" => cfg.enable_zhidao_quiz = parse_bool(&val, true),
                 "enablemastery" => cfg.enable_mastery = parse_bool(&val, true),
+                "skip_ai_free_exam" | "skipaifreeexam" => {
+                    cfg.skip_ai_free_exam = parse_bool(&val, true);
+                }
                 "masterytarget" => {
                     if let Ok(num) = val.parse::<f64>() {
                         if num.is_finite() && num > 0.0 {
@@ -291,6 +294,9 @@ pub fn render_ini_str(cfg: &AutovisorConfig) -> String {
         ";课中弹题: 是否优先用智慧树 AI 作答, 失败回退自定义大模型 (默认:True)".to_string(),
         format!("enableZhidaoQuiz = {}", format_bool(cfg.enable_zhidao_quiz)),
         format!("enableMastery = {}", format_bool(cfg.enable_mastery)),
+        ";AI智慧课: 掌握度/作业考核阶段是否跳过免考知识点 (默认:True, 不影响必学资源阶段)"
+            .to_string(),
+        format!("skip_ai_free_exam = {}", format_bool(cfg.skip_ai_free_exam)),
         format!(
             "masteryTarget = {}",
             format_number(cfg.mastery_target.clamp(1.0, 100.0))

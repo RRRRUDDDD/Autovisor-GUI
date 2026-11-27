@@ -42,6 +42,7 @@ class Config:
         self.shutdownOnComplete = False
         self.enableDebugLog = False
         self.reviewMode = False
+        self.skip_ai_free_exam = True
         if config_path:
             self._config = configparser.ConfigParser()
             # 用户常量
@@ -94,6 +95,15 @@ class Config:
             self.reviewMode = self.get_bool_field('course-option', 'reviewMode', fallback=False)
             # AI 智慧课: 视频刷完后是否继续把知识点掌握度刷满
             self.enableMastery = self.get_bool_field('course-option', 'enableMastery', fallback=True)
+            # AI 智慧课: 掌握度/作业考核阶段是否跳过免考知识点 (默认开启, 不影响必学资源阶段)
+            if self._config.has_option('course-option', 'skip_ai_free_exam'):
+                self.skip_ai_free_exam = self.get_bool_field(
+                    'course-option', 'skip_ai_free_exam', fallback=True
+                )
+            else:
+                self.skip_ai_free_exam = self.get_bool_field(
+                    'course-option', 'skipAiFreeExam', fallback=True
+                )
             # AI 智慧课: 是否先用接口版 ExamCtx 刷计分考试并交卷
             self.enableExamApi = self.get_bool_field('course-option', 'enableExamApi', fallback=True)
             # 复习/模拟考试页: 是否用接口直接作答交卷(默认关闭, 正式考试勿开)
@@ -396,6 +406,8 @@ soundOff = True
 reviewMode = False
 ;AI智慧课: 视频刷完后是否继续把知识点掌握度(题目)刷满 (默认:True)
 enableMastery = True
+;AI智慧课: 掌握度/作业考核阶段是否跳过免考知识点 (默认:True, 不影响必学资源阶段)
+skip_ai_free_exam = True
 ;AI智慧课: 是否先用接口版 ExamCtx 刷计分考试并交卷 (默认:True)
 enableExamApi = True
 ;复习/模拟考试页: 是否捕获新页面并用接口直接作答交卷 (默认:False, 正式考试勿开)

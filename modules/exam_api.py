@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import random
 import re
+import time
 from pathlib import Path
 from urllib.parse import unquote
 
@@ -28,6 +29,10 @@ EXAM_BASE = "https://studentexamtest.zhihuishu.com/gateway/t/v1"
 KNOWLEDGE_RESOURCE_LIST = (
     "https://kg-ai-run.zhihuishu.com/run/gateway/t/stu/resources/list-knowledge-resource"
 )
+STUDY_RECORD_COMPLETED = (
+    "https://kg-ai-run.zhihuishu.com/run/gateway/t/stu/studyRecord/completed"
+)
+_VIDEO_EXTS = (".mp4", ".m3u8", ".flv", ".webm", ".mov")
 EXAM_OPEN = f"{EXAM_BASE}/exam/user/openExam"
 EXAM_USED_TIME = f"{EXAM_BASE}/exam/user/updateUserUsedTime"
 EXAM_SHEET = f"{EXAM_BASE}/exam/user/getExamSheetInfo"
@@ -515,3 +520,185 @@ class ExamApi:
             payload.get("resourceList") if isinstance(payload, dict) else None
         )
         return resources if isinstance(resources, list) else []
+
+    def complete_study_resource(
+        self, course_id, class_id, knowledge_id, resources_uid
+    ) -> bool:
+        """上报 AI 智慧课非视频资源(文档/PPT/文本)完成状态；失败返回 False。"""
+        data = {
+            "courseId": _maybe_int(course_id),
+            "classId": _maybe_int(class_id),
+            "knowledgeId": _maybe_int(knowledge_id),
+            "resourcesUid": _maybe_int(resources_uid),
+            "watchUId": 1,
+        }
+        try:
+            self.query_strategy("ai_task", STUDY_RECORD_COMPLETED, data)
+            return True
+        except Exception as exc:
+            logger.debug(
+                f"上报 AI 非视频资源完成失败(knowledgeId={knowledge_id}, uid={resources_uid}): {exc}"
+            )
+            return False
+
+
+def _maybe_int(value):
+    if isinstance(value, bool) or value is None:
+        return value
+    if isinstance(value, int):
+        return value
+    text = str(value).strip()
+    if text and text.lstrip("-").isdigit():
+        try:
+            return int(text)
+        except ValueError:
+            return value
+    return value
+
+
+def _safe_int(value, default: int | None = None) -> int | None:
+    if isinstance(value, bool) or value is None:
+        return default
+    try:
+        return int(str(value).strip())
+    except (TypeError, ValueError):
+        return default
+
+
+def is_video_knowledge_resource(resource: dict | None) -> bool:
+    """判断 AI 知识点资源是否为视频类（视频严格走浏览器播放，不走快速完成接口）。"""
+    if not isinstance(resource, dict):
+        return False
+    detail = (
+        resource.get("resourcesDetail")
+        if isinstance(resource.get("resourcesDetail"), dict)
+        else resource
+    )
+    r_type = _safe_int(detail.get("resourcesType"))
+    r_dist = _safe_int(detail.get("resourcesDistributeType"))
+    if (r_type == 1 and r_dist == 3) or (r_type == 2 and r_dist == 2):
+        return True
+    for candidate in (detail.get("resourcesUrl"), detail.get("resourcesName")):
+        text = str(candidate or "").strip().lower().split("?", 1)[0]
+        if text and any(text.endswith(ext) for ext in _VIDEO_EXTS):
+            return True
+    return False
+
+
+def collect_incomplete_non_video_resources(
+    resources: list[dict] | None, *, include_optional: bool = False
+) -> list[dict]:
+    """筛选未完成的必学非视频资源(PPT/文档/文本)，排除选学与视频资源。"""
+    targets: list[dict] = []
+    seen_uids: set[str] = set()
+    for item in resources or []:
+        if not isinstance(item, dict):
+            continue
+        detail = (
+            item.get("resourcesDetail")
+            if isinstance(item.get("resourcesDetail"), dict)
+            else item
+        )
+        sync_type = detail.get("resourcesSyncType")
+        if not include_optional and sync_type is not None and _safe_int(sync_type) != 1:
+            continue
+        if _safe_int(item.get("studyStatus")) == 1:
+            continue
+        if is_video_knowledge_resource(item):
+            continue
+        uid = detail.get("resourcesUid")
+        if uid in (None, "", 0, "0"):
+            uid = item.get("resourcesUid")
+        uid_key = str(uid or "").strip()
+        if not uid_key or uid_key == "0" or uid_key in seen_uids:
+            continue
+        seen_uids.add(uid_key)
+        name = str(
+            detail.get("resourcesName") or item.get("resourcesName") or uid_key
+        ).strip()
+        targets.append(
+            {
+                "resourcesUid": _maybe_int(uid),
+                "name": name,
+                "resourcesType": detail.get("resourcesType"),
+                "resourcesDistributeType": detail.get("resourcesDistributeType"),
+            }
+        )
+    return targets
+
+
+def complete_non_video_resources_via_api(
+    api: ExamApi,
+    course_id,
+    class_id,
+    knowledge_id,
+    *,
+    include_optional: bool = False,
+    delay: float = 0.2,
+    sleep=time.sleep,
+    logger=None,
+) -> dict:
+    """通过 studyRecord/completed 快速完成单个知识点的必学非视频资源。"""
+    resources = api.list_knowledge_resources(course_id, class_id, knowledge_id)
+    if not resources:
+        return {
+            "ok": False,
+            "done": 0,
+            "failed": 0,
+            "skipped": 0,
+            "has_incomplete_video": False,
+            "total": 0,
+        }
+
+    total_required = 0
+    skipped = 0
+    has_incomplete_video = False
+    for item in resources:
+        if not isinstance(item, dict):
+            continue
+        detail = (
+            item.get("resourcesDetail")
+            if isinstance(item.get("resourcesDetail"), dict)
+            else item
+        )
+        sync_type = detail.get("resourcesSyncType")
+        if not include_optional and sync_type is not None and _safe_int(sync_type) != 1:
+            continue
+        total_required += 1
+        if _safe_int(item.get("studyStatus")) == 1:
+            skipped += 1
+            continue
+        if is_video_knowledge_resource(item):
+            has_incomplete_video = True
+
+    targets = collect_incomplete_non_video_resources(
+        resources, include_optional=include_optional
+    )
+    done = 0
+    failed = 0
+    for target in targets:
+        if api.complete_study_resource(
+            course_id, class_id, knowledge_id, target["resourcesUid"]
+        ):
+            done += 1
+            if logger is not None:
+                logger.info(f"API 快速完成非视频资源: {target['name']}")
+                logger.event(
+                    "ai-smart 资源完成",
+                    标题=target["name"],
+                    类型="document",
+                    方式="API",
+                )
+        else:
+            failed += 1
+        if delay > 0 and callable(sleep):
+            sleep(delay)
+
+    return {
+        "ok": True,
+        "done": done,
+        "failed": failed,
+        "skipped": skipped,
+        "has_incomplete_video": has_incomplete_video,
+        "total": total_required,
+    }

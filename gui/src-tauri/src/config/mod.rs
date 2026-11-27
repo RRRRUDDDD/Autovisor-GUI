@@ -39,6 +39,7 @@ mod tests {
         cfg.enable_review_exam_api = true;
         cfg.enable_zhidao_quiz = false;
         cfg.enable_mastery = false;
+        cfg.skip_ai_free_exam = false;
         cfg.mastery_target = 85.0;
         cfg.enable_hide_window = false;
         cfg.enable_debug_log = true;
@@ -101,6 +102,7 @@ mod tests {
         assert!(parsed.enable_review_exam_api);
         assert!(!parsed.enable_zhidao_quiz);
         assert!(!parsed.enable_mastery);
+        assert!(!parsed.skip_ai_free_exam);
         assert!((parsed.mastery_target - 85.0).abs() < 1e-6);
         assert!(!parsed.enable_hide_window);
         assert!(parsed.enable_debug_log);

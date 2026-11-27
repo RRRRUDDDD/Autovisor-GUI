@@ -150,6 +150,7 @@ export function defaultConfig() {
     enableReviewExamApi: false,
     enableZhidaoQuiz: true,
     enableMastery: true,
+    skipAiFreeExam: true,
     masteryTarget: 100,
     enablePptReference: true,
     enablePopupIntercept: true,
@@ -377,6 +378,12 @@ export function normalizeConfig(raw) {
     enableReviewExamApi: Boolean(raw.enableReviewExamApi),
     enableZhidaoQuiz: raw.enableZhidaoQuiz !== undefined ? Boolean(raw.enableZhidaoQuiz) : true,
     enableMastery: raw.enableMastery !== undefined ? Boolean(raw.enableMastery) : true,
+    skipAiFreeExam:
+      raw.skipAiFreeExam !== undefined
+        ? Boolean(raw.skipAiFreeExam)
+        : raw.skip_ai_free_exam !== undefined
+          ? Boolean(raw.skip_ai_free_exam)
+          : true,
     masteryTarget: Number.isFinite(masteryTarget) && masteryTarget > 0
       ? Math.min(100, Math.max(1, Math.round(masteryTarget)))
       : 100,

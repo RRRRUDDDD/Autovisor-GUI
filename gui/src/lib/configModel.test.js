@@ -163,6 +163,9 @@ describe('configModel', () => {
     expect(normalizeConfig({}).llm.questionBankToken).toBe('');
     expect(normalizeConfig({}).llm.questionBankUrl).toBe('https://tk.enncy.cn/query');
     expect(normalizeConfig({}).llm.questionBankScopes).toEqual(['zhidao_exam', 'ai_exam']);
+    expect(normalizeConfig({}).skipAiFreeExam).toBe(true);
+    expect(normalizeConfig({ skipAiFreeExam: false }).skipAiFreeExam).toBe(false);
+    expect(normalizeConfig({ skip_ai_free_exam: false }).skipAiFreeExam).toBe(false);
     const llmOverrides = normalizeConfig({
       llm: {
         stream_timeout: 60,

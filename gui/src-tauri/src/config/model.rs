@@ -108,6 +108,8 @@ pub struct AutovisorConfig {
     pub enable_zhidao_quiz: bool,
     #[serde(default = "default_true")]
     pub enable_mastery: bool,
+    #[serde(default = "default_true")]
+    pub skip_ai_free_exam: bool,
     #[serde(default = "default_mastery_target")]
     pub mastery_target: f64,
     #[serde(default = "default_true")]
@@ -185,6 +187,7 @@ impl Default for AutovisorConfig {
             enable_review_exam_api: false,
             enable_zhidao_quiz: true,
             enable_mastery: true,
+            skip_ai_free_exam: true,
             mastery_target: 100.0,
             enable_ppt_reference: true,
             enable_popup_intercept: true,
