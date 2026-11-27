@@ -9,26 +9,28 @@ import time
 import uuid
 
 from PIL import Image, ImageOps
+import requests
 
-from modules.http_utils import create_retry_session
+from modules.http_utils import DEFAULT_BROWSER_USER_AGENT, create_retry_session
 from modules.utils import filter_zhihuishu_cookies, get_runtime_path
 
-QR_IMG_URL = "https://passport.zhihuishu.com/qrCodeLogin/getLoginQrImg"
-QR_INFO_URL = "https://passport.zhihuishu.com/qrCodeLogin/getLoginQrInfo"
+QR_IMG_URL = "https://user.zhihuishu.com/zhsuser/qrCodeLogin/getLoginQrImg"
+QR_INFO_URL = "https://user.zhihuishu.com/zhsuser/qrCodeLogin/getLoginQrInfo"
 QR_LOGIN_SERVICE_URL = (
     "https://passport.zhihuishu.com/login"
-    "?service=https://onlineweb.zhihuishu.com/onlinestuh5"
+    "?service=https://onlineservice-api.zhihuishu.com/login/gologin"
 )
 
 _DEFAULT_HEADERS = {
     "Accept": "*/*",
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/131.0.0.0 Safari/537.36"
-    ),
+    "User-Agent": DEFAULT_BROWSER_USER_AGENT,
     "Referer": "https://passport.zhihuishu.com/login",
 }
+
+
+def _prewarm_qr_session(client) -> None:
+    """请求二维码前先 GET 登录页，种下服务端所需的初始会话 Cookie。"""
+    client.get(QR_LOGIN_SERVICE_URL, timeout=15)
 
 
 def render_qr_unicode(img_bytes: bytes, size: int = 47) -> str:
@@ -162,16 +164,22 @@ def qr_login_for_cookies(
     proxy: str = "",
     poll_interval: float = 1.0,
     max_refreshes: int = 3,
+    timeout_secs: float = 180.0,
     qr_callback=None,
     logger=None,
     session=None,
     sleep_fn=time.sleep,
+    monotonic_fn=time.monotonic,
 ) -> list[dict]:
     """通过官方二维码登录接口获取智慧树登录 Cookies（Playwright 格式）。"""
     own_session = session is None
     client = session or create_retry_session(proxy=proxy, headers=_DEFAULT_HEADERS)
+    deadline = monotonic_fn() + max(1.0, float(timeout_secs))
     try:
+        _prewarm_qr_session(client)
         for attempt in range(1, max_refreshes + 1):
+            if monotonic_fn() >= deadline:
+                raise RuntimeError(f"扫码登录超时（超过 {float(timeout_secs):g} 秒），请重试")
             resp = client.get(QR_IMG_URL, timeout=15)
             resp.raise_for_status()
             payload = resp.json()
@@ -195,14 +203,25 @@ def qr_login_for_cookies(
             scanned = False
             expired = False
             while True:
+                if monotonic_fn() >= deadline:
+                    raise RuntimeError(
+                        f"扫码登录超时（超过 {float(timeout_secs):g} 秒），请重试"
+                    )
                 sleep_fn(poll_interval)
-                poll_resp = client.get(
-                    QR_INFO_URL,
-                    params={"qrToken": qr_token},
-                    timeout=15,
-                )
-                poll_resp.raise_for_status()
-                info = poll_resp.json()
+                try:
+                    poll_resp = client.get(
+                        QR_INFO_URL,
+                        params={"qrToken": qr_token},
+                        timeout=15,
+                    )
+                    poll_resp.raise_for_status()
+                    info = poll_resp.json()
+                except (requests.RequestException, ValueError) as exc:
+                    if monotonic_fn() >= deadline:
+                        raise RuntimeError(f"扫码登录轮询超时: {exc}") from exc
+                    if logger:
+                        logger.warn(f"二维码状态轮询遇到瞬时异常，继续重试: {exc}")
+                    continue
                 status = info.get("status")
                 if status == -1:
                     continue
@@ -310,6 +329,7 @@ class QrLoginManager:
             self._cleanup_expired_locked()
         client = self._create_session(proxy=proxy)
         try:
+            _prewarm_qr_session(client)
             resp = client.get(QR_IMG_URL, timeout=15)
             resp.raise_for_status()
             payload = resp.json()

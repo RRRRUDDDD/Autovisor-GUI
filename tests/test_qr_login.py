@@ -5,10 +5,16 @@ import tempfile
 import unittest
 
 from PIL import Image
+import requests
 from requests.cookies import RequestsCookieJar, create_cookie
 
+from modules import zhs_api
 from modules.qr_login import (
+    QR_IMG_URL,
+    QR_INFO_URL,
+    QR_LOGIN_SERVICE_URL,
     QrLoginManager,
+    _DEFAULT_HEADERS,
     qr_login_for_cookies,
     render_qr_tty,
     render_qr_unicode,
@@ -93,6 +99,26 @@ class QrLoginTests(unittest.TestCase):
         self.assertTrue(converted["CASTGC"]["secure"])
         self.assertEqual(converted["CASTGC"]["expires"], 1893456000.0)
 
+    def test_qr_urls_and_unified_user_agent(self):
+        self.assertEqual(
+            QR_IMG_URL,
+            "https://user.zhihuishu.com/zhsuser/qrCodeLogin/getLoginQrImg",
+        )
+        self.assertEqual(
+            QR_INFO_URL,
+            "https://user.zhihuishu.com/zhsuser/qrCodeLogin/getLoginQrInfo",
+        )
+        self.assertIn(
+            "service=https://onlineservice-api.zhihuishu.com/login/gologin",
+            QR_LOGIN_SERVICE_URL,
+        )
+        self.assertEqual(
+            _DEFAULT_HEADERS["User-Agent"],
+            zhs_api.DEFAULT_HEADERS["User-Agent"],
+        )
+        self.assertNotIn("Chrome/120", _DEFAULT_HEADERS["User-Agent"])
+        self.assertNotIn("Chrome/131", _DEFAULT_HEADERS["User-Agent"])
+
     def test_qr_login_full_flow_with_refresh(self):
         png_b64 = b64encode(_sample_qr_png()).decode("ascii")
         received_imgs = []
@@ -105,6 +131,7 @@ class QrLoginTests(unittest.TestCase):
 
         session = _FakeQrSession(
             [
+                {},  # pre-warm passport/login
                 {"qrToken": "t1", "img": png_b64},
                 {"status": 2, "msg": "expired"},
                 {"qrToken": "t2", "img": png_b64},
@@ -123,20 +150,88 @@ class QrLoginTests(unittest.TestCase):
         self.assertEqual(len(received_imgs), 2)
         self.assertEqual(len(cookies), 1)
         self.assertEqual(cookies[0]["name"], "CASLOGC")
+        self.assertEqual(session.calls[0][0], QR_LOGIN_SERVICE_URL)
+        self.assertEqual(session.calls[1][0], QR_IMG_URL)
+        self.assertEqual(session.calls[2][0], QR_INFO_URL)
+        self.assertEqual(session.calls[-1][0], QR_LOGIN_SERVICE_URL)
+        self.assertEqual(session.calls[-1][1]["params"], {"pwd": "otp-1"})
 
     def test_qr_login_cancelled_raises(self):
         png_b64 = b64encode(_sample_qr_png()).decode("ascii")
         session = _FakeQrSession(
             [
+                {},  # pre-warm
                 {"qrToken": "t1", "img": png_b64},
                 {"status": 3, "msg": "canceled"},
             ]
         )
-        with self.assertRaises(RuntimeError):
+        with self.assertRaisesRegex(RuntimeError, "取消"):
             qr_login_for_cookies(
                 qr_callback=lambda _: None,
                 session=session,
                 sleep_fn=lambda _: None,
+            )
+
+    def test_qr_login_retries_transient_poll_errors_and_succeeds(self):
+        png_b64 = b64encode(_sample_qr_png()).decode("ascii")
+
+        def transient_err(_sess, _url, _kwargs):
+            raise requests.ConnectionError("temporary reset")
+
+        def finish_login(sess, _url, _kwargs):
+            sess.cookies.set_cookie(
+                create_cookie("CASLOGC", '{"uuid":"u-retry"}', domain=".zhihuishu.com")
+            )
+            return _FakeResp({})
+
+        session = _FakeQrSession(
+            [
+                {},  # pre-warm
+                {"qrToken": "t-retry", "img": png_b64},
+                transient_err,
+                transient_err,
+                {"status": 1, "oncePassword": "otp-retry"},
+                finish_login,
+            ]
+        )
+        cookies = qr_login_for_cookies(
+            qr_callback=lambda _: None,
+            session=session,
+            sleep_fn=lambda _: None,
+        )
+        self.assertEqual(len(cookies), 1)
+        self.assertEqual(cookies[0]["name"], "CASLOGC")
+
+    def test_qr_login_poll_respects_total_timeout(self):
+        png_b64 = b64encode(_sample_qr_png()).decode("ascii")
+        clock = {"t": 0.0}
+
+        def fake_monotonic():
+            return clock["t"]
+
+        def fake_sleep(sec):
+            clock["t"] += sec
+
+        def always_waiting(_sess, _url, _kwargs):
+            return _FakeResp({"status": -1})
+
+        session = _FakeQrSession(
+            [
+                {},  # pre-warm
+                {"qrToken": "t-timeout", "img": png_b64},
+                always_waiting,
+                always_waiting,
+                always_waiting,
+            ]
+        )
+        with self.assertRaisesRegex(RuntimeError, "超时"):
+            qr_login_for_cookies(
+                qr_callback=lambda _: None,
+                session=session,
+                poll_interval=1.0,
+                timeout_secs=2.0,
+                sleep_fn=fake_sleep,
+                monotonic_fn=fake_monotonic,
             )
 
     def test_qr_login_manager_lifecycle_and_save_image(self):
@@ -153,6 +248,7 @@ class QrLoginTests(unittest.TestCase):
 
         fake_sess = _FakeQrSession(
             [
+                {},  # pre-warm
                 {"qrToken": "tok-mgr", "img": png_b64},
                 {"status": -1},
                 {"status": 0},
@@ -167,6 +263,8 @@ class QrLoginTests(unittest.TestCase):
                 sid = started["sessionId"]
                 self.assertEqual(started["imageBase64"], png_b64)
                 self.assertEqual(started["savedPath"], "")
+                self.assertEqual(fake_sess.calls[0][0], QR_LOGIN_SERVICE_URL)
+                self.assertEqual(fake_sess.calls[1][0], QR_IMG_URL)
 
                 saved_file = mgr.save_current_image(sid, tmp)
                 self.assertTrue(os.path.isfile(saved_file))
@@ -193,8 +291,8 @@ class QrLoginTests(unittest.TestCase):
     def test_qr_login_manager_expired_and_cancel(self):
         png_b64 = b64encode(_sample_qr_png()).decode("ascii")
         sessions = [
-            _FakeQrSession([{"qrToken": "t-exp", "img": png_b64}, {"status": 2}]),
-            _FakeQrSession([{"qrToken": "t-can", "img": png_b64}]),
+            _FakeQrSession([{}, {"qrToken": "t-exp", "img": png_b64}, {"status": 2}]),
+            _FakeQrSession([{}, {"qrToken": "t-can", "img": png_b64}]),
         ]
         mgr = QrLoginManager(session_factory=lambda _proxy: sessions.pop(0))
         try:
