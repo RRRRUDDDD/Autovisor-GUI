@@ -53,8 +53,11 @@ from modules.exam_api import (  # noqa: F401
     _trim_reference_materials,
     as_number,
     build_answer_prompt,
+    build_fill_prompt,
     build_session,
     is_flagged,
+    is_free_exam,
+    normalize_free_exam,
     parse_review_exam_url,
     select_random_answers,
 )
@@ -332,11 +335,17 @@ class AiExamBase(ABC):
         options = [extract_plain_text(choice.get("content", "")) for choice in choices]
         return self._bank_helper.query(title, options, question_type)
 
-    def _generate_answer(self, question_type: int, question: dict, choices: list[dict]) -> list:
+    def _build_prompt_extra(
+        self, question: dict, question_type, choices: list[dict]
+    ) -> dict:
         extra = dict(self.op_extra)
         reference = self._bank_reference(question, question_type, choices)
         if reference:
             extra["题库参考"] = reference
+        return extra
+
+    def _generate_answer(self, question_type: int, question: dict, choices: list[dict]) -> list:
+        extra = self._build_prompt_extra(question, question_type, choices)
         prompt = build_answer_prompt(
             question_type,
             question.get("content", ""),
@@ -364,12 +373,12 @@ class AiExamBase(ABC):
         return ids
 
     def _generate_fill_answer(self, question: dict) -> list:
-        prompt = (
-            "假设你是一名学生, 正在参加线上考试, 需要严格按要求完成一道填空题。\n"
-            f"题目：{extract_plain_text(question.get('content', ''))}\n"
-            "本题为填空题, 可能有多个空。只输出 markdown 代码块, 按空的顺序给出答案：\n"
-            '```answer\n["答案一", "答案二"]\n```\n'
-            "代码块外不要写任何解释。"
+        extra = self._build_prompt_extra(question, 3, [])
+        prompt = build_fill_prompt(
+            question.get("content", ""),
+            self.reference_materials,
+            extra,
+            max_chars=self.op_extra.get("promptMaxChars"),
         )
         try:
             name, cleaned = self._llm_breaker.run_fallback_chain(
@@ -391,11 +400,17 @@ class AiExamBase(ABC):
         self, question: dict, question_id, version: int, valid_ids: set
     ) -> list | None:
         """三级缓存: 当前题库快照 -> SQLite 当前 exam_id -> 跨考试课程检索."""
+        is_fill = question.get("questionType") == 3
 
         def normalize(record):
             if not record or not record.get("answer"):
                 return None
-            ids = [item for item in str(record["answer"]).split("#@#") if item]
+            raw_answer = str(record["answer"])
+            if is_fill:
+                sep = "#@#" if "#@#" in raw_answer else "/"
+                values = [item.strip() for item in raw_answer.split(sep) if item.strip()]
+                return values or None
+            ids = [item for item in raw_answer.split("#@#") if item]
             if not ids:
                 return None
             if valid_ids and not all(item in valid_ids for item in ids):
@@ -415,7 +430,7 @@ class AiExamBase(ABC):
         ids = normalize(row)
         if ids:
             return ids
-        if not self._cross_exam_search or not valid_ids:
+        if not self._cross_exam_search or (not is_fill and not valid_ids):
             return None
         text = extract_plain_text(question.get("content", ""))
         if len(text) < 8:
@@ -433,6 +448,52 @@ class AiExamBase(ABC):
                 f"题目 {question_id} 跨考试题库命中({hit.get('match')}): {ids}"
             )
         return ids
+
+    @staticmethod
+    def _build_readback_record(content: dict) -> dict | None:
+        """构造回读入库记录；填空题提取清洗后的答案文本并以 '/' 拼接."""
+        correct = [
+            option
+            for option in content.get("optionVos") or []
+            if is_flagged(option.get("isCorrect"))
+        ]
+        if content.get("questionType") == 3:
+            cleaned = [
+                text
+                for option in correct
+                for text in [extract_plain_text(option.get("content", ""))]
+                if text
+            ]
+            if not cleaned:
+                user_answers = content.get("userAnswerVo")
+                if isinstance(user_answers, dict):
+                    user_answers = [user_answers]
+                elif not isinstance(user_answers, list):
+                    user_answers = []
+                cleaned = [
+                    text
+                    for item in user_answers
+                    if isinstance(item, dict) and is_flagged(item.get("isCorrect"))
+                    for text in [extract_plain_text(item.get("answer", ""))]
+                    if text
+                ]
+            if not cleaned:
+                return None
+            answer_str = "/".join(cleaned)
+            answer_content_str = "\n".join(cleaned)
+        else:
+            if not correct:
+                return None
+            answer_str = "#@#".join(str(option["id"]) for option in correct)
+            answer_content_str = "\n".join(
+                option.get("content", "") for option in correct
+            )
+        return {
+            "question": content.get("content", ""),
+            "answer": answer_str,
+            "answer_content": answer_content_str,
+            "questionDict": content,
+        }
 
     def get_question_answer(self, question: dict) -> tuple[list, str]:
         question_id = question.get("id") or question.get("questionId")
@@ -452,7 +513,7 @@ class AiExamBase(ABC):
             self._sleep_or_cancel(random.uniform(1.5, 3.0))
             return cached_ids, "题库"
 
-        if question_type == 3 and not choices:
+        if question_type == 3:
             try:
                 return self._generate_fill_answer(question), "AI"
             except Exception as exc:
@@ -654,20 +715,10 @@ class AiHomeworkCtx(AiExamBase):
                         f"题目 {item['questionId']} 答错, 题库已更新"
                         + (f" (正确答案: {correct_preview})." if correct_preview else ".")
                     )
-                if not correct:
+                record = self._build_readback_record(content)
+                if not record:
                     continue
-                self.answer_bank.set(
-                    item["questionId"],
-                    version,
-                    {
-                        "question": content.get("content", ""),
-                        "answer": "#@#".join(str(option["id"]) for option in correct),
-                        "answer_content": "\n".join(
-                            option.get("content", "") for option in correct
-                        ),
-                        "questionDict": content,
-                    },
-                )
+                self.answer_bank.set(item["questionId"], version, record)
         else:
             logger.info("答案已保存, 未自动交卷, 请在浏览器中手动提交.")
         self.answer_bank.save(self.exam_test_id)
@@ -779,7 +830,14 @@ class AiFormalExamCtx(AiExamBase):
     def scan_pending_tasks(self) -> list[dict]:
         """扫描未完成的 AI 课程考试任务 (taskType=1, status=0)."""
         ret = self.api.query_strategy(
-            "ai_task", FORMAL_TASK_LIST, {"taskType": 1, "status": 0}
+            "ai_task",
+            FORMAL_TASK_LIST,
+            {
+                "courseId": self.course_id,
+                "taskType": 1,
+                "taskName": "",
+                "status": 0,
+            },
         )
         payload = ret.get("data") if isinstance(ret, dict) else None
         if isinstance(payload, list):
@@ -793,7 +851,13 @@ class AiFormalExamCtx(AiExamBase):
             tasks = tasks or []
         else:
             tasks = []
-        return [task for task in tasks if isinstance(task, dict)]
+        return [
+            task
+            for task in tasks
+            if isinstance(task, dict)
+            and not isinstance(task.get("taskType"), bool)
+            and str(task.get("taskType")) == "1"
+        ]
 
     # ---------------------------------------------------------------- 开考
     def start_pull_paper(self) -> dict:
@@ -963,25 +1027,10 @@ class AiFormalExamCtx(AiExamBase):
             content = self.get_question_content(item["questionId"], version)
             if not content:
                 continue
-            correct = [
-                option
-                for option in content.get("optionVos") or []
-                if is_flagged(option.get("isCorrect"))
-            ]
-            if not correct:
+            record = self._build_readback_record(content)
+            if not record:
                 continue
-            self.answer_bank.set(
-                item["questionId"],
-                version,
-                {
-                    "question": content.get("content", ""),
-                    "answer": "#@#".join(str(option["id"]) for option in correct),
-                    "answer_content": "\n".join(
-                        option.get("content", "") for option in correct
-                    ),
-                    "questionDict": content,
-                },
-            )
+            self.answer_bank.set(item["questionId"], version, record)
             written += 1
         self.answer_bank.save(self.exam_test_id)
         return written

@@ -11,6 +11,7 @@ from urllib.parse import unquote
 from modules import zhidao_crypto, zhs_api
 from modules.answer_parser import QUESTION_TYPE_NAMES
 from modules.answer_store import AiQuestionStore
+from modules.html_utils import extract_plain_text
 from modules.logger import Logger
 from modules.text_utils import brief as _text_brief
 from modules.utils import get_runtime_path
@@ -56,6 +57,32 @@ ExamApiError = zhs_api.ZhsApiError
 
 def is_flagged(value) -> bool:
     return str(value).strip().lower() in {"1", "true"}
+
+
+def normalize_free_exam(value) -> int:
+    """将 AI 课程知识点的 freeExam 字段严格归一化为整数 0 或 1."""
+    if value is None or value == "":
+        return 0
+    if isinstance(value, bool):
+        return 1 if value else 0
+    if isinstance(value, (int, float)):
+        return 1 if int(value) != 0 else 0
+    text = str(value).strip().lower()
+    if not text or text in {"0", "false", "no", "n", "none", "null"}:
+        return 0
+    if text in {"1", "true", "yes", "y"}:
+        return 1
+    try:
+        return 1 if int(text) != 0 else 0
+    except ValueError:
+        return 0
+
+
+def is_free_exam(node: dict | None) -> bool:
+    """判断知识点节点是否为免考节点."""
+    if not isinstance(node, dict):
+        return False
+    return normalize_free_exam(node.get("freeExam")) == 1
 
 
 def as_number(value, default: float = 0.0) -> float:
@@ -136,16 +163,8 @@ def _trim_reference_materials(materials: list[dict], budget: int) -> str:
     return header + "\n".join(kept) + "\n"
 
 
-def build_answer_prompt(
-    question_type: int,
-    question: str,
-    choices: list[dict],
-    reference_materials: list[dict] | None = None,
-    extra: dict | None = None,
-    max_chars: int | None = None,
-) -> str:
+def _prompt_context_prefix(extra: dict | None) -> str:
     extra = extra or {}
-    type_name = QUESTION_TYPE_NAMES.get(question_type, "客观题")
     background = (
         f"假设你是一名学生，正在学习《{extra.get('courseName', '未知课程')}》，"
         "需要严格按照考试要求完成一道题目，否则无法及格。\n"
@@ -162,22 +181,14 @@ def build_answer_prompt(
         if bank
         else ""
     )
-    requirement = f"""本题为{type_name}，请从选项中选择{'最合适的答案' if question_type == 1 else '所有正确的答案'}，
-回答放到 markdown 代码块中，例如：
-```answer
-[{{"id": 652308395, "content": "<p>仅涉及心、肺、肝、肾及脑相关疾病</p>"}}]
-```
-答案必须是 JSON 列表，单选也要是列表，否则视为无效答案。代码块外可以简短解释依据。
-"""
-    body = (
-        background
-        + theme
-        + knowledge
-        + bank_section
-        + requirement
-        + f"现在，请听题：\n\n{question}\n\n"
-        + f"选项如下：```choices\n{json.dumps(choices, ensure_ascii=False, indent=4)}\n```\n"
-    )
+    return background + theme + knowledge + bank_section
+
+
+def _prepend_reference_materials(
+    body: str,
+    reference_materials: list[dict] | None = None,
+    max_chars: int | None = None,
+) -> str:
     materials = ""
     if reference_materials:
         try:
@@ -186,6 +197,48 @@ def build_answer_prompt(
             limit = DEFAULT_PROMPT_CHAR_LIMIT
         materials = _trim_reference_materials(reference_materials, limit - len(body))
     return materials + body
+
+
+def build_answer_prompt(
+    question_type: int,
+    question: str,
+    choices: list[dict],
+    reference_materials: list[dict] | None = None,
+    extra: dict | None = None,
+    max_chars: int | None = None,
+) -> str:
+    type_name = QUESTION_TYPE_NAMES.get(question_type, "客观题")
+    requirement = f"""本题为{type_name}，请从选项中选择{'最合适的答案' if question_type == 1 else '所有正确的答案'}，
+回答放到 markdown 代码块中，例如：
+```answer
+[{{"id": 652308395, "content": "<p>仅涉及心、肺、肝、肾及脑相关疾病</p>"}}]
+```
+答案必须是 JSON 列表，单选也要是列表，否则视为无效答案。代码块外可以简短解释依据。
+"""
+    body = (
+        _prompt_context_prefix(extra)
+        + requirement
+        + f"现在，请听题：\n\n{question}\n\n"
+        + f"选项如下：```choices\n{json.dumps(choices, ensure_ascii=False, indent=4)}\n```\n"
+    )
+    return _prepend_reference_materials(body, reference_materials, max_chars)
+
+
+def build_fill_prompt(
+    question: str,
+    reference_materials: list[dict] | None = None,
+    extra: dict | None = None,
+    max_chars: int | None = None,
+) -> str:
+    """组装填空题提示词（与客观题共用课程/主题/知识点/题库参考/PPT 资料上下文）."""
+    question_text = extract_plain_text(question or "") or str(question or "")
+    requirement = (
+        "本题为填空题，可能有多个空。只输出 markdown 代码块，按空的顺序给出答案：\n"
+        '```answer\n["答案一", "答案二"]\n```\n'
+        "代码块外不要写任何解释。\n"
+    )
+    body = _prompt_context_prefix(extra) + requirement + f"题目：{question_text}\n"
+    return _prepend_reference_materials(body, reference_materials, max_chars)
 
 
 class AnswerBank:

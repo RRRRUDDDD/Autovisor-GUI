@@ -217,6 +217,47 @@ class ZhidaoAnswererTests(unittest.TestCase):
         self.assertIn("```answer", answerer.chat("prompt"))
         self.assertEqual(answerer.answer("prompt"), [2])
 
+    def test_chat_early_stops_after_answer_block_outside_think_and_enforces_deadline(self):
+        import time as _time
+
+        class _CountingResponse:
+            def __init__(self, lines, delay=0.0):
+                self._lines = list(lines)
+                self._delay = delay
+                self.reads = 0
+
+            def raise_for_status(self):
+                pass
+
+            def iter_lines(self):
+                for line in self._lines:
+                    if self._delay:
+                        _time.sleep(self._delay)
+                    self.reads += 1
+                    yield line
+
+            def close(self):
+                pass
+
+        # 1) <think> 内的 decoy 代码块不会触发早停，真正代码块闭合后立即停止
+        early_lines = [
+            b'data:{"message":"<think>```answer\\n[{\\"id\\": 9}]\\n```</think>","end":false}',
+            b'data:{"message":"```answer\\n[{\\"id\\": 2}]\\n```","end":false}',
+            b'data:{"message":"TRAILING_SHOULD_NOT_BE_READ","end":false}',
+        ]
+        resp = _CountingResponse(early_lines)
+        content = ZhidaoAnswerer._consume_response(resp, timeout=5.0)
+        self.assertIn('"id": 2', content)
+        self.assertNotIn("TRAILING_SHOULD_NOT_BE_READ", content)
+        self.assertNotIn("<think>", content)
+        self.assertEqual(resp.reads, 2)
+
+        # 2) 超时 deadline 防卡死
+        slow_lines = [b'data:{"message":"slow","end":false}'] * 20
+        slow_resp = _CountingResponse(slow_lines, delay=0.03)
+        with self.assertRaisesRegex(RuntimeError, "超时"):
+            ZhidaoAnswerer._consume_response(slow_resp, timeout=0.05)
+
 
 class ExamApiTests(unittest.TestCase):
     def test_query_encrypts_payload_and_checks_code(self):
@@ -578,6 +619,111 @@ class ExamRunnerReferenceTests(unittest.TestCase):
         self.assertEqual(len(extractor.calls), 1)
         self.assertEqual(api.resource_calls, [("course-1", "class-1", "k-1")])
         self.assertEqual(extractor.calls[0][1], "测试课程")
+
+    def test_runner_prefers_high_mastery_score_and_normalizes_free_exam(self):
+        directory = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, directory, True)
+        bank = AnswerBank("course-m", base_dir=directory)
+
+        class MasteryApi:
+            proxy = ""
+            session = None
+
+            def __init__(self):
+                self.queried = []
+                self.calls_by_kid = {}
+
+            def query_paper(self, course_id, class_id, knowledge_id):
+                self.queried.append(knowledge_id)
+                n = self.calls_by_kid.get(knowledge_id, 0) + 1
+                self.calls_by_kid[knowledge_id] = n
+                if knowledge_id == "k-high":
+                    # highMasteryScore 优先于 masteryScore
+                    return {"examTestId": "e1", "paperId": "p1", "highMasteryScore": 100, "masteryScore": 0}
+                if knowledge_id == "k-zero":
+                    # highMasteryScore == 0 时不得回退 masteryScore == 100
+                    return {"examTestId": "e2", "paperId": "p2", "highMasteryScore": 0 if n == 1 else 100, "masteryScore": 100}
+                return {"examTestId": "e3", "paperId": "p3", "masteryScore": 100}
+
+            def list_knowledge_resources(self, *_args):
+                return []
+
+        ran = []
+
+        class StubCtx:
+            def __init__(self, *args, **kwargs):
+                ran.append(kwargs["knowledge_id"])
+
+            def start(self, reference_materials=None):
+                return True, 1, 1
+
+        api = MasteryApi()
+        runner = ExamRunner("course-m", "class-m", api, target=100, max_attempts=2, bank=bank, enable_ppt=False)
+        nodes = [
+            {"nodeUid": "k-high", "name": "高掌握度", "freeExam": "0"},
+            {"nodeUid": "k-zero", "name": "零掌握度", "freeExam": ""},
+            {"nodeUid": "k-free", "name": "免考", "freeExam": "1"},
+        ]
+        with patch("modules.exam_ctx.ExamCtx", StubCtx), patch("modules.exam_ctx.time.sleep"):
+            summary = runner.run(nodes)
+
+        self.assertEqual(summary["done"], ["高掌握度", "零掌握度"])
+        self.assertEqual(summary["skipped"], ["免考"])
+        self.assertEqual(ran, ["k-zero"])
+
+    def test_homework_ctx_fill_readback_stores_cleaned_text_not_option_ids(self):
+        directory = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, directory, True)
+        bank = AnswerBank("course-fill", base_dir=directory)
+        api = ExamApi([])
+        ctx = ExamCtx(
+            api,
+            "course-fill",
+            "k-fill",
+            "t-fill",
+            "p-fill",
+            op_extra={"courseName": "高等数学", "theme": "微积分", "knowledgePoint": "导数"},
+            answer_bank=bank,
+        )
+        recorded_prompts = []
+
+        class _RecordingAnswerer:
+            def answer(self, prompt):
+                recorded_prompts.append(prompt)
+                return ["导数", "积分"]
+
+        ctx.zhidao_answerer = _RecordingAnswerer()
+        question_data = {
+            "id": 601,
+            "version": 1,
+            "questionType": 3,
+            "content": "<p>微积分两大核心概念是___和___</p>",
+            "optionVos": [
+                {"id": 7001, "content": "<p>导数</p>", "isCorrect": 1},
+                {"id": 7002, "content": "<p>积分</p>", "isCorrect": 1},
+            ],
+            "userAnswerVo": {"isCorrect": 1, "answer": "导数/积分"},
+        }
+        with (
+            patch.object(ctx, "open_exam"),
+            patch.object(ctx, "get_sheet_content", return_value=[{"questionId": 601, "version": 1}]),
+            patch.object(ctx, "get_question_content", return_value=question_data),
+            patch.object(ctx, "save_answer", return_value=True),
+            patch.object(ctx, "submit_exam"),
+        ):
+            success, correct, total = ctx.start(
+                reference_materials=[{"name": "PPT", "content": "导数与积分互为逆运算"}],
+                submit=True,
+            )
+        self.assertTrue(success)
+        self.assertEqual((correct, total), (1, 1))
+        self.assertIn("高等数学", recorded_prompts[0])
+        self.assertIn("导数与积分互为逆运算", recorded_prompts[0])
+        rec = bank.get(601, 1)
+        self.assertEqual(rec["answer"], "导数/积分")
+        self.assertEqual(rec["answer_content"], "导数\n积分")
+        ctx.close()
+        api.close()
 
 
 class Phase2ExamCtxHardeningTests(unittest.TestCase):

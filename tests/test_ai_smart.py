@@ -193,6 +193,40 @@ class AiSmartReviewModeTests(unittest.IsolatedAsyncioTestCase):
         self.assertIs(outcome, CourseOutcome.COMPLETED)
         watch_video.assert_awaited_once()
 
+    async def test_run_resources_stage_does_not_skip_free_exam_nodes(self):
+        from modules.stages.ai_smart_stage import run_resources_stage
+
+        visited_urls = []
+
+        async def fake_complete(_page, learn_url, *_args):
+            visited_urls.append(learn_url)
+            return {"ok": True, "done": 1, "skipped": 0, "failed": 0}
+
+        payload = {
+            "courseId": "100",
+            "classId": "200",
+            "nodes": [
+                {"nodeUid": "n1", "name": "普通节点", "freeExam": 0},
+                {"nodeUid": "n2", "name": "免考节点", "freeExam": 1},
+            ],
+        }
+        with (
+            patch("modules.stages.ai_smart_stage._av", side_effect=lambda _name, fb: fb),
+            patch("modules.stages.ai_smart_stage.enumerate_nodes", AsyncMock(return_value=payload)),
+            patch("modules.stages.ai_smart_stage.complete_resources_for_node", AsyncMock(side_effect=fake_complete)),
+        ):
+            result = await run_resources_stage(
+                Mock(),
+                "https://ai-smart-course-student-pro.zhihuishu.com/singleCourse/knowledgeStudy/100/200",
+                SimpleNamespace(limitMaxTime=0),
+                Mock(),
+                asyncio.Event(),
+            )
+
+        self.assertEqual(result, {"done": 2, "failed": 0})
+        self.assertEqual(len(visited_urls), 2)
+        self.assertTrue(any("/n2/" in url for url in visited_urls))
+
 
 if __name__ == "__main__":
     unittest.main()

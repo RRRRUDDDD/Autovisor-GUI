@@ -152,6 +152,60 @@ class AiSmartMasteryFixesTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(summary["done"]), 2)
         self.assertEqual(summary["failed"], [])
 
+    async def test_run_course_mastery_normalizes_string_free_exam_values(self):
+        from modules.exam_api import is_free_exam, normalize_free_exam
+
+        self.assertEqual(normalize_free_exam("0"), 0)
+        self.assertEqual(normalize_free_exam(""), 0)
+        self.assertEqual(normalize_free_exam(None), 0)
+        self.assertEqual(normalize_free_exam(False), 0)
+        self.assertEqual(normalize_free_exam("1"), 1)
+        self.assertEqual(normalize_free_exam(1), 1)
+        self.assertEqual(normalize_free_exam(True), 1)
+        self.assertFalse(is_free_exam({"freeExam": "0"}))
+        self.assertTrue(is_free_exam({"freeExam": "1"}))
+
+        parsed = mastery_mod._nodes_from_theme_payload(
+            {
+                "data": {
+                    "courseThemeList": [
+                        {
+                            "themeName": "M1",
+                            "subThemeList": [
+                                {
+                                    "themeName": "U1",
+                                    "knowledgeList": [
+                                        {"knowledgeId": 1, "knowledgeName": "非免考字符串0", "freeExam": "0"},
+                                        {"knowledgeId": 2, "knowledgeName": "非免考空串", "freeExam": ""},
+                                        {"knowledgeId": 3, "knowledgeName": "免考字符串1", "freeExam": "1"},
+                                    ],
+                                }
+                            ],
+                        }
+                    ]
+                }
+            }
+        )
+        self.assertEqual([n["freeExam"] for n in parsed], [0, 0, 1])
+
+        page = _FakeMasteryPage()
+        cache = _FakeCache()
+        logger = _DummyLogger()
+        nodes = [
+            {"nodeUid": "n1", "name": "字符串0", "module": "M1", "unit": "U1", "freeExam": "0"},
+            {"nodeUid": "n2", "name": "空串", "module": "M1", "unit": "U1", "freeExam": ""},
+            {"nodeUid": "n3", "name": "免考1", "module": "M1", "unit": "U1", "freeExam": "1"},
+        ]
+        with (
+            patch.object(mastery_mod, "read_node_mastery", new=AsyncMock(return_value=50)),
+            patch.object(mastery_mod, "run_mastery", new=AsyncMock(return_value={"mastery": 100, "attempts": []})),
+        ):
+            summary = await mastery_mod.run_course_mastery(
+                page, nodes, "100", "300", cache, logger, target=100, max_attempts=1, passes=1
+            )
+        self.assertEqual([item["name"] for item in summary["done"]], ["字符串0", "空串"])
+        self.assertEqual([item["name"] for item in summary["skipped"]], ["免考1"])
+
 
 class AiSmartMasteryUnitTests(unittest.TestCase):
     def test_url_and_percent_parsers(self):

@@ -13,6 +13,7 @@ from modules.exam_api import (
     ExamApi,
     MAX_EXAM_ATTEMPTS,
     as_number,
+    is_free_exam,
     parse_review_exam_url,
 )
 from modules.logger import Logger
@@ -82,7 +83,7 @@ class ExamRunner:
             if deadline is not None and time.monotonic() >= deadline:
                 log.warn("接口考试达到时限, 停止剩余知识点.")
                 break
-            if node.get("freeExam"):
+            if is_free_exam(node):
                 summary["skipped"].append(node.get("name") or node.get("nodeUid"))
                 continue
             knowledge_id = node.get("nodeUid")
@@ -143,7 +144,10 @@ class ExamRunner:
             if not paper or not paper.get("paperId"):
                 log.info(f"知识点「{name}」没有可用的考试试卷.")
                 return "skipped"
-            mastery = as_number(paper.get("masteryScore"))
+            raw_mastery = paper.get("highMasteryScore")
+            if raw_mastery is None:
+                raw_mastery = paper.get("masteryScore")
+            mastery = as_number(raw_mastery)
             if mastery >= self.target:
                 log.info(f"知识点「{name}」掌握度已达 {mastery:g}, 跳过.")
                 return "done"

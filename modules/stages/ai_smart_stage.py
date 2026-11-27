@@ -19,6 +19,7 @@ from modules.ai_smart_mastery import (
     run_course_mastery,
 )
 from modules.answer_store import AiQuestionStore
+from modules.exam_api import is_free_exam
 from modules.exam_ctx import AiFormalExamCtx, ExamApi, ExamRunner
 from modules.runtime_bootstrap import build_page_exam_api, resolve_cancel_event
 from modules.url_router import (
@@ -78,7 +79,7 @@ async def run_resources_stage(
 
     logger.section("必学资源补齐")
     payload = await enum_fn(page, course_url)
-    nodes = [node for node in payload["nodes"] if not node.get("freeExam")]
+    nodes = list(payload.get("nodes") or [])
     logger.event("资源补齐范围", 知识点=len(nodes))
     started_at = time.monotonic()
     total_done = total_failed = 0
@@ -486,7 +487,7 @@ async def run_mastery_stage(page: Page, course_url: str, config, logger) -> dict
     logger.section("掌握度提升")
     payload = await enum_fn(page, course_url)
     nodes = payload.get("nodes") or []
-    free_count = sum(1 for node in nodes if node.get("freeExam"))
+    free_count = sum(1 for node in nodes if is_free_exam(node))
     logger.event("知识点枚举", 总数=len(nodes), 免考=free_count)
     if not nodes:
         logger.warn("没有枚举到知识点, 跳过掌握度阶段.")

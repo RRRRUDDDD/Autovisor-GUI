@@ -22,6 +22,7 @@ from pathlib import Path
 from playwright.async_api import Locator, Page
 
 from modules.answer_parser import parse_reference_answer_text as parse_answer_text
+from modules.exam_api import is_free_exam, normalize_free_exam
 from modules.text_utils import (
     brief as _text_brief,
     cache_key,
@@ -937,7 +938,7 @@ def _nodes_from_theme_payload(payload: dict) -> list[dict]:
                         "name": (knowledge.get("knowledgeName") or "").strip(),
                         "module": module,
                         "unit": unit,
-                        "freeExam": knowledge.get("freeExam") or 0,
+                        "freeExam": normalize_free_exam(knowledge.get("freeExam")),
                         "mastery": knowledge.get("masteryPercentage"),
                         "studyProgress": knowledge.get("studyProgress"),
                         "finished": knowledge.get("finishedResourceCount") or 0,
@@ -1069,9 +1070,9 @@ async def run_course_mastery(
         nodes = nodes[:limit]
     logger.info(f"共 {len(nodes)} 个知识点待处理, 目标掌握度 {target}%")
 
-    pending = [node for node in nodes if not node.get("freeExam")]
+    pending = [node for node in nodes if not is_free_exam(node)]
     records: dict[str, dict] = {}
-    skipped_free = [node for node in nodes if node.get("freeExam")]
+    skipped_free = [node for node in nodes if is_free_exam(node)]
     for node in skipped_free:
         summary["skipped"].append(
             {"name": node.get("name") or node["nodeUid"], "reason": "免考"}

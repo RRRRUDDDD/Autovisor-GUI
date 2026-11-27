@@ -101,9 +101,11 @@ class StubAnswerer:
         self.result = result
         self.error = error
         self.calls = 0
+        self.prompts = []
 
     def answer(self, prompt):
         self.calls += 1
+        self.prompts.append(prompt)
         if self.error is not None:
             raise self.error
         return list(self.result)
@@ -410,20 +412,84 @@ class FormalExamReadbackTests(FormalExamTestCase):
         self.assertEqual((answered, total), (1, 1))
         self.assertIsNone(ctx.answer_bank.get(5201, 1))
 
+    def test_fill_question_prompt_includes_context_and_readback_stores_cleaned_text(self):
+        parts = self.make_parts([[5301]])
+        contents = {
+            5301: {
+                "id": 5301,
+                "version": 1,
+                "questionType": 3,
+                "content": "<p>请填写两大定律</p>",
+                "optionVos": [
+                    {"id": 9001, "content": "<p>牛顿第一定律</p>", "isCorrect": 1},
+                    {"id": 9002, "content": "<p>牛顿第二定律</p>", "isCorrect": 1},
+                ],
+            }
+        }
+        ctx, _api = self.make_ctx(
+            parts,
+            contents,
+            detail={"isLookAnswer": 1},
+            auto_submit=True,
+        )
+        ctx.op_extra = {
+            "courseName": "大学物理",
+            "theme": "力学",
+            "knowledgePoint": "牛顿定律",
+        }
+        ctx.zhidao_answerer = StubAnswerer(result=["牛顿第一定律", "牛顿第二定律"])
+
+        with (
+            patch("modules.exam_ctx.time.sleep"),
+            patch.object(ctx._bank_helper, "query", return_value="题库提示文本"),
+        ):
+            success, answered, total = ctx.start(
+                reference_materials=[{"name": "课件1", "content": "PPT核心公式"}],
+                submit=True,
+            )
+
+        self.assertTrue(success)
+        self.assertEqual((answered, total), (1, 1))
+        prompt = ctx.zhidao_answerer.prompts[0]
+        self.assertIn("大学物理", prompt)
+        self.assertIn("力学", prompt)
+        self.assertIn("牛顿定律", prompt)
+        self.assertIn("PPT核心公式", prompt)
+        self.assertIn("题库提示文本", prompt)
+
+        saved_record = ctx.answer_bank.get(5301, 1)
+        self.assertEqual(saved_record["answer"], "牛顿第一定律/牛顿第二定律")
+        self.assertEqual(saved_record["answer_content"], "牛顿第一定律\n牛顿第二定律")
+
 
 class FormalExamTaskListTests(FormalExamTestCase):
     def test_scan_pending_tasks_uses_ai_task_strategy(self):
-        tasks = [{"taskId": 1, "courseId": "c"}]
+        tasks = [
+            {"taskId": 1, "courseId": "course-1", "taskType": 1},
+            {"taskId": 2, "courseId": "course-1", "taskType": 2},
+            {"taskId": 3, "courseId": "course-1"},
+        ]
         api = FakeFormalApi([], {}, tasks=tasks)
         ctx = AiFormalExamCtx(
             api, "course-1", exam_test_id="exam-1", exam_paper_id="paper-1",
             answer_bank=self.bank,
         )
-        self.assertEqual(ctx.scan_pending_tasks(), tasks)
+        self.assertEqual(
+            ctx.scan_pending_tasks(),
+            [{"taskId": 1, "courseId": "course-1", "taskType": 1}],
+        )
         call = api.strategy_calls[0]
         self.assertEqual(call["strategy"], "ai_task")
         self.assertEqual(call["url"], FORMAL_TASK_LIST)
-        self.assertEqual(call["data"], {"taskType": 1, "status": 0})
+        self.assertEqual(
+            call["data"],
+            {
+                "courseId": "course-1",
+                "taskType": 1,
+                "taskName": "",
+                "status": 0,
+            },
+        )
 
     def test_scan_pending_tasks_accepts_plain_list_and_skips_bad_items(self):
         api = FakeFormalApi([], {})
@@ -433,9 +499,16 @@ class FormalExamTaskListTests(FormalExamTestCase):
         )
         api.query_strategy = lambda *args, **kwargs: {
             "code": 200,
-            "data": [{"taskId": 2}, "bad"],
+            "data": [
+                {"taskId": 2, "taskType": 1},
+                {"taskId": 3, "taskType": 2},
+                {"taskId": 4, "taskType": True},
+                "bad",
+            ],
         }
-        self.assertEqual(ctx.scan_pending_tasks(), [{"taskId": 2}])
+        self.assertEqual(
+            ctx.scan_pending_tasks(), [{"taskId": 2, "taskType": 1}]
+        )
 
     def test_from_task_maps_public_fields(self):
         api = FakeFormalApi([], {})
