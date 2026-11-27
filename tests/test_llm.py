@@ -849,10 +849,69 @@ class OpenAiStreamTests(unittest.TestCase):
         self.assertIsNotNone(s1)
         # Stateless cookie policy refuses storing cookies across providers/keys
         self.assertFalse(s1.cookies._policy.set_ok(None, None))
+        self.assertFalse(s1.cookies._policy.rfc2965)
+        self.assertFalse(s1.cookies._policy.netscape)
+        self.assertTrue(s1.cookies._policy.hide_cookie2)
         llm.close_all_http_sessions()
         s2 = llm._get_http_session()
         self.assertIsNot(s1, s2)
         llm.close_all_http_sessions()
+
+    def test_fetch_models_real_session_ignores_set_cookie_without_rfc2965_error(self):
+        from http.server import BaseHTTPRequestHandler, HTTPServer
+        import os
+        import threading
+
+        seen_cookie_headers: list[tuple[str | None, str | None]] = []
+
+        class _Handler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                seen_cookie_headers.append(
+                    (self.headers.get("Cookie"), self.headers.get("Cookie2"))
+                )
+                body = json.dumps(
+                    {"data": [{"id": "model-b"}, {"id": "model-a"}]}
+                ).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Set-Cookie", "sid=abc123; Path=/")
+                self.send_header("Set-Cookie2", 'v="1"; Version="1"; Path="/"')
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, format, *args):
+                pass
+
+        server = HTTPServer(("127.0.0.1", 0), _Handler)
+        port = server.server_address[1]
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        llm.close_all_http_sessions()
+        try:
+            cfg = {
+                "provider": "openai",
+                "apiFormat": "openai",
+                "apiBase": f"http://127.0.0.1:{port}/v1",
+                "apiKey": "sk-test",
+            }
+            with patch.dict(
+                os.environ,
+                {"NO_PROXY": "127.0.0.1,localhost", "no_proxy": "127.0.0.1,localhost"},
+                clear=False,
+            ):
+                models_1 = llm.fetch_models(cfg)
+                models_2 = llm.fetch_models(cfg)
+            self.assertEqual(models_1, ["model-a", "model-b"])
+            self.assertEqual(models_2, ["model-a", "model-b"])
+            sess = llm._get_http_session()
+            self.assertEqual(len(sess.cookies), 0)
+            self.assertEqual(seen_cookie_headers, [(None, None), (None, None)])
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=3)
+            llm.close_all_http_sessions()
 
 
 if __name__ == "__main__":

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+from http.cookiejar import DefaultCookiePolicy
 import json
 import queue
 import re
@@ -53,8 +54,15 @@ _ORIGINAL_REQUESTS_POST = getattr(requests, "post", None) if requests is not Non
 _ORIGINAL_REQUESTS_GET = getattr(requests, "get", None) if requests is not None else None
 
 
-class _StatelessCookiePolicy:
+class _StatelessCookiePolicy(DefaultCookiePolicy):
     """禁止 requests.Session 持久化 Set-Cookie，防止跨厂商/API Key 状态串号。"""
+
+    def __init__(self) -> None:
+        super().__init__(
+            netscape=False,
+            rfc2965=False,
+            hide_cookie2=True,
+        )
 
     def set_ok(self, cookie, request):
         return False
