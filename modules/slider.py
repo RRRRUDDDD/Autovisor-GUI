@@ -24,9 +24,12 @@ from modules.logger import Logger
 
 YIDUN_PUZZLE_SELECTOR = ".yidun_bgimg, img.yidun_bg-img"
 YIDUN_BG_SELECTOR = "img.yidun_bg-img"
+YIDUN_BLOCK_SELECTOR = "img.yidun_jigsaw"
+YIDUN_SLIDER_SELECTOR = "div.yidun_slider"
+YIDUN_TRACK_SELECTOR = "div.yidun_control"
 YIDUN_REFRESH_SELECTOR = ".yidun_refresh, .yidun_icon-refresh"
 YIDUN_TIPS_SELECTOR = ".yidun_tips__text"
-# 易盾除拼图外还有图标/文字点选、短信验证等形态, 这些不归本模块处理。
+# 易盾除拼图外还有图标/文字点选、短信验证等形态, 滑块模块不直接处理它们。
 YIDUN_UNSUPPORTED_MODES = {
     "yidun--icon": "图标点选",
     "yidun--word": "文字点选",
@@ -39,15 +42,24 @@ SLIDER_APPEAR_SELECTOR = (
     f"{YIDUN_PUZZLE_SELECTOR}, iframe[id^='tcaptcha'], iframe.tcaptcha-iframe, "
     "iframe[src*='captcha.qq.com'], [id^='tcaptcha_transform']"
 )
-# 模板匹配给出的是拼图条带左边缘, 实测鼠标位移要比缺口坐标再多约 16px 才落在
-# 易盾判定窗口中央(偏 0 或 +32 均失败), 组件尺寸变化时需要重新校准。
+# 当实时 DOM 轨道/滑块尺寸不可用时的回退位移补偿(px); 实时 DOM 可用时按
+# (track_width - slider_width) / (bg_width - block_width) 比例换算。
 GAP_BIAS_PX = 16
+YIDUN_PIECE_OFFSET_LIMIT_PX = 80.0
 MAX_ATTEMPTS = 4
 
 logger = Logger()
 
 
-async def download_image(url: str, page=None, *, np=None, cv2=None, proxy: str | None = None):
+async def download_image(
+    url: str,
+    page=None,
+    *,
+    np=None,
+    cv2=None,
+    proxy: str | None = None,
+    unchanged: bool = False,
+):
     """代理感知地下载易盾验证码图片并解码为 OpenCV 图像。"""
     if np is None or cv2 is None:
         import cv2 as _cv2
@@ -56,31 +68,50 @@ async def download_image(url: str, page=None, *, np=None, cv2=None, proxy: str |
         np = np or _np
         cv2 = cv2 or _cv2
     data = await fetch_image_bytes(page, url, allow_eval_fetch=False, proxy=proxy)
-    return decode_image_bytes(data, np, cv2, unchanged=False)
+    return decode_image_bytes(data, np, cv2, unchanged=unchanged)
 
 
-# 对背景图提取边缘，减少颜色和纹理对匹配的干扰。
 def process_background_image(image, cv2=None):
+    """背景图直接转灰度后执行 Canny(50, 150) 提取缺口边缘。"""
     if cv2 is None:
         import cv2 as _cv2
 
         cv2 = _cv2
-    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    denoised = cv2.fastNlMeansDenoising(gray, None, 10, 7, 21)
-    _, binary = cv2.threshold(denoised, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    return cv2.Canny(binary, 500, 900, apertureSize=3)
+    if image.ndim == 2:
+        gray = image
+    elif image.shape[2] == 4:
+        gray = cv2.cvtColor(image, cv2.COLOR_BGRA2GRAY)
+    else:
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    return cv2.Canny(gray, 50, 150)
 
 
-def process_block_image(image, cv2=None):
+def process_block_image(image, cv2=None, np=None):
+    """提取拼图前景图边缘：保留 Alpha 通道(>50 + 3x3 腐蚀)过滤透明外框边缘。"""
     if cv2 is None:
         import cv2 as _cv2
 
         cv2 = _cv2
-    # 拼图块亮度方向与背景不同，因此先反色再提取边缘。
-    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    inverted = cv2.bitwise_not(gray)
-    _, binary = cv2.threshold(inverted, 240, 255, cv2.THRESH_BINARY_INV)
-    return cv2.Canny(binary, 500, 900, apertureSize=3)
+    if np is None:
+        import numpy as _np
+
+        np = _np
+    if image.ndim == 2:
+        bgra = cv2.cvtColor(image, cv2.COLOR_GRAY2BGRA)
+    elif image.shape[2] == 3:
+        bgra = cv2.cvtColor(image, cv2.COLOR_BGR2BGRA)
+    else:
+        bgra = image
+
+    rgb = bgra[:, :, :3]
+    alpha = bgra[:, :, 3]
+    _, mask = cv2.threshold(alpha, 50, 255, cv2.THRESH_BINARY)
+    front_edge = cv2.Canny(cv2.cvtColor(rgb, cv2.COLOR_BGR2GRAY), 50, 150)
+    eroded_mask = cv2.erode(mask, np.ones((3, 3), np.uint8))
+    masked_edge = cv2.bitwise_and(front_edge, front_edge, mask=eroded_mask)
+    if np.count_nonzero(masked_edge) == 0 and np.count_nonzero(front_edge) > 0:
+        masked_edge = cv2.bitwise_and(front_edge, front_edge, mask=mask)
+    return masked_edge
 
 
 async def resolve_captcha_target(page: Page):
@@ -227,17 +258,85 @@ async def _refresh_puzzle(target) -> None:
     await _wait_puzzle_ready(target)
 
 
-def _match_yidun_gap(bg_img, block_img, cv2):
+def _match_yidun_gap(bg_img, block_img, cv2, np=None):
     """在后台线程执行 OpenCV 边缘提取与模板匹配，避免阻塞 asyncio 事件循环。"""
     bg_edges = process_background_image(bg_img, cv2=cv2)
-    block_edges = process_block_image(block_img, cv2=cv2)
+    block_edges = process_block_image(block_img, cv2=cv2, np=np)
+    if (
+        block_edges.shape[0] > bg_edges.shape[0]
+        or block_edges.shape[1] > bg_edges.shape[1]
+    ):
+        raise ValueError("yidun block larger than background")
     result = cv2.matchTemplate(bg_edges, block_edges, cv2.TM_CCOEFF_NORMED)
     _, score, _, max_loc = cv2.minMaxLoc(result)
     return float(score), max_loc
 
 
-# 主函数，结合页面加载和图片处理
-async def progress_img(page: Page, modules: list[ModuleType] | None = None):
+def gap_to_slider_distance(
+    gap_display_x: float,
+    bg_box: dict[str, float],
+    block_box: dict[str, float] | None = None,
+    track_box: dict[str, float] | None = None,
+    slider_box: dict[str, float] | None = None,
+    *,
+    fallback_bias: float = GAP_BIAS_PX,
+) -> tuple[float, bool]:
+    """根据实时 DOM bounding_box 将缺口 CSS 坐标换算为滑块拖动距离。
+
+    返回 ``(drag_distance, used_dom_geometry)``:
+    - 当背景、拼图块、轨道与滑块几何尺寸均有效时，扣减拼图初始偏移后按
+      ``(track_width - slider_width) / (bg_width - block_width)`` 换算滑块位移；
+    - 当任意 DOM 盒子缺失或比例超出合理区间时，回退至 ``jigsaw_delta + fallback_bias``。
+    """
+    bg_width = float(bg_box.get("width") or 0.0)
+    bg_x = float(bg_box.get("x") or 0.0)
+    piece_offset = 0.0
+    if block_box is not None:
+        raw_offset = float(block_box.get("x", bg_x)) - bg_x
+        if 0.0 <= raw_offset <= YIDUN_PIECE_OFFSET_LIMIT_PX and (
+            bg_width <= 0 or raw_offset < bg_width * 0.4
+        ):
+            piece_offset = raw_offset
+
+    jigsaw_delta = max(0.0, float(gap_display_x) - piece_offset)
+
+    if (
+        bg_width > 0
+        and block_box is not None
+        and track_box is not None
+        and slider_box is not None
+    ):
+        block_width = float(block_box.get("width") or 0.0)
+        track_width = float(track_box.get("width") or 0.0)
+        slider_width = float(slider_box.get("width") or 0.0)
+        max_jigsaw = bg_width - block_width
+        max_slider = track_width - slider_width
+        if (
+            block_width > 0
+            and slider_width > 0
+            and max_jigsaw > 0
+            and max_slider > 0
+            and track_width >= slider_width * 2
+        ):
+            ratio = max_slider / max_jigsaw
+            if 0.5 <= ratio <= 1.5:
+                distance = min(max_slider, max(0.0, jigsaw_delta * ratio))
+                return round(distance, 3), True
+
+    return round(max(0.0, jigsaw_delta + float(fallback_bias)), 3), False
+
+
+async def _optional_box(target, selector: str) -> dict[str, float] | None:
+    try:
+        locator = await _visible_locator(target, selector)
+        if locator is None:
+            return None
+        return await locator.bounding_box()
+    except Exception:
+        return None
+
+
+async def _measure_yidun_puzzle(page: Page, modules: list[ModuleType] | None = None):
     if modules is not None:
         np_mod, cv2_mod = modules
     else:
@@ -254,7 +353,7 @@ async def progress_img(page: Page, modules: list[ModuleType] | None = None):
 
     # OpenCV 处理的是原图像素，浏览器拖动使用 CSS 显示像素。
     bg_locator = await _visible_locator(page, YIDUN_BG_SELECTOR)
-    block_locator = await _visible_locator(page, "img.yidun_jigsaw")
+    block_locator = await _visible_locator(page, YIDUN_BLOCK_SELECTOR)
     if bg_locator is None or block_locator is None:
         raise TimeoutError("yidun puzzle not visible")
     block_url = await block_locator.get_attribute("src")
@@ -262,18 +361,30 @@ async def progress_img(page: Page, modules: list[ModuleType] | None = None):
     bg_box = await bg_locator.bounding_box()
     if not bg_url or not block_url or not bg_box:
         raise TimeoutError("yidun puzzle images not ready")
+    try:
+        block_box = await block_locator.bounding_box()
+    except Exception:
+        block_box = None
+    track_box = await _optional_box(page, YIDUN_TRACK_SELECTOR)
+    slider_box = await _optional_box(page, YIDUN_SLIDER_SELECTOR)
     image_size = await bg_locator.evaluate(
         "image => ({width: image.naturalWidth, height: image.naturalHeight})"
     )
 
     browser_page = _page_of(page)
-    bg_img = await download_image(bg_url, browser_page, np=np_mod, cv2=cv2_mod)
-    block_img = await download_image(block_url, browser_page, np=np_mod, cv2=cv2_mod)
+    bg_img = await download_image(
+        bg_url, browser_page, np=np_mod, cv2=cv2_mod, unchanged=False
+    )
+    block_img = await download_image(
+        block_url, browser_page, np=np_mod, cv2=cv2_mod, unchanged=True
+    )
     if bg_img is None or block_img is None:
         raise TimeoutError("yidun puzzle decode failed")
 
     # 匹配结果仍是原图坐标，后面必须转换到浏览器显示坐标。
-    score, max_loc = await asyncio.to_thread(_match_yidun_gap, bg_img, block_img, cv2_mod)
+    score, max_loc = await asyncio.to_thread(
+        _match_yidun_gap, bg_img, block_img, cv2_mod, np_mod
+    )
     if score < 0.05:
         raise TimeoutError(f"yidun puzzle match too weak: {score:.3f}")
 
@@ -288,12 +399,32 @@ async def progress_img(page: Page, modules: list[ModuleType] | None = None):
     )
     if not -2 <= display_point[0] <= bg_box["width"] - 4:
         raise TimeoutError(f"yidun puzzle offset out of range: {display_point[0]:.1f}")
-    return round(display_point[0], 3), round(display_point[1], 3)
+
+    drag_distance, used_dom = gap_to_slider_distance(
+        display_point[0],
+        bg_box,
+        block_box,
+        track_box,
+        slider_box,
+    )
+    return (
+        round(display_point[0], 3),
+        round(display_point[1], 3),
+        drag_distance,
+        used_dom,
+        float(score),
+    )
+
+
+# 主函数，结合页面加载和图片处理
+async def progress_img(page: Page, modules: list[ModuleType] | None = None):
+    gap_x, gap_y, _, _, _ = await _measure_yidun_puzzle(page, modules=modules)
+    return gap_x, gap_y
 
 
 async def move_slider(page: Page, distance, bias=GAP_BIAS_PX):
     """按浏览器显示坐标拖动滑块。"""
-    slider_el = await _visible_locator(page, "div.yidun_slider")
+    slider_el = await _visible_locator(page, YIDUN_SLIDER_SELECTOR)
     if slider_el is None:
         raise TimeoutError("yidun slider not found")
     await drag_element_horizontally(
@@ -313,12 +444,29 @@ async def solve_yidun(
     for attempt in range(1, max_attempts + 1):
         try:
             await _wait_puzzle_ready(target)
-            gap_x, _ = await progress_img(target, modules=modules)
-            # 重试时轻微左右试探, 规避识别端与判定窗口的系统性偏差。
-            bias = GAP_BIAS_PX if attempt == 1 else GAP_BIAS_PX + random.choice((-2, 0, 2))
-            logger.debug(f"滑块缺口识别: x={gap_x:.1f}px, 拖动补偿={bias}px")
-            logger.info(f"第{attempt}次尝试过滑块验证...")
-            await move_slider(target, gap_x, bias)
+            gap_x, _, drag_distance, used_dom, score = await _measure_yidun_puzzle(
+                target, modules=modules
+            )
+            if used_dom:
+                probe = (0.0, 2.0, -2.0, 4.0)[min(attempt - 1, 3)]
+                logger.debug(
+                    f"滑块缺口识别: x={gap_x:.1f}px, DOM换算位移={drag_distance:.1f}px, "
+                    f"微调={probe:+.1f}px, score={score:.3f}"
+                )
+                logger.info(f"第{attempt}次尝试过滑块验证...")
+                await move_slider(target, drag_distance, bias=probe)
+            else:
+                # 无法获取完整 DOM 轨道尺寸时回退到经验偏移, 重试轻微左右试探。
+                bias = (
+                    GAP_BIAS_PX
+                    if attempt == 1
+                    else GAP_BIAS_PX + random.choice((-2, 0, 2))
+                )
+                logger.debug(
+                    f"滑块缺口识别: x={gap_x:.1f}px, 回退补偿={bias}px, score={score:.3f}"
+                )
+                logger.info(f"第{attempt}次尝试过滑块验证...")
+                await move_slider(target, gap_x, bias)
             if await _wait_verify_result(target):
                 logger.info("滑块验证已成功通过.")
                 logger.event("滑块验证", 结果="通过", 尝试=attempt, 缺口=f"{gap_x:.1f}px")
