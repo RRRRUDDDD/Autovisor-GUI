@@ -30,10 +30,41 @@ Repository = "https://github.com/RRRRUDDDD/Autovisor-GUI.git"
 Issues = "https://github.com/RRRRUDDDD/Autovisor-GUI/issues"
 
 [dependency-groups]
+dev = [
+    "pytest>=8.0",
+    "ruff>=0.8",
+]
 build = ["pyinstaller==6.22.3"]
 
 [tool.uv]
 package = false
+
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+exclude = [
+    ".venv",
+    "build",
+    "dist",
+    "data",
+    "gui",
+    "logs",
+    "packages",
+    "resources",
+]
+
+[tool.ruff.lint]
+# E: pycodestyle 错误 / F: pyflakes / B: flake8-bugbear / UP: pyupgrade
+# 暂不启用全仓强制导入重排 (I) 或风格重写 (SIM)，避免历史文件产生大面积无关噪音
+select = ["E", "F", "B", "UP"]
+ignore = [
+    "UP009",  # 保留历史文件头 `# encoding=utf-8` 约定
+]
+
+[tool.ruff.lint.per-file-ignores]
+"__init__.py" = ["F401"]
+"Autovisor.py" = ["E402"]  # 启动前需先执行 configure_stdio() 初始化控制台编码
+"tests/**/*.py" = ["B011"]
 
 [tool.setuptools.dynamic]
 version = { attr = "modules.version.__engine_version__" }
