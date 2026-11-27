@@ -571,5 +571,156 @@ class ExamApiContractTests(unittest.TestCase):
         self.assertFalse(submit_succeeded({"rt": {"statu": "0"}}))
 
 
+class ExamHttpCaptchaTests(unittest.TestCase):
+    def setUp(self):
+        patcher = patch("modules.zhidao_exam_worker.logger", _QuietLogger())
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        root = Path(self.tmp.name)
+        self.store = AiQuestionStore(
+            db_path=root / "bank.db", data_root=root, migrate=False
+        )
+
+    def _valid_fp(self):
+        return ("E" + "zY8+/=_-5wUvX6tQ") * 10 + "abcdef:1764200000123"
+
+    def _worker(self, api, **kwargs):
+        options = {
+            "course_id": "C1",
+            "store": self.store,
+            "answerer": lambda _prompt: _ids(2),
+            "auto_submit": True,
+            "sleep": lambda _seconds: None,
+        }
+        options.update(kwargs)
+        return ZhidaoExamWorker(api, **options)
+
+    def test_exam_http_captcha_unlocks_and_retries_do_exam_and_save_answer(self):
+        from modules.yidun_http import CaptchaSolution
+        from modules.zhs_api import CaptchaRequiredError
+
+        class CaptchaOnceExamApi(FakeExamApi):
+            def __init__(self):
+                super().__init__([])
+                self.do_attempts = 0
+                self.save_attempts = 0
+                self.validate_calls = []
+
+            def do_exam(self, **kwargs):
+                self.do_attempts += 1
+                if self.do_attempts == 1:
+                    raise CaptchaRequiredError("接口要求验证码(code=-12)", code="-12")
+                return super().do_exam(**kwargs)
+
+            def save_student_answer(self, **kwargs):
+                self.save_attempts += 1
+                if self.save_attempts == 1:
+                    raise CaptchaRequiredError("接口要求验证码(code=-12)", code="-12")
+                return super().save_student_answer(**kwargs)
+
+            def validate_slide_token(self, **kwargs):
+                self.validate_calls.append(kwargs)
+                return {"status": "200", "pass": True}
+
+        api = CaptchaOnceExamApi()
+        worker = self._worker(
+            api,
+            captcha_solver=lambda _trigger: CaptchaSolution("CN31_exam_v_i_1", "raw"),
+            fp_provider=self._valid_fp,
+        )
+        stats = worker.run(
+            recruit_id="R1",
+            course_id="C1",
+            exam_id="E1",
+            student_exam_id="S1",
+            school_id="9",
+        )
+        self.assertEqual(stats["answered"], 1)
+        self.assertTrue(stats["submitted"])
+        self.assertEqual(api.do_attempts, 2)
+        self.assertEqual(api.save_attempts, 2)
+        self.assertEqual(len(api.validate_calls), 2)
+        self.assertEqual(api.validate_calls[0]["exam_id"], "E1")
+
+    def test_exam_http_captcha_falls_back_without_fp_or_on_reject(self):
+        from modules.yidun_http import CaptchaSolution
+        from modules.zhs_api import CaptchaRequiredError
+
+        class CaptchaExamApi(FakeExamApi):
+            def __init__(self, *, passed=False):
+                super().__init__([])
+                self.passed = passed
+                self.do_attempts = 0
+                self.validate_calls = []
+
+            def do_exam(self, **kwargs):
+                self.do_attempts += 1
+                raise CaptchaRequiredError("接口要求验证码(code=-12)", code="-12")
+
+            def validate_slide_token(self, **kwargs):
+                self.validate_calls.append(kwargs)
+                return {"status": "200", "pass": self.passed}
+
+        # 无 fp 静默回退
+        api_no_fp = CaptchaExamApi(passed=True)
+        worker_no_fp = self._worker(
+            api_no_fp,
+            captcha_solver=lambda _trigger: CaptchaSolution("CN31_ex_v_i_1", "raw"),
+            fp_provider=lambda: None,
+        )
+        with self.assertRaises(CaptchaRequiredError):
+            worker_no_fp.run(
+                recruit_id="R1", course_id="C1", exam_id="E1", student_exam_id="S1", school_id="9"
+            )
+        self.assertEqual(api_no_fp.do_attempts, 1)
+        self.assertEqual(api_no_fp.validate_calls, [])
+
+        # validateSlideToken 返回 pass=False 静默回退
+        api_rej = CaptchaExamApi(passed=False)
+        worker_rej = self._worker(
+            api_rej,
+            captcha_solver=lambda _trigger: CaptchaSolution("CN31_ex_v_i_1", "raw"),
+            fp_provider=self._valid_fp,
+        )
+        with self.assertRaises(CaptchaRequiredError):
+            worker_rej.run(
+                recruit_id="R1", course_id="C1", exam_id="E1", student_exam_id="S1", school_id="9"
+            )
+        self.assertEqual(api_rej.do_attempts, 1)
+        self.assertEqual(len(api_rej.validate_calls), 1)
+
+    def test_exam_submit_never_auto_retries_on_captcha(self):
+        from modules.yidun_http import CaptchaSolution
+        from modules.zhs_api import CaptchaRequiredError
+
+        class SubmitCaptchaExamApi(FakeExamApi):
+            def __init__(self):
+                super().__init__([])
+                self.validate_calls = []
+
+            def submit(self, **kwargs):
+                self.submit_calls.append(kwargs)
+                raise CaptchaRequiredError("接口要求验证码(code=-12)", code="-12")
+
+            def validate_slide_token(self, **kwargs):
+                self.validate_calls.append(kwargs)
+                return {"status": "200", "pass": True}
+
+        api = SubmitCaptchaExamApi()
+        worker = self._worker(
+            api,
+            captcha_solver=lambda _trigger: CaptchaSolution("CN31_sub_v_i_1", "raw"),
+            fp_provider=self._valid_fp,
+        )
+        with self.assertRaises(CaptchaRequiredError):
+            worker.run(
+                recruit_id="R1", course_id="C1", exam_id="E1", student_exam_id="S1", school_id="9"
+            )
+        self.assertEqual(len(api.submit_calls), 1)
+        self.assertEqual(api.validate_calls, [])
+
+
 if __name__ == "__main__":
     unittest.main()

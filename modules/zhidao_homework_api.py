@@ -24,6 +24,7 @@ SAVE_STUDENT_ANSWER = f"{HOMEWORK_BASE}/answer/saveStudentAnswer"
 SUBMIT_HOMEWORK = f"{HOMEWORK_BASE}/answer/submit"
 LOOK_HOMEWORK = f"{HOMEWORK_BASE}/student/lookHomework"
 GET_STU_ANSWER_INFO = f"{HOMEWORK_BASE}/answer/getStuAnswerInfo"
+VALIDATE_SLIDE_TOKEN = f"{HOMEWORK_BASE}/answer/validateSlideToken"
 
 QUESTION_TYPE_NAMES = {1: "single", 2: "multiple", 3: "fill", 14: "judge"}
 
@@ -570,6 +571,37 @@ class ZhidaoHomeworkApi:
                 "questionIds": joined,
             },
         )
+
+    def validate_slide_token(
+        self,
+        *,
+        recruit_id,
+        exam_id,
+        token: str,
+    ) -> dict:
+        """上报易盾 validate 解锁作业风控（chapterId 字段实际填 examId，checkType=1）。"""
+        return self._call(
+            VALIDATE_SLIDE_TOKEN,
+            {
+                "recruitId": str(recruit_id),
+                "token": str(token),
+                "checkType": 1,
+                "chapterId": str(exam_id),
+            },
+        )
+
+
+def validate_slide_token_passed(payload) -> bool:
+    """判定 validateSlideToken 接口响应是否解锁通过。"""
+    if not isinstance(payload, dict):
+        return False
+    if "pass" in payload:
+        return bool(payload.get("pass"))
+    for key in ("rt", "data"):
+        nested = payload.get(key)
+        if isinstance(nested, dict) and "pass" in nested:
+            return bool(nested.get("pass"))
+    return False
 
 
 def extract_score(payload) -> float | None:

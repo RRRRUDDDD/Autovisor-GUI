@@ -49,6 +49,17 @@ class ZhsApiError(RuntimeError):
 class CaptchaRequiredError(ZhsApiError):
     """接口要求滑块/点选验证 (知到接口 code == -12)."""
 
+    def __init__(
+        self,
+        message: str = "",
+        *,
+        code: str | int | None = None,
+        response: dict | None = None,
+    ):
+        super().__init__(message)
+        self.code = None if code is None else str(code)
+        self.response = response
+
 
 class SessionExpiredError(ZhsApiError):
     """CASTGC/CAS 票据失效, 需要用户重新登录."""
@@ -377,7 +388,9 @@ class ZhsApiClient:
         code = _as_int(ret.get("code"))
         if strategy.captcha_on_minus_12 and code == -12:
             raise CaptchaRequiredError(
-                f"接口要求验证码(code=-12): {ret.get('message') or ret}"
+                f"接口要求验证码(code=-12): {ret.get('message') or ret}",
+                code="-12",
+                response=ret,
             )
         if strategy.ok_field is not None:
             expected = strategy.ok_value

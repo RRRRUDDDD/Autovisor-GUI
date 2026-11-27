@@ -46,15 +46,19 @@ class ZhidaoExamWorker(ZhidaoHomeworkWorker):
         school_id="",
     ) -> None:
         answer = format_student_answer(question.get("type", 1), values)
-        response = self.api.save_student_answer(
+        response = self._call_with_http_captcha(
+            lambda: self.api.save_student_answer(
+                recruit_id=recruit_id,
+                course_id=course_id,
+                exam_id=exam_id,
+                student_exam_id=stu_exam_id,
+                school_id=school_id,
+                eid=question["eid"],
+                question_type=question.get("type", 1),
+                answer=answer,
+            ),
             recruit_id=recruit_id,
-            course_id=course_id,
             exam_id=exam_id,
-            student_exam_id=stu_exam_id,
-            school_id=school_id,
-            eid=question["eid"],
-            question_type=question.get("type", 1),
-            answer=answer,
         )
         message = str((response or {}).get("message") or (response or {}).get("msg") or "")
         if any(hint in message.lower() for hint in _CAPTCHA_HINTS):
@@ -211,12 +215,16 @@ class ZhidaoExamWorker(ZhidaoHomeworkWorker):
                 logger.debug(f"getLoginSchoolInfo 失败, 以空 schoolId 继续: {exc}")
                 school_id = ""
 
-        payload = self.api.do_exam(
+        payload = self._call_with_http_captcha(
+            lambda: self.api.do_exam(
+                recruit_id=recruit_id,
+                exam_id=exam_id,
+                student_exam_id=student_exam_id,
+                school_id=school_id,
+                course_id=course_id,
+            ),
             recruit_id=recruit_id,
             exam_id=exam_id,
-            student_exam_id=student_exam_id,
-            school_id=school_id,
-            course_id=course_id,
         )
         questions = extract_exam_questions(payload)
         if not questions:

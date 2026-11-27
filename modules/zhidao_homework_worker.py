@@ -2,6 +2,7 @@
 """知到作业 API 答题 worker: 答题 -> 提交 -> 查错 -> 官方解析 -> 重做达标."""
 from __future__ import annotations
 
+import inspect
 import json
 import random
 import re
@@ -18,6 +19,12 @@ from modules.answer_store import AiQuestionStore, option_hash
 from modules.html_utils import extract_plain_text, has_meaningful_image
 from modules.logger import Logger
 from modules.question_bank import QuestionBankClient
+from modules.yidun_fp import get_session_fp, is_valid_fp, normalize_fp
+from modules.yidun_http import (
+    DEFAULT_ZHIDAO_REFERER,
+    CaptchaTrigger,
+    YidunHttpSolver,
+)
 from modules.zhidao_homework_api import (
     QUESTION_TYPE_NAMES,
     check_time_window,
@@ -27,8 +34,9 @@ from modules.zhidao_homework_api import (
     extract_score,
     format_student_answer,
     iter_answer_info_items,
+    validate_slide_token_passed,
 )
-from modules.zhs_api import ZhsApiError
+from modules.zhs_api import CaptchaRequiredError, ZhsApiError
 
 logger = Logger()
 
@@ -337,6 +345,9 @@ class ZhidaoHomeworkWorker:
         sleep=time.sleep,
         question_bank=None,
         cancel_event: threading.Event | None = None,
+        captcha_solver=None,
+        fp_provider=None,
+        enable_http_captcha: bool = True,
     ):
         self.api = api
         self.course_id = str(course_id)
@@ -359,6 +370,17 @@ class ZhidaoHomeworkWorker:
         self._ai_user_id = None
         self._recruit_id = str(recruit_id or "")
         self._llm_breaker = LlmCircuitBreaker()
+        self._captcha_solver = captcha_solver
+        self._fp_provider = fp_provider
+        self._enable_http_captcha = bool(enable_http_captcha)
+        self._http_proxy = str(bank_proxy or "").strip()
+        api_session = getattr(api_client, "session", None) if api_client is not None else None
+        api_headers = getattr(api_session, "headers", None) if api_session is not None else None
+        self._http_user_agent = (
+            str(api_headers.get("User-Agent") or "").strip()
+            if hasattr(api_headers, "get")
+            else ""
+        )
 
     @property
     def question_bank(self):
@@ -417,6 +439,120 @@ class ZhidaoHomeworkWorker:
             return self.cancel_event.wait(seconds)
         self.sleep(seconds)
         return self._is_cancelled()
+
+    # ------------------------------------------------------------ http captcha
+    @staticmethod
+    def _is_minus_12_captcha(exc: CaptchaRequiredError) -> bool:
+        code = getattr(exc, "code", None)
+        if code is not None:
+            return str(code).strip() == "-12"
+        text = str(exc)
+        return "code=-12" in text or "code: -12" in text
+
+    def _resolve_http_fp(self) -> str | None:
+        raw = None
+        if callable(self._fp_provider):
+            try:
+                raw = self._fp_provider()
+            except Exception:
+                raw = None
+        else:
+            raw = get_session_fp()
+        fp_value = normalize_fp(raw)
+        return fp_value if is_valid_fp(fp_value) else None
+
+    def _invoke_captcha_solver(self, trigger: CaptchaTrigger, fp_value: str):
+        solver = self._captcha_solver
+        if solver is None:
+            solver = YidunHttpSolver(
+                fp_provider=lambda: fp_value,
+                proxy=self._http_proxy,
+                user_agent=self._http_user_agent,
+            )
+            return solver.solve(trigger, fp=fp_value)
+        solve_fn = getattr(solver, "solve", solver)
+        try:
+            params = inspect.signature(solve_fn).parameters
+            if "fp" in params or any(
+                p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values()
+            ):
+                return solve_fn(trigger, fp=fp_value)
+        except (TypeError, ValueError):
+            pass
+        return solve_fn(trigger)
+
+    def _try_http_captcha_unlock(
+        self,
+        *,
+        recruit_id,
+        exam_id,
+        referer: str = DEFAULT_ZHIDAO_REFERER,
+    ) -> bool:
+        """捕获 code=-12 且具备有效 fp 时走纯 HTTP 易盾求解并上报 validateSlideToken。"""
+        if not self._enable_http_captcha or self._is_cancelled():
+            return False
+        validate_fn = getattr(self.api, "validate_slide_token", None)
+        if not callable(validate_fn):
+            return False
+        recruit_str = str(recruit_id or "").strip()
+        exam_str = str(exam_id or "").strip()
+        if not recruit_str or not exam_str:
+            return False
+        fp_value = self._resolve_http_fp()
+        if not fp_value:
+            return False
+
+        trigger = CaptchaTrigger(
+            kind="click",
+            referer=referer or DEFAULT_ZHIDAO_REFERER,
+        )
+        try:
+            solution = self._invoke_captcha_solver(trigger, fp_value)
+        except Exception as exc:
+            logger.warn(f"纯 HTTP 易盾求解异常，静默回退浏览器处理: {exc}")
+            return False
+        validate_token = str(getattr(solution, "validate", "") or "").strip()
+        if not validate_token:
+            logger.debug("纯 HTTP 易盾未返回有效 validate，静默回退浏览器处理.")
+            return False
+
+        try:
+            response = validate_fn(
+                recruit_id=recruit_str,
+                exam_id=exam_str,
+                token=validate_token,
+            )
+        except Exception as exc:
+            logger.warn(f"validateSlideToken 上报异常，静默回退浏览器处理: {exc}")
+            return False
+
+        if validate_slide_token_passed(response):
+            logger.info("纯 HTTP 易盾验证通过并完成风控解锁，重试原请求...")
+            return True
+        logger.warn("validateSlideToken 校验未通过，静默回退浏览器处理.")
+        return False
+
+    def _call_with_http_captcha(
+        self,
+        call_fn,
+        *,
+        recruit_id,
+        exam_id,
+        referer: str = DEFAULT_ZHIDAO_REFERER,
+    ):
+        """执行知到接口请求；若遇 code=-12 且本地有有效 fp 则无感解锁并重试一次。"""
+        try:
+            return call_fn()
+        except CaptchaRequiredError as exc:
+            if not self._is_minus_12_captcha(exc):
+                raise
+            if not self._try_http_captcha_unlock(
+                recruit_id=recruit_id,
+                exam_id=exam_id,
+                referer=referer,
+            ):
+                raise
+            return call_fn()
 
     # ------------------------------------------------------------- answering
     def _get_question_bank(self):
@@ -664,20 +800,22 @@ class ZhidaoHomeworkWorker:
         school_id="",
     ) -> None:
         answer = format_student_answer(question.get("type", 1), values)
-        response = self.api.save_student_answer(
+        response = self._call_with_http_captcha(
+            lambda: self.api.save_student_answer(
+                recruit_id=recruit_id,
+                exam_id=exam_id,
+                stu_exam_id=stu_exam_id,
+                school_id=school_id,
+                eid=question["eid"],
+                question_type=question.get("type", 1),
+                answer=answer,
+                exam_type="",
+            ),
             recruit_id=recruit_id,
             exam_id=exam_id,
-            stu_exam_id=stu_exam_id,
-            school_id=school_id,
-            eid=question["eid"],
-            question_type=question.get("type", 1),
-            answer=answer,
-            exam_type="",
         )
         message = str((response or {}).get("message") or (response or {}).get("msg") or "")
         if any(hint in message.lower() for hint in _CAPTCHA_HINTS):
-            from modules.zhs_api import CaptchaRequiredError
-
             raise CaptchaRequiredError(f"保存答案触发人机验证: {message}")
 
     # ---------------------------------------------------------------- review
@@ -1006,44 +1144,42 @@ class ZhidaoHomeworkWorker:
         school_id,
         allow_reset=True,
     ):
-        try:
-            payload = self.api.do_homework(
+        def _do_hw():
+            return self._call_with_http_captcha(
+                lambda: self.api.do_homework(
+                    recruit_id=recruit_id,
+                    exam_id=exam_key,
+                    student_exam_id=stu_exam_id,
+                    school_id=school_id,
+                    course_id=course_id,
+                ),
                 recruit_id=recruit_id,
                 exam_id=exam_key,
-                student_exam_id=stu_exam_id,
-                school_id=school_id,
-                course_id=course_id,
             )
+
+        def _reset_hw():
+            return self._call_with_http_captcha(
+                lambda: self.api.save_course_tran(
+                    recruit_id=recruit_id,
+                    exam_id=exam_key,
+                    course_id=course_id,
+                ),
+                recruit_id=recruit_id,
+                exam_id=exam_key,
+            )
+
+        try:
+            payload = _do_hw()
         except ZhsApiError as exc:
             if not allow_reset or not any(hint in str(exc) for hint in _RESET_HINTS):
                 raise
             logger.warn("作业已提交或不可继续作答, 先重置状态再重试...")
-            self.api.save_course_tran(
-                recruit_id=recruit_id,
-                exam_id=exam_key,
-                course_id=course_id,
-            )
-            return self.api.do_homework(
-                recruit_id=recruit_id,
-                exam_id=exam_key,
-                student_exam_id=stu_exam_id,
-                school_id=school_id,
-                course_id=course_id,
-            )
+            _reset_hw()
+            return _do_hw()
         if allow_reset and payload_needs_reset(payload):
             logger.warn("作业已提交或不可继续作答, 先重置状态再重试...")
-            self.api.save_course_tran(
-                recruit_id=recruit_id,
-                exam_id=exam_key,
-                course_id=course_id,
-            )
-            payload = self.api.do_homework(
-                recruit_id=recruit_id,
-                exam_id=exam_key,
-                student_exam_id=stu_exam_id,
-                school_id=school_id,
-                course_id=course_id,
-            )
+            _reset_hw()
+            payload = _do_hw()
         return payload
 
     def _round_limit(self, payload) -> int:
@@ -1240,10 +1376,14 @@ class ZhidaoHomeworkWorker:
                 if self.max_rounds == 0 and marking >= server_limit:
                     logger.warn("作业重做次数已达上限, 停止重做.")
                     break
-            self.api.save_course_tran(
+            self._call_with_http_captcha(
+                lambda: self.api.save_course_tran(
+                    recruit_id=recruit_id,
+                    exam_id=exam_key,
+                    course_id=course_id,
+                ),
                 recruit_id=recruit_id,
                 exam_id=exam_key,
-                course_id=course_id,
             )
             payload = self._open_homework(
                 recruit_id=recruit_id,

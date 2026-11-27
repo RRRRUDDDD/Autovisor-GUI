@@ -479,6 +479,7 @@ async def _try_zhidao_api(page, config, params: dict) -> dict:
     """用浏览器 Cookie 构造加密 API 客户端并同步作答, 不修改页面."""
     from modules.ai_analysis_api import AiAnalysisApi
     from modules.answer_store import AiQuestionStore
+    from modules.yidun_fp import get_session_fp, probe_fp_from_page
     from modules.zhidao_exam_api import ZhidaoExamApi
     from modules.zhidao_exam_worker import ZhidaoExamWorker
     from modules.zhidao_homework_api import ZhidaoHomeworkApi
@@ -493,6 +494,11 @@ async def _try_zhidao_api(page, config, params: dict) -> dict:
     proxy = str(getattr(config, "proxy", "") or "").strip()
     client = ZhsApiClient(cookies, proxy=proxy, user_agent=user_agent)
     auto_submit = bool(llm.conf().get("auto_submit", False))
+    enable_http_captcha = bool(getattr(config, "enableAutoCaptcha", True))
+    page_context = getattr(page, "context", None)
+    if enable_http_captcha and not get_session_fp(page_context):
+        await probe_fp_from_page(page, context=page_context)
+    fp_provider = lambda ctx=page_context: get_session_fp(ctx)
     store = AiQuestionStore()
     course_id = params.get("courseId", "")
 
@@ -518,6 +524,8 @@ async def _try_zhidao_api(page, config, params: dict) -> dict:
                 target_score=float(threshold or 0),
                 max_rounds=int(max_redo or 0),
                 cancel_event=cancel_event,
+                fp_provider=fp_provider,
+                enable_http_captcha=enable_http_captcha,
             )
             try:
                 return await asyncio.to_thread(
@@ -542,6 +550,8 @@ async def _try_zhidao_api(page, config, params: dict) -> dict:
             store=store,
             auto_submit=auto_submit,
             cancel_event=cancel_event,
+            fp_provider=fp_provider,
+            enable_http_captcha=enable_http_captcha,
         )
         try:
             return await asyncio.to_thread(

@@ -543,6 +543,60 @@ class CourseMetaAndHelpersTests(unittest.TestCase):
             (False, "expired"),
         )
 
+    def test_validate_slide_token_contract_and_passed_helper(self):
+        from modules.zhidao_exam_api import ZhidaoExamApi
+        from modules.zhidao_homework_api import (
+            VALIDATE_SLIDE_TOKEN,
+            ZhidaoHomeworkApi,
+            validate_slide_token_passed,
+        )
+
+        class _StubClient:
+            def __init__(self):
+                self.calls = []
+                self.sso_calls = 0
+
+            def ensure_exam_sso(self):
+                self.sso_calls += 1
+
+            def query(self, strategy, url, data, **kwargs):
+                self.calls.append((strategy, url, dict(data), dict(kwargs)))
+                return {"status": "200", "pass": True}
+
+        client = _StubClient()
+        hw_api = ZhidaoHomeworkApi(client)
+        res_hw = hw_api.validate_slide_token(
+            recruit_id="R100", exam_id="E200", token="CN31_enc_v_i_1"
+        )
+        self.assertTrue(validate_slide_token_passed(res_hw))
+        self.assertEqual(client.sso_calls, 1)
+        self.assertEqual(client.calls[0][0], "homework")
+        self.assertEqual(client.calls[0][1], VALIDATE_SLIDE_TOKEN)
+        self.assertEqual(
+            client.calls[0][2],
+            {
+                "recruitId": "R100",
+                "token": "CN31_enc_v_i_1",
+                "checkType": 1,
+                "chapterId": "E200",
+            },
+        )
+
+        exam_api = ZhidaoExamApi(client)
+        res_exam = exam_api.validate_slide_token(
+            recruit_id="R101", exam_id="E201", token="CN31_enc2_v_i_1"
+        )
+        self.assertTrue(validate_slide_token_passed(res_exam))
+        self.assertEqual(client.calls[1][0], "homework")
+        self.assertEqual(client.calls[1][1], VALIDATE_SLIDE_TOKEN)
+        self.assertEqual(client.calls[1][2]["chapterId"], "E201")
+        self.assertEqual(client.calls[1][2]["checkType"], 1)
+
+        self.assertFalse(validate_slide_token_passed({"status": "200", "pass": False}))
+        self.assertTrue(validate_slide_token_passed({"rt": {"pass": True}}))
+        self.assertTrue(validate_slide_token_passed({"data": {"pass": True}}))
+        self.assertFalse(validate_slide_token_passed(None))
+
 
 if __name__ == "__main__":
     unittest.main()

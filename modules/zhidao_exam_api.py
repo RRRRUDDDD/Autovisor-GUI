@@ -12,9 +12,11 @@ import json
 from modules.zhidao_homework_api import (
     HOMEWORK_BASE,
     SAVE_STUDENT_ANSWER,
+    VALIDATE_SLIDE_TOKEN,
     _maybe_int,
     build_student_answer_item,
     extract_exam_questions,
+    validate_slide_token_passed,
 )
 
 EXAM_BASE = "https://taurusexam-api.zhihuishu.com/taurusExam/gateway/t/v1"
@@ -215,6 +217,24 @@ class ZhidaoExamApi:
             },
         )
 
+    def validate_slide_token(
+        self,
+        *,
+        recruit_id,
+        exam_id,
+        token: str,
+    ) -> dict:
+        """上报易盾 validate 解锁正式考试风控（chapterId 填 examId，checkType=1）。"""
+        return self._homework_call(
+            VALIDATE_SLIDE_TOKEN,
+            {
+                "recruitId": str(recruit_id),
+                "token": str(token),
+                "checkType": 1,
+                "chapterId": str(exam_id),
+            },
+        )
+
 
 __all__ = [
     "EXAM_BASE",
@@ -223,6 +243,7 @@ __all__ = [
     "SUBMIT_EXAM",
     "GET_SAVE_ANSWER_LOCK_RESULT",
     "GET_LOGIN_SCHOOL_INFO",
+    "VALIDATE_SLIDE_TOKEN",
     "ZhidaoExamApi",
     "extract_exam_questions",
     "extract_final_exams",
@@ -230,4 +251,5 @@ __all__ = [
     "lock_state",
     "extract_school_id",
     "submit_succeeded",
+    "validate_slide_token_passed",
 ]

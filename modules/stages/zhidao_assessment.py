@@ -342,6 +342,7 @@ async def _run_zhidao_assessment_with_client(
     resources: list,
 ) -> dict:
     from modules.ai_analysis_api import AiAnalysisApi
+    from modules.yidun_fp import get_session_fp, probe_fp_from_page
     from modules.zhidao_exam_api import ZhidaoExamApi, is_exam_started
     from modules.zhidao_exam_worker import ZhidaoExamWorker
     from modules.zhidao_homework_api import (
@@ -386,6 +387,11 @@ async def _run_zhidao_assessment_with_client(
 
     proxy = str(getattr(config, "proxy", "") or "").strip()
     auto_submit = bool(qp_mod.llm.conf().get("auto_submit", False))
+    enable_http_captcha = bool(getattr(config, "enableAutoCaptcha", True))
+    page_context = getattr(page, "context", None)
+    if enable_http_captcha and not get_session_fp(page_context):
+        await probe_fp_from_page(page, context=page_context)
+    fp_provider = lambda ctx=page_context: get_session_fp(ctx)
     cancel_event = resolve_cancel_event(config)
     store = AiQuestionStore()
     if not qp_mod.llm.enabled():
@@ -429,6 +435,8 @@ async def _run_zhidao_assessment_with_client(
             target_score=threshold,
             max_rounds=max_redo,
             cancel_event=cancel_event,
+            fp_provider=fp_provider,
+            enable_http_captcha=enable_http_captcha,
         )
         resources.append(hw_worker)
         try:
@@ -548,6 +556,8 @@ async def _run_zhidao_assessment_with_client(
             store=store,
             auto_submit=auto_submit,
             cancel_event=cancel_event,
+            fp_provider=fp_provider,
+            enable_http_captcha=enable_http_captcha,
         )
         resources.append(exam_worker)
         try:
