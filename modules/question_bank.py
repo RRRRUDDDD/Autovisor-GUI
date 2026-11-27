@@ -7,7 +7,9 @@
 """
 from __future__ import annotations
 
+from dataclasses import dataclass
 import re
+import time
 
 try:
     import requests
@@ -22,12 +24,22 @@ logger = Logger()
 
 DEFAULT_QUERY_URL = "https://tk.enncy.cn/query"
 DEFAULT_INFO_URL = "https://tk.enncy.cn/info"
+DEFAULT_MAX_RETRIES = 3
+DEFAULT_RETRY_DELAY = 0.25
+QUESTION_BANK_SCOPES = (
+    "zhidao_homework",
+    "zhidao_exam",
+    "ai_homework",
+    "ai_exam",
+)
+DEFAULT_QUESTION_BANK_SCOPES = ("zhidao_exam", "ai_exam")
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Autovisor-QuestionBank/1.0"
 )
 _SENSITIVE_HEADERS = ("Cookie", "Origin", "Referer", "Authorization")
 _WS_RE = re.compile(r"\s+")
+_RETRYABLE_HTTP_STATUS = frozenset({429})
 
 _TYPE_NAMES = {
     1: "single",
@@ -35,6 +47,19 @@ _TYPE_NAMES = {
     3: "completion",
     14: "judgement",
 }
+
+
+@dataclass(frozen=True)
+class QuestionBankResult:
+    """外部题库单次命中的结构化结果."""
+
+    answer: str
+    ai: bool = False
+    remaining: int | None = None
+
+    @property
+    def source_label(self) -> str:
+        return "题库AI生成" if self.ai else "题库数据库"
 
 
 def type_name(question_type) -> str:
@@ -50,11 +75,23 @@ def _clean(value) -> str:
     return _WS_RE.sub(" ", str(value or "")).strip()
 
 
+def _clean_answer_lines(text: str) -> str:
+    """逐行去除题库答案末尾的 `#` 污染字符与空白行."""
+    cleaned: list[str] = []
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        while line.endswith("#"):
+            line = line[:-1].strip()
+        if line:
+            cleaned.append(line)
+    return "\n".join(cleaned)
+
+
 def _extract_answer(data) -> str:
     if data is None:
         return ""
     if isinstance(data, str):
-        return data.strip()
+        return _clean_answer_lines(data)
     if isinstance(data, bool):
         return ""
     if isinstance(data, (int, float)):
@@ -69,6 +106,43 @@ def _extract_answer(data) -> str:
                 if text:
                     return text
     return ""
+
+
+def _extract_ai_flag(payload) -> bool:
+    """解析题库响应中的 `ai` 布尔字段（区分题库数据库与题库 AI 生成）."""
+    if not isinstance(payload, dict):
+        return False
+    candidates = []
+    if isinstance(payload.get("data"), dict):
+        candidates.append(payload["data"])
+    candidates.append(payload)
+    for source in candidates:
+        if "ai" not in source:
+            continue
+        value = source.get("ai")
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)):
+            return bool(value)
+        if isinstance(value, str):
+            text = value.strip().lower()
+            if text in ("true", "1", "yes"):
+                return True
+            if text in ("false", "0", "no", ""):
+                return False
+    return False
+
+
+def _normalize_scopes(scopes) -> frozenset[str] | None:
+    if scopes is None:
+        return None
+    if isinstance(scopes, str):
+        items = [part.strip().lower() for part in re.split(r"[\s,;]+", scopes) if part.strip()]
+    elif isinstance(scopes, (list, tuple, set, frozenset)):
+        items = [str(item or "").strip().lower() for item in scopes]
+    else:
+        return None
+    return frozenset(item for item in items if item in QUESTION_BANK_SCOPES)
 
 
 def _extract_remaining(payload) -> int | None:
@@ -101,6 +175,10 @@ class QuestionBankClient:
         proxy="",
         timeout=8.0,
         session=None,
+        scopes=None,
+        max_retries: int = DEFAULT_MAX_RETRIES,
+        retry_delay: float = DEFAULT_RETRY_DELAY,
+        sleep=None,
     ):
         self.token = _clean(token)
         if self.token:
@@ -112,6 +190,16 @@ class QuestionBankClient:
             self.timeout = float(timeout)
         except (TypeError, ValueError):
             self.timeout = 8.0
+        self.scopes = _normalize_scopes(scopes)
+        try:
+            self.max_retries = max(1, int(max_retries))
+        except (TypeError, ValueError):
+            self.max_retries = DEFAULT_MAX_RETRIES
+        try:
+            self.retry_delay = max(0.0, float(retry_delay))
+        except (TypeError, ValueError):
+            self.retry_delay = DEFAULT_RETRY_DELAY
+        self._sleep = sleep
         self._owns_session = session is None
         self.session = session if session is not None else self._new_session()
         self._sanitize_session(self.session)
@@ -180,8 +268,19 @@ class QuestionBankClient:
         except Exception:
             pass
 
+    def _backoff(self, attempt: int) -> None:
+        if self.retry_delay <= 0:
+            return
+        delay = min(self.retry_delay * (2 ** attempt), 2.0)
+        sleep_fn = self._sleep if callable(self._sleep) else time.sleep
+        sleep_fn(delay)
+
     def _request_json(self, url: str, params: dict):
-        """返回 (payload, error); error 为 None 表示拿到了合法 JSON 响应."""
+        """返回 (payload, error); error 为 None 表示拿到了合法 JSON 响应.
+
+        对瞬时网络异常、HTTP 5xx/429 及 JSON 解析异常执行短退避重试（最多 max_retries 次）；
+        4xx 鉴权/参数错误与无效代理配置不重试，直接返回。
+        """
         if self.session is None:
             return None, "disabled"
         kwargs = {"params": params, "timeout": self.timeout}
@@ -195,20 +294,47 @@ class QuestionBankClient:
             return None, "network"
         if proxies:
             kwargs["proxies"] = proxies
-        try:
-            response = self.session.get(url, **kwargs)
-        except Exception as exc:
-            logger.debug(f"题库请求失败({safe_url}): {self._redact_for_log(exc)}")
-            return None, "network"
-        status = getattr(response, "status_code", 200)
-        if isinstance(status, int) and status >= 400:
-            logger.debug(f"题库请求失败({safe_url}): HTTP {status}")
-            return None, "http"
-        try:
-            return response.json(), None
-        except Exception as exc:
-            logger.debug(f"题库响应不是合法 JSON({safe_url}): {self._redact_for_log(exc)}")
-            return None, "json"
+
+        last_error = "network"
+        for attempt in range(self.max_retries):
+            try:
+                response = self.session.get(url, **kwargs)
+            except Exception as exc:
+                last_error = "network"
+                logger.debug(
+                    f"题库请求失败({safe_url}, 尝试 {attempt + 1}/{self.max_retries}): "
+                    f"{self._redact_for_log(exc)}"
+                )
+                if attempt + 1 < self.max_retries:
+                    self._backoff(attempt)
+                    continue
+                return None, last_error
+
+            status = getattr(response, "status_code", 200)
+            if isinstance(status, int) and status >= 400:
+                last_error = "http"
+                logger.debug(
+                    f"题库请求失败({safe_url}, 尝试 {attempt + 1}/{self.max_retries}): HTTP {status}"
+                )
+                retryable = status >= 500 or status in _RETRYABLE_HTTP_STATUS
+                if retryable and attempt + 1 < self.max_retries:
+                    self._backoff(attempt)
+                    continue
+                return None, last_error
+
+            try:
+                return response.json(), None
+            except Exception as exc:
+                last_error = "json"
+                logger.debug(
+                    f"题库响应不是合法 JSON({safe_url}, 尝试 {attempt + 1}/{self.max_retries}): "
+                    f"{self._redact_for_log(exc)}"
+                )
+                if attempt + 1 < self.max_retries:
+                    self._backoff(attempt)
+                    continue
+                return None, last_error
+        return None, last_error
 
     def _get_json(self, url: str, params: dict):
         payload, _ = self._request_json(url, params)
@@ -234,6 +360,14 @@ class QuestionBankClient:
     # -------------------------------------------------------------- query
     def enabled(self) -> bool:
         return bool(self.token) and self.session is not None
+
+    def allows_scope(self, scope: str | None = None) -> bool:
+        """检查当前客户端是否允许在指定作用域查询题库（scopes=None 表示不限制）."""
+        if self.scopes is None:
+            return True
+        if not scope:
+            return bool(self.scopes)
+        return str(scope).strip().lower() in self.scopes
 
     def stats(self) -> tuple[int, int]:
         return self._hit_count, self._total_queries
@@ -279,9 +413,14 @@ class QuestionBankClient:
             剩余=self._remaining if self._remaining is not None else "未知",
         )
 
-    def query(self, title, options=None, question_type=1) -> str | None:
-        """查询题目, 命中返回参考答案文本, 未命中或异常返回 None."""
+    def query_result(
+        self, title, options=None, question_type=1, *, scope: str | None = None
+    ) -> QuestionBankResult | None:
+        """查询题目, 命中返回结构化结果(含 answer 与 ai 来源标识), 未命中或异常返回 None."""
         if not self.enabled():
+            return None
+        if not self.allows_scope(scope):
+            logger.debug(f"第三方题库作用域({scope})未启用, 跳过查询.")
             return None
         text = _clean(title)
         if not text:
@@ -323,7 +462,18 @@ class QuestionBankClient:
         if not answer:
             return None
         self._hit_count += 1
-        return answer
+        return QuestionBankResult(
+            answer=answer,
+            ai=_extract_ai_flag(payload),
+            remaining=self._remaining,
+        )
+
+    def query(
+        self, title, options=None, question_type=1, *, scope: str | None = None
+    ) -> str | None:
+        """查询题目, 命中返回参考答案文本, 未命中或异常返回 None."""
+        result = self.query_result(title, options, question_type, scope=scope)
+        return result.answer if result is not None else None
 
     # -------------------------------------------------------------- factory
     @classmethod
@@ -337,4 +487,5 @@ class QuestionBankClient:
             query_url=conf.get("url", DEFAULT_QUERY_URL),
             proxy=proxy,
             session=session,
+            scopes=conf.get("scopes"),
         )

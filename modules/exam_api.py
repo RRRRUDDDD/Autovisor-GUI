@@ -176,11 +176,19 @@ def _prompt_context_prefix(extra: dict | None) -> str:
         else ""
     )
     bank = str(extra.get("题库参考") or "").strip()
-    bank_section = (
-        f"【第三方题库参考】以下内容来自外部题库, 仅供参考, 请自行判断正确性：\n{bank}\n"
-        if bank
-        else ""
-    )
+    if bank:
+        bank_ai = extra.get("题库AI生成")
+        if bank_ai is True:
+            source_hint = "（来源：题库AI生成，仅供辅助参考，请结合题干重点核实）"
+        elif bank_ai is False:
+            source_hint = "（来源：题库数据库，请结合题干与选项核对后作答）"
+        else:
+            source_hint = ", 仅供参考, 请自行判断正确性"
+        bank_section = (
+            f"【第三方题库参考】以下内容来自外部题库{source_hint}：\n{bank}\n"
+        )
+    else:
+        bank_section = ""
     return background + theme + knowledge + bank_section
 
 

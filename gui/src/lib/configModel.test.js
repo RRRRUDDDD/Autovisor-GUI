@@ -162,12 +162,14 @@ describe('configModel', () => {
     expect(normalizeConfig({}).llm.streamIdleTimeout).toBe(30);
     expect(normalizeConfig({}).llm.questionBankToken).toBe('');
     expect(normalizeConfig({}).llm.questionBankUrl).toBe('https://tk.enncy.cn/query');
+    expect(normalizeConfig({}).llm.questionBankScopes).toEqual(['zhidao_exam', 'ai_exam']);
     const llmOverrides = normalizeConfig({
       llm: {
         stream_timeout: 60,
         stream_idle_timeout: 15,
         question_bank_token: '  bank-token  ',
         question_bank_url: '  https://tk.example.com/query  ',
+        question_bank_scopes: ['ai_homework', 'zhidao_exam', 'invalid'],
       },
     });
     expect(llmOverrides.llm.streamTimeout).toBe(60);
@@ -178,6 +180,8 @@ describe('configModel', () => {
     ).toBe(10);
     expect(llmOverrides.llm.questionBankToken).toBe('bank-token');
     expect(llmOverrides.llm.questionBankUrl).toBe('https://tk.example.com/query');
+    expect(llmOverrides.llm.questionBankScopes).toEqual(['zhidao_exam', 'ai_homework']);
+    expect(normalizeConfig({ llm: { question_bank_scopes: [] } }).llm.questionBankScopes).toEqual([]);
     expect(cfg.llm).toEqual({
       provider: 'custom',
       apiFormat: 'openai',
@@ -191,6 +195,7 @@ describe('configModel', () => {
       streamIdleTimeout: 30,
       questionBankToken: '',
       questionBankUrl: 'https://tk.enncy.cn/query',
+      questionBankScopes: ['zhidao_exam', 'ai_exam'],
     });
 
     const claudeCfg = normalizeConfig({

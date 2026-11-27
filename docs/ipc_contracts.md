@@ -68,13 +68,13 @@
 | `homeworkMaxRedo` | `integer` | `3` | `[course-option] homeworkMaxRedo` | `>= 0` |
 | `enableFormalExamApi` | `boolean` | `true` | `[course-option] enableFormalExamApi` | 知到正式考试加密 API |
 | `forceRedoAnswered` | `boolean` | `false` | `[course-option] forceRedoAnswered` | 强制重做已答题目 |
-| `llm` | `LlmConfig` | 见下 | `data/llm.json` | 12 字段对象 |
+| `llm` | `LlmConfig` | 见下 | `data/llm.json` | 13 字段对象 |
 | `courses` | `CourseItem[]` | `[]` | `[course-url]` + `data/gui_courses.json` | 已勾选的 https URL 写入 INI |
 | `mirrors` | `Record<string, string>` | 4 镜像源 | `data/mirrors.json` | PyPI 镜像表 |
 
 ### 1.4 `LlmConfig` 字段映射（IPC `camelCase` ↔ 磁盘 `snake_case`）
 
-`provider`, `apiFormat`/`api_format`, `apiKey`/`api_key`, `apiBase`/`api_base`, `model`, `visionModel`/`vision_model`, `apiVersion`/`api_version`, `autoSubmit`/`auto_submit`, `streamTimeout`/`stream_timeout` (`>0`, 默认 `120`), `streamIdleTimeout`/`stream_idle_timeout` (`>0` 且 `<= streamTimeout`, 默认 `30`), `questionBankToken`/`question_bank_token`, `questionBankUrl`/`question_bank_url` (默认 `https://tk.enncy.cn/query`)。
+`provider`, `apiFormat`/`api_format`, `apiKey`/`api_key`, `apiBase`/`api_base`, `model`, `visionModel`/`vision_model`, `apiVersion`/`api_version`, `autoSubmit`/`auto_submit`, `streamTimeout`/`stream_timeout` (`>0`, 默认 `120`), `streamIdleTimeout`/`stream_idle_timeout` (`>0` 且 `<= streamTimeout`, 默认 `30`), `questionBankToken`/`question_bank_token`, `questionBankUrl`/`question_bank_url` (默认 `https://tk.enncy.cn/query`), `questionBankScopes`/`question_bank_scopes` (允许值 `zhidao_homework` / `zhidao_exam` / `ai_homework` / `ai_exam`，默认 `["zhidao_exam", "ai_exam"]`，显式空列表 `[]` 表示禁用全部作用域)。
 
 ---
 

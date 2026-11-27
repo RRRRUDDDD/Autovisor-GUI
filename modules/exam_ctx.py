@@ -85,6 +85,7 @@ class AiExamBase(ABC):
     exam_label = "接口考试"
     # 是否允许跨 exam_id 检索同课程题库 (仅综合考试开启)
     _cross_exam_search = False
+    question_bank_scope = ""
 
     def __init__(
         self,
@@ -106,7 +107,9 @@ class AiExamBase(ABC):
         self.op_extra = op_extra or {}
         self.answer_bank = answer_bank or AnswerBank(course_id)
         self._bank_helper = QuestionBankHelper(
-            question_bank, proxy=getattr(api, "proxy", "")
+            question_bank,
+            proxy=getattr(api, "proxy", ""),
+            scope=self.question_bank_scope,
         )
         self.cancel_event = cancel_event
         self.reference_materials: list[dict] = []
@@ -330,18 +333,31 @@ class AiExamBase(ABC):
         """懒加载外部题库客户端; 未配置 token 时返回 None."""
         return self._bank_helper.get()
 
-    def _bank_reference(self, question: dict, question_type, choices: list[dict]) -> str:
+    def _bank_result(self, question: dict, question_type, choices: list[dict]):
         title = extract_plain_text(question.get("content", ""))
         options = [extract_plain_text(choice.get("content", "")) for choice in choices]
-        return self._bank_helper.query(title, options, question_type)
+        return self._bank_helper.query_result(title, options, question_type)
+
+    def _bank_reference(self, question: dict, question_type, choices: list[dict]) -> str:
+        result = self._bank_result(question, question_type, choices)
+        return result.answer if result is not None else ""
 
     def _build_prompt_extra(
         self, question: dict, question_type, choices: list[dict]
     ) -> dict:
         extra = dict(self.op_extra)
-        reference = self._bank_reference(question, question_type, choices)
-        if reference:
-            extra["题库参考"] = reference
+        if (
+            type(self)._bank_reference is AiExamBase._bank_reference
+            and "_bank_reference" not in self.__dict__
+        ):
+            result = self._bank_result(question, question_type, choices)
+            if result is not None and result.answer:
+                extra["题库参考"] = result.answer
+                extra["题库AI生成"] = result.ai
+        else:
+            reference = self._bank_reference(question, question_type, choices)
+            if reference:
+                extra["题库参考"] = reference
         return extra
 
     def _generate_answer(self, question_type: int, question: dict, choices: list[dict]) -> list:
@@ -675,6 +691,7 @@ class AiHomeworkCtx(AiExamBase):
     """AI 知识点作业: 逐题保存, 交卷后核对成绩并写回题库."""
 
     _cross_exam_search = False
+    question_bank_scope = "ai_homework"
 
     def _fetch_sheet_items(self) -> list:
         return self.get_sheet_content()
@@ -744,6 +761,7 @@ class AiFormalExamCtx(AiExamBase):
     """AI 智慧课综合/单元测试: 任务列表 -> 拉卷 -> 批量保存 -> 按配置交卷 -> 回读."""
 
     _cross_exam_search = True
+    question_bank_scope = "ai_exam"
 
     def __init__(
         self,

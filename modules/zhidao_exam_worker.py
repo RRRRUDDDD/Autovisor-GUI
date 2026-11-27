@@ -31,6 +31,8 @@ __all__ = ["ZhidaoExamWorker"]
 class ZhidaoExamWorker(ZhidaoHomeworkWorker):
     """正式考试没有查错/重做闭环, 复用作业的答案生成与题库逻辑."""
 
+    question_bank_scope = "zhidao_exam"
+
     def _save_answer(
         self,
         *,

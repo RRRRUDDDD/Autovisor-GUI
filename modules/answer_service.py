@@ -6,17 +6,18 @@ from collections.abc import Callable
 
 from modules import llm
 from modules.logger import Logger
-from modules.question_bank import QuestionBankClient
+from modules.question_bank import QuestionBankClient, QuestionBankResult
 
 logger = Logger()
 
 
 class QuestionBankHelper:
-    """统一管理 QuestionBankClient 的懒加载、查询降级、统计输出与资源关闭。"""
+    """统一管理 QuestionBankClient 的懒加载、作用域校验、查询降级、统计输出与资源关闭。"""
 
-    def __init__(self, client=None, *, proxy: str = ""):
+    def __init__(self, client=None, *, proxy: str = "", scope: str = ""):
         self.client = client
         self.proxy = str(proxy or "")
+        self.scope = str(scope or "").strip().lower()
         self.ready = client is not None
         self.owns_client = False
 
@@ -33,15 +34,56 @@ class QuestionBankHelper:
             self.owns_client = False
         return self.client
 
-    def query(self, title: str, options: list[str], question_type) -> str:
+    def allows_scope(self, bank=None) -> bool:
+        target = self.client if bank is None else bank
+        if target is None or not self.scope:
+            return True
+        allows_fn = getattr(target, "allows_scope", None)
+        if callable(allows_fn):
+            try:
+                return bool(allows_fn(self.scope))
+            except Exception as exc:
+                logger.debug(f"外部题库作用域判断异常: {exc}")
+                return False
+        return True
+
+    def query_result(
+        self, title: str, options: list[str], question_type
+    ) -> QuestionBankResult | None:
+        if (
+            type(self).query is not QuestionBankHelper.query
+            or "query" in self.__dict__
+        ):
+            try:
+                answer = self.query(title, options, question_type) or ""
+            except Exception as exc:
+                logger.debug(f"外部题库查询降级: {exc}")
+                return None
+            return QuestionBankResult(answer=str(answer), ai=False) if answer else None
         bank = self.get()
         if bank is None or not bank.enabled():
-            return ""
+            return None
+        if not self.allows_scope(bank):
+            return None
         try:
-            return bank.query(title, options, question_type) or ""
+            query_result_fn = getattr(bank, "query_result", None)
+            if callable(query_result_fn):
+                if self.scope:
+                    return query_result_fn(
+                        title, options, question_type, scope=self.scope
+                    )
+                return query_result_fn(title, options, question_type)
+            answer = bank.query(title, options, question_type) or ""
+            if not answer:
+                return None
+            return QuestionBankResult(answer=str(answer), ai=False)
         except Exception as exc:
             logger.debug(f"外部题库查询降级: {exc}")
-            return ""
+            return None
+
+    def query(self, title: str, options: list[str], question_type) -> str:
+        result = self.query_result(title, options, question_type)
+        return result.answer if result is not None else ""
 
     def log_stats(self) -> None:
         if self.client is None:

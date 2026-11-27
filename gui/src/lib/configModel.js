@@ -72,6 +72,35 @@ export function isNotificationConfigured(cfg) {
   return true;
 }
 
+export const QUESTION_BANK_SCOPES = [
+  { value: 'zhidao_homework', label: '知到作业' },
+  { value: 'zhidao_exam', label: '知到考试' },
+  { value: 'ai_homework', label: 'AI 作业' },
+  { value: 'ai_exam', label: 'AI 考试' },
+];
+
+const VALID_QUESTION_BANK_SCOPES = QUESTION_BANK_SCOPES.map((item) => item.value);
+export const DEFAULT_QUESTION_BANK_SCOPES = ['zhidao_exam', 'ai_exam'];
+
+export function normalizeQuestionBankScopes(raw) {
+  if (raw === undefined || raw === null) {
+    return [...DEFAULT_QUESTION_BANK_SCOPES];
+  }
+  let items;
+  if (typeof raw === 'string') {
+    items = raw
+      .split(/[\s,;]+/)
+      .map((s) => s.trim().toLowerCase())
+      .filter(Boolean);
+  } else if (Array.isArray(raw)) {
+    items = raw.map((s) => String(s || '').trim().toLowerCase());
+  } else {
+    return [...DEFAULT_QUESTION_BANK_SCOPES];
+  }
+  const allowed = new Set(items.filter((s) => VALID_QUESTION_BANK_SCOPES.includes(s)));
+  return VALID_QUESTION_BANK_SCOPES.filter((s) => allowed.has(s));
+}
+
 export function defaultLlmConfig() {
   return {
     provider: 'deepseek',
@@ -86,6 +115,7 @@ export function defaultLlmConfig() {
     streamIdleTimeout: 30,
     questionBankToken: '',
     questionBankUrl: 'https://tk.enncy.cn/query',
+    questionBankScopes: [...DEFAULT_QUESTION_BANK_SCOPES],
   };
 }
 
@@ -288,6 +318,12 @@ export function normalizeConfig(raw) {
     Number.isFinite(llmStreamIdleTimeout) && llmStreamIdleTimeout > 0
       ? llmStreamIdleTimeout
       : 30;
+  const rawBankScopes =
+    'questionBankScopes' in rawLlm
+      ? rawLlm.questionBankScopes
+      : 'question_bank_scopes' in rawLlm
+        ? rawLlm.question_bank_scopes
+        : undefined;
   const llm = {
     provider: llmProvider,
     apiFormat: llmApiFormat,
@@ -305,6 +341,7 @@ export function normalizeConfig(raw) {
     questionBankUrl:
       String(rawLlm.questionBankUrl ?? rawLlm.question_bank_url ?? '').trim() ||
       'https://tk.enncy.cn/query',
+    questionBankScopes: normalizeQuestionBankScopes(rawBankScopes),
   };
 
   return {

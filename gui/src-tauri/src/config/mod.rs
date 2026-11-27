@@ -204,6 +204,10 @@ mod tests {
                 stream_idle_timeout: 20.0,
                 question_bank_token: "bank-key".to_string(),
                 question_bank_url: "https://tk.example/query".to_string(),
+                question_bank_scopes: vec![
+                    "zhidao_homework".to_string(),
+                    "ai_exam".to_string(),
+                ],
             },
             ..Default::default()
         };
@@ -224,6 +228,10 @@ mod tests {
         assert_eq!(disk["stream_idle_timeout"], 20.0);
         assert_eq!(disk["question_bank_token"], "bank-key");
         assert_eq!(disk["question_bank_url"], "https://tk.example/query");
+        assert_eq!(
+            disk["question_bank_scopes"],
+            serde_json::json!(["zhidao_homework", "ai_exam"])
+        );
 
         fs::write(
             dir.join("data").join("llm.json"),
@@ -234,6 +242,10 @@ mod tests {
         assert_eq!(legacy.llm.provider, "openai");
         assert_eq!(legacy.llm.api_format, "openai");
         assert_eq!(legacy.llm.model, "gpt-4o-mini");
+        assert_eq!(
+            legacy.llm.question_bank_scopes,
+            vec!["zhidao_exam".to_string(), "ai_exam".to_string()]
+        );
 
         let _ = fs::remove_dir_all(&dir);
     }

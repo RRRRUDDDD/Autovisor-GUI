@@ -5,6 +5,11 @@ import Input from '../ui/Input';
 import Label from '../ui/Label';
 import NumberInput from '../ui/NumberInput';
 import Switch from '../ui/Switch';
+import {
+  DEFAULT_QUESTION_BANK_SCOPES,
+  QUESTION_BANK_SCOPES,
+  normalizeQuestionBankScopes,
+} from '../../lib/configModel';
 
 const MASTERY_PRESETS = [80, 90, 100];
 
@@ -26,6 +31,16 @@ export default function AnswerEnhancementCard({
   const [confirmClearCache, setConfirmClearCache] = useState(false);
 
   const showMasteryTarget = config.enableMastery !== false || config.enableExamApi !== false;
+  const activeBankScopes = normalizeQuestionBankScopes(
+    llm.questionBankScopes ?? DEFAULT_QUESTION_BANK_SCOPES
+  );
+
+  const toggleBankScope = (scopeValue) => {
+    const next = activeBankScopes.includes(scopeValue)
+      ? activeBankScopes.filter((item) => item !== scopeValue)
+      : normalizeQuestionBankScopes([...activeBankScopes, scopeValue]);
+    updateLlmField({ questionBankScopes: next });
+  };
 
   const handleTestQuestionBank = async () => {
     if (!onTestQuestionBank) return;
@@ -325,6 +340,34 @@ export default function AnswerEnhancementCard({
                 placeholder="https://tk.enncy.cn/query"
                 className="font-mono text-xs"
               />
+            </div>
+          </div>
+
+          <div className="space-y-1.5">
+            <Label>外部题库生效范围</Label>
+            <p className="text-[11px] leading-relaxed text-on-surface-variant">
+              默认仅在知到考试与 AI 考试启用，避免可重做的平时作业消耗付费题库次数
+            </p>
+            <div className="flex flex-wrap gap-1.5 pt-0.5">
+              {QUESTION_BANK_SCOPES.map((scope) => {
+                const active = activeBankScopes.includes(scope.value);
+                return (
+                  <button
+                    key={scope.value}
+                    type="button"
+                    aria-pressed={active}
+                    onClick={() => toggleBankScope(scope.value)}
+                    className={`inline-flex items-center gap-1 rounded-full px-3 py-1 text-xs font-medium transition-colors ease-m3 ${
+                      active
+                        ? 'bg-secondary-container text-on-secondary-container'
+                        : 'border border-outline/50 bg-transparent text-on-surface-variant hover:bg-on-surface/[0.06]'
+                    }`}
+                  >
+                    {active && <Check className="h-3 w-3" strokeWidth={2.8} />}
+                    {scope.label}
+                  </button>
+                );
+              })}
             </div>
           </div>
 

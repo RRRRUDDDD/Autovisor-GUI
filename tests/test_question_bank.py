@@ -2,8 +2,16 @@
 import unittest
 from unittest.mock import patch
 
+from modules import llm
 from modules import question_bank as qb
-from modules.exam_ctx import AiExamBase, build_answer_prompt
+from modules.exam_ctx import (
+    AiExamBase,
+    AiFormalExamCtx,
+    AiHomeworkCtx,
+    build_answer_prompt,
+    build_fill_prompt,
+)
+from modules.zhidao_exam_worker import ZhidaoExamWorker
 from modules.zhidao_homework_worker import ZhidaoHomeworkWorker, build_homework_prompt
 
 TOKEN = "test-token"
@@ -56,6 +64,7 @@ class _Session:
 
 class QuestionBankClientTests(unittest.TestCase):
     def _client(self, handler, token=TOKEN, **kwargs):
+        kwargs.setdefault("retry_delay", 0.0)
         session = _Session(handler)
         client = qb.QuestionBankClient(
             token=token, query_url="https://bank.example/query", session=session, **kwargs
@@ -323,6 +332,120 @@ class QuestionBankClientTests(unittest.TestCase):
             client = qb.QuestionBankClient.from_config()
         self.assertFalse(client.enabled())
         self.assertEqual(client.query_url, "https://tk.enncy.cn/query")
+        self.assertIsNone(client.scopes)
+
+    def test_retries_transient_network_5xx_and_json_errors_up_to_3_attempts(self):
+        for kind in ("network", "5xx", "json"):
+            with self.subTest(kind=kind):
+                attempts = {"n": 0}
+                sleeps = []
+
+                def handler(url, kwargs, mode=kind):
+                    if url.endswith("/info"):
+                        return _Response({"code": 1, "data": {"times": 10}})
+                    attempts["n"] += 1
+                    if attempts["n"] < 3:
+                        if mode == "network":
+                            return ConnectionError("transient")
+                        if mode == "5xx":
+                            return _Response({"error": "bad gateway"}, status=502)
+                        return _Response(ValueError("truncated json"))
+                    return _Response(
+                        {"code": 1, "data": {"answer": "正确答案#", "times": 9, "ai": False}}
+                    )
+
+                client, _ = self._client(
+                    handler, max_retries=3, retry_delay=0.1, sleep=sleeps.append
+                )
+                result = client.query_result("题目", ["A", "B"])
+                self.assertIsNotNone(result)
+                self.assertEqual(result.answer, "正确答案")
+                self.assertFalse(result.ai)
+                self.assertEqual(attempts["n"], 3)
+                self.assertEqual(sleeps, [0.1, 0.2])
+
+    def test_4xx_errors_do_not_retry(self):
+        attempts = {"n": 0}
+        sleeps = []
+
+        def handler(url, kwargs):
+            attempts["n"] += 1
+            return _Response({"code": 0}, status=401)
+
+        client, _ = self._client(
+            handler, max_retries=3, retry_delay=0.1, sleep=sleeps.append
+        )
+        res = client.probe()
+        self.assertFalse(res["ok"])
+        self.assertEqual(attempts["n"], 1)
+        self.assertEqual(sleeps, [])
+
+    def test_extract_answer_strips_trailing_hash_per_line_and_parses_ai_flag(self):
+        self.assertEqual(
+            qb._extract_answer("连续性#\n创新性#"),
+            "连续性\n创新性",
+        )
+        self.assertEqual(
+            qb._extract_answer("  答案一### \n#\n  答案二#  "),
+            "答案一\n答案二",
+        )
+
+        def handler(url, kwargs):
+            if url.endswith("/info"):
+                return _Response({"code": 1, "data": {"times": 8}})
+            return _Response(
+                {
+                    "code": 1,
+                    "data": {
+                        "answer": "选项A#\n选项B#",
+                        "times": 7,
+                        "ai": True,
+                    },
+                }
+            )
+
+        client, _ = self._client(handler)
+        result = client.query_result("多选题", ["选项A", "选项B"], 2)
+        self.assertIsNotNone(result)
+        self.assertEqual(result.answer, "选项A\n选项B")
+        self.assertTrue(result.ai)
+        self.assertEqual(result.source_label, "题库AI生成")
+
+    def test_scope_filtering_and_normalization(self):
+        self.assertEqual(
+            llm.normalize_conf({})["question_bank_scopes"],
+            ["zhidao_exam", "ai_exam"],
+        )
+        self.assertEqual(
+            llm.normalize_conf({"question_bank_scopes": []})["question_bank_scopes"],
+            [],
+        )
+        self.assertEqual(
+            llm.normalize_conf(
+                {"questionBankScopes": ["AI_HOMEWORK", "invalid", "zhidao_exam", "ai_homework"]}
+            )["question_bank_scopes"],
+            ["zhidao_exam", "ai_homework"],
+        )
+        self.assertEqual(
+            llm.normalize_conf({"question_bank_scopes": "zhidao_homework, ai_exam"})[
+                "question_bank_scopes"
+            ],
+            ["zhidao_homework", "ai_exam"],
+        )
+
+        def handler(url, kwargs):
+            if url.endswith("/info"):
+                return _Response({"code": 1, "data": {"times": 5}})
+            return _Response({"code": 1, "data": {"answer": "A", "times": 4, "ai": False}})
+
+        client, session = self._client(handler, scopes=["zhidao_exam", "ai_exam"])
+        self.assertIsNone(client.query("题目", ["A"], scope="zhidao_homework"))
+        self.assertIsNone(client.query("题目", ["A"], scope="ai_homework"))
+        self.assertEqual(session.calls, [])
+        self.assertEqual(client.stats(), (0, 0))
+
+        self.assertEqual(client.query("题目", ["A"], scope="zhidao_exam"), "A")
+        self.assertEqual(client.stats(), (1, 1))
 
 
 class BankReferenceInjectionTests(unittest.TestCase):
@@ -346,6 +469,30 @@ class BankReferenceInjectionTests(unittest.TestCase):
             1, "2 + 2 = ?", [{"id": 11, "content": "3"}], extra={}
         )
         self.assertNotIn("第三方题库参考", prompt)
+
+    def test_prompts_distinguish_database_and_ai_generated_sources(self):
+        hw_db = build_homework_prompt(
+            HOMEWORK_QUESTION, bank_reference="自西向东", bank_is_ai=False
+        )
+        hw_ai = build_homework_prompt(
+            HOMEWORK_QUESTION, bank_reference="自西向东", bank_is_ai=True
+        )
+        self.assertIn("题库数据库", hw_db)
+        self.assertNotIn("题库AI生成", hw_db)
+        self.assertIn("题库AI生成", hw_ai)
+
+        ex_db = build_answer_prompt(
+            1,
+            "2 + 2 = ?",
+            [{"id": 11, "content": "3"}, {"id": 12, "content": "4"}],
+            extra={"题库参考": "4", "题库AI生成": False},
+        )
+        ex_ai = build_fill_prompt(
+            "2 + 2 = ___",
+            extra={"题库参考": "4", "题库AI生成": True},
+        )
+        self.assertIn("题库数据库", ex_db)
+        self.assertIn("题库AI生成", ex_ai)
 
 
 class _FakeBank:
@@ -516,6 +663,7 @@ class HomeworkWorkerBankTests(unittest.TestCase):
                 token=secret_tok,
                 query_url=f"https://bank.example/query?token={secret_tok}",
                 session=_BoomSession(),
+                retry_delay=0.0,
             )
             res = client.probe()
         self.assertFalse(res["ok"])
@@ -534,6 +682,65 @@ class HomeworkWorkerBankTests(unittest.TestCase):
 
             owned_client.session.close = _track_close
         self.assertEqual(closed, [True])
+
+    def test_workers_and_exam_ctxs_enforce_question_bank_scopes_and_ai_label(self):
+        def handler(url, kwargs):
+            if url.endswith("/info"):
+                return _Response({"code": 1, "data": {"times": 10}})
+            return _Response(
+                {"code": 1, "data": {"answer": "自西向东#", "times": 9, "ai": True}}
+            )
+
+        session = _Session(handler)
+        scoped_client = qb.QuestionBankClient(
+            token=TOKEN,
+            query_url="https://bank.example/query",
+            session=session,
+            scopes=["zhidao_exam", "ai_exam"],
+            retry_delay=0.0,
+        )
+
+        # Homework workers / AI homework ctx skipped under exam-only scopes
+        hw_prompts = []
+        hw_worker = ZhidaoHomeworkWorker(
+            None,
+            course_id="course",
+            store=object(),
+            answerer=lambda p: (hw_prompts.append(p), '```answer\n[{"id": 21}]\n```')[1],
+            question_bank=scoped_client,
+            sleep=lambda _: None,
+        )
+        hw_worker._answer_question(HOMEWORK_QUESTION, None)
+        self.assertNotIn("第三方题库参考", hw_prompts[0])
+        self.assertEqual(session.calls, [])
+
+        ai_hw = AiHomeworkCtx(
+            _DummyApi(), "course", "k1", "t1", "p1", question_bank=scoped_client
+        )
+        self.assertEqual(ai_hw._bank_reference({"content": "题干"}, 1, []), "")
+        self.assertEqual(session.calls, [])
+
+        # Exam worker & AI formal exam ctx allowed and inject ai=True label
+        exam_prompts = []
+        exam_worker = ZhidaoExamWorker(
+            None,
+            course_id="course",
+            store=object(),
+            answerer=lambda p: (exam_prompts.append(p), '```answer\n[{"id": 21}]\n```')[1],
+            question_bank=scoped_client,
+            sleep=lambda _: None,
+        )
+        exam_worker._answer_question(HOMEWORK_QUESTION, None)
+        self.assertIn("题库AI生成", exam_prompts[0])
+        self.assertIn("自西向东", exam_prompts[0])
+        self.assertNotIn("自西向东#", exam_prompts[0])
+
+        ai_exam = AiFormalExamCtx(
+            _DummyApi(), "course", "k1", "t1", "p1", question_bank=scoped_client
+        )
+        extra = ai_exam._build_prompt_extra({"content": "题干"}, 1, [])
+        self.assertEqual(extra.get("题库参考"), "自西向东")
+        self.assertIs(extra.get("题库AI生成"), True)
 
 
 if __name__ == "__main__":

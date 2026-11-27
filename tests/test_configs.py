@@ -393,6 +393,7 @@ class EnsureConfigFilesTests(unittest.TestCase):
                 "auto_submit",
                 "model",
                 "provider",
+                "question_bank_scopes",
                 "question_bank_token",
                 "question_bank_url",
                 "stream_idle_timeout",
@@ -403,6 +404,7 @@ class EnsureConfigFilesTests(unittest.TestCase):
         self.assertEqual(data["api_key"], "")
         self.assertEqual(data["api_format"], "openai")
         self.assertEqual(data["provider"], "deepseek")
+        self.assertEqual(data["question_bank_scopes"], ["zhidao_exam", "ai_exam"])
         self.assertEqual(data["question_bank_token"], "")
         self.assertEqual(data["question_bank_url"], "https://tk.enncy.cn/query")
 

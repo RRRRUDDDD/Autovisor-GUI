@@ -442,6 +442,7 @@ LLM_TEMPLATE = {
     "stream_idle_timeout": 30,
     "question_bank_token": "",
     "question_bank_url": "https://tk.enncy.cn/query",
+    "question_bank_scopes": ["zhidao_exam", "ai_exam"],
 }
 
 DEFAULT_MIRRORS = {

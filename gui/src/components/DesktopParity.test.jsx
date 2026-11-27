@@ -223,6 +223,9 @@ describe('Desktop Parity features (Phases 1-6)', () => {
     fireEvent.click(screen.getByRole('checkbox', { name: /已作答保存的题目仍重新作答/ }));
     expect(cfg.forceRedoAnswered).toBe(true);
 
+    fireEvent.click(screen.getByRole('button', { name: '知到作业' }));
+    expect(cfg.llm.questionBankScopes).toEqual(['zhidao_homework', 'zhidao_exam', 'ai_exam']);
+
     fireEvent.change(screen.getByLabelText('作业达标得分率（%）'), {
       target: { value: '85' },
     });

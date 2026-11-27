@@ -75,6 +75,14 @@ _HTTP_STATUS_HINTS = {
     422: "请求参数校验失败",
 }
 
+QUESTION_BANK_SCOPES = (
+    "zhidao_homework",
+    "zhidao_exam",
+    "ai_homework",
+    "ai_exam",
+)
+DEFAULT_QUESTION_BANK_SCOPES = ["zhidao_exam", "ai_exam"]
+
 DEFAULT_CONF = {
     "provider": "deepseek",
     "api_format": "openai",
@@ -88,6 +96,7 @@ DEFAULT_CONF = {
     "stream_idle_timeout": DEFAULT_STREAM_IDLE_TIMEOUT,
     "question_bank_token": "",
     "question_bank_url": "https://tk.enncy.cn/query",
+    "question_bank_scopes": list(DEFAULT_QUESTION_BANK_SCOPES),
 }
 
 _LOCAL_HOSTS = {"localhost", "127.0.0.1", "::1", "0.0.0.0"}
@@ -313,6 +322,13 @@ def normalize_conf(raw: dict | None) -> dict:
     question_bank_url = str(
         src.get("question_bank_url") or src.get("questionBankUrl") or ""
     ).strip() or DEFAULT_CONF["question_bank_url"]
+    if "question_bank_scopes" in src:
+        raw_scopes = src.get("question_bank_scopes")
+    elif "questionBankScopes" in src:
+        raw_scopes = src.get("questionBankScopes")
+    else:
+        raw_scopes = None
+    question_bank_scopes = normalize_question_bank_scopes(raw_scopes)
     return {
         "provider": provider,
         "api_format": api_format,
@@ -326,6 +342,7 @@ def normalize_conf(raw: dict | None) -> dict:
         "stream_idle_timeout": stream_idle_timeout,
         "question_bank_token": question_bank_token,
         "question_bank_url": question_bank_url,
+        "question_bank_scopes": question_bank_scopes,
     }
 
 
@@ -364,12 +381,29 @@ def conf() -> dict:
     return _resolve_facade("_conf", _conf)()
 
 
+def normalize_question_bank_scopes(
+    raw, *, default: list[str] | tuple[str, ...] = DEFAULT_QUESTION_BANK_SCOPES
+) -> list[str]:
+    """归一化外部题库作用域列表；未提供时回退默认值，显式空列表保留为空。"""
+    if raw is None:
+        return list(default)
+    if isinstance(raw, str):
+        items = [part.strip().lower() for part in re.split(r"[\s,;]+", raw) if part.strip()]
+    elif isinstance(raw, (list, tuple, set, frozenset)):
+        items = [str(item or "").strip().lower() for item in raw]
+    else:
+        return list(default)
+    allowed = {item for item in items if item in QUESTION_BANK_SCOPES}
+    return [scope for scope in QUESTION_BANK_SCOPES if scope in allowed]
+
+
 def question_bank_conf() -> dict:
-    """返回外部题库的 token 与查询地址; token 为空表示未启用."""
+    """返回外部题库的 token、查询地址与生效作用域; token 为空表示未启用."""
     c = _resolve_facade("_conf", _conf)()
     return {
         "token": c.get("question_bank_token", ""),
         "url": c.get("question_bank_url", DEFAULT_CONF["question_bank_url"]),
+        "scopes": normalize_question_bank_scopes(c.get("question_bank_scopes")),
     }
 
 

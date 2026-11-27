@@ -31,6 +31,32 @@ fn default_question_bank_url() -> String {
     "https://tk.enncy.cn/query".to_string()
 }
 
+pub const QUESTION_BANK_SCOPES: &[&str] = &[
+    "zhidao_homework",
+    "zhidao_exam",
+    "ai_homework",
+    "ai_exam",
+];
+
+fn default_question_bank_scopes() -> Vec<String> {
+    vec!["zhidao_exam".to_string(), "ai_exam".to_string()]
+}
+
+fn normalize_question_bank_scopes(raw: &[String]) -> Vec<String> {
+    let mut allowed = std::collections::HashSet::new();
+    for item in raw {
+        let lowered = item.trim().to_ascii_lowercase();
+        if QUESTION_BANK_SCOPES.contains(&lowered.as_str()) {
+            allowed.insert(lowered);
+        }
+    }
+    QUESTION_BANK_SCOPES
+        .iter()
+        .filter(|scope| allowed.contains(**scope))
+        .map(|scope| (*scope).to_string())
+        .collect()
+}
+
 #[derive(Debug, Deserialize)]
 struct LlmFormatMeta {
     id: String,
@@ -172,6 +198,8 @@ pub struct LlmConfig {
     pub question_bank_token: String,
     #[serde(default = "default_question_bank_url", alias = "question_bank_url")]
     pub question_bank_url: String,
+    #[serde(default = "default_question_bank_scopes", alias = "question_bank_scopes")]
+    pub question_bank_scopes: Vec<String>,
 }
 
 impl Default for LlmConfig {
@@ -189,6 +217,7 @@ impl Default for LlmConfig {
             stream_idle_timeout: default_stream_idle_timeout(),
             question_bank_token: String::new(),
             question_bank_url: default_question_bank_url(),
+            question_bank_scopes: default_question_bank_scopes(),
         }
     }
 }
@@ -231,6 +260,7 @@ impl LlmConfig {
             stream_idle_timeout,
             question_bank_token: self.question_bank_token.trim().to_string(),
             question_bank_url: normalize_question_bank_url(&self.question_bank_url),
+            question_bank_scopes: normalize_question_bank_scopes(&self.question_bank_scopes),
         }
     }
 
@@ -249,6 +279,7 @@ impl LlmConfig {
             "stream_idle_timeout": norm.stream_idle_timeout,
             "question_bank_token": norm.question_bank_token,
             "question_bank_url": norm.question_bank_url,
+            "question_bank_scopes": norm.question_bank_scopes,
         })
     }
 }

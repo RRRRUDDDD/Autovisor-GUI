@@ -262,6 +262,7 @@ def build_homework_prompt(
     analysis: str = "",
     excluded: list[str] | None = None,
     bank_reference: str = "",
+    bank_is_ai: bool | None = None,
 ) -> str:
     qtype = question.get("type", 1)
     type_name = QUESTION_TYPE_NAMES.get(qtype, "single")
@@ -293,8 +294,14 @@ def build_homework_prompt(
     if analysis:
         lines.append("【历史AI解析】" + _plain(analysis))
     if bank_reference:
+        if bank_is_ai is True:
+            source_hint = "（来源：题库AI生成，仅供辅助参考，请结合题干重点核实）"
+        elif bank_is_ai is False:
+            source_hint = "（来源：题库数据库，请结合题干与选项核对后作答）"
+        else:
+            source_hint = ", 仅供参考, 请自行判断正确性"
         lines.append(
-            "【第三方题库参考】以下内容来自外部题库, 仅供参考, 请自行判断正确性："
+            f"【第三方题库参考】以下内容来自外部题库{source_hint}："
             + _plain(bank_reference)
         )
     if qtype == 3:
@@ -310,6 +317,8 @@ def build_homework_prompt(
 
 class ZhidaoHomeworkWorker:
     """知到作业答题 worker, 可注入 answerer 与 AI 解析源便于离线测试."""
+
+    question_bank_scope = "zhidao_homework"
 
     def __init__(
         self,
@@ -343,7 +352,9 @@ class ZhidaoHomeworkWorker:
         self.sleep = sleep
         api_client = getattr(api, "client", None)
         bank_proxy = getattr(api_client, "proxy", "") if api_client is not None else ""
-        self._bank_helper = QuestionBankHelper(question_bank, proxy=bank_proxy)
+        self._bank_helper = QuestionBankHelper(
+            question_bank, proxy=bank_proxy, scope=self.question_bank_scope
+        )
         self.cancel_event = cancel_event
         self._ai_user_id = None
         self._recruit_id = str(recruit_id or "")
@@ -411,10 +422,14 @@ class ZhidaoHomeworkWorker:
     def _get_question_bank(self):
         return self._bank_helper.get()
 
-    def _bank_reference(self, question: dict) -> str:
+    def _bank_result(self, question: dict):
         title = _plain(question.get("content"))
         options = [_plain(option.get("content")) for option in question.get("options") or []]
-        return self._bank_helper.query(title, options, question.get("type", 1))
+        return self._bank_helper.query_result(title, options, question.get("type", 1))
+
+    def _bank_reference(self, question: dict) -> str:
+        result = self._bank_result(question)
+        return result.answer if result is not None else ""
 
     def _log_bank_stats(self) -> None:
         self._bank_helper.log_stats()
@@ -463,7 +478,16 @@ class ZhidaoHomeworkWorker:
             raise ValueError(f"题目 {question.get('eid')} 没有可选项")
         if self._llm_disabled:
             return self._fallback_values(question), "随机"
-        bank_reference = self._bank_reference(question)
+        if (
+            type(self)._bank_reference is ZhidaoHomeworkWorker._bank_reference
+            and "_bank_reference" not in self.__dict__
+        ):
+            bank_res = self._bank_result(question)
+            bank_reference = bank_res.answer if bank_res is not None else ""
+            bank_is_ai = bank_res.ai if bank_res is not None else None
+        else:
+            bank_reference = self._bank_reference(question)
+            bank_is_ai = None
 
         if qtype in (1, 14):
             excluded = []
@@ -480,6 +504,7 @@ class ZhidaoHomeworkWorker:
                 analysis=analysis,
                 excluded=excluded,
                 bank_reference=bank_reference,
+                bank_is_ai=bank_is_ai,
             )
             excluded_set = set(excluded)
             for _attempt in range(ROLLBACK_RETRIES):
@@ -503,6 +528,7 @@ class ZhidaoHomeworkWorker:
             wrong_combos=combos,
             analysis=analysis,
             bank_reference=bank_reference,
+            bank_is_ai=bank_is_ai,
         )
         if qtype == 3:
             wrong_signatures = {tuple(combo) for combo in combos}
