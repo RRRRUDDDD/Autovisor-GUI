@@ -8,6 +8,7 @@ pub struct CourseItem {
     pub id: String,
     pub title: String,
     pub url: String,
+    #[serde(default)]
     pub enabled: bool,
     #[serde(default)]
     pub teacher: String,
@@ -336,6 +337,8 @@ pub fn merge_discovered_courses(
             if item.course_type.trim().is_empty() && !prev.course_type.trim().is_empty() {
                 item.course_type = prev.course_type.clone();
             }
+        } else {
+            item.enabled = false;
         }
         result.push(item);
     }

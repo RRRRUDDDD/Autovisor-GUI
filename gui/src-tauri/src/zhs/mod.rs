@@ -514,7 +514,7 @@ fn parse_backend_courses_response(resp: &Value) -> ApiCoursesResponse {
                 id: format!("auto-{}", short_hash(&url)),
                 title,
                 url,
-                enabled: true,
+                enabled: false,
                 teacher: get_string_field(map, &["teacher"]),
                 school: get_string_field(map, &["school"]),
                 progress: get_string_field(map, &["progress"]),
@@ -1370,6 +1370,8 @@ mod tests {
         assert_eq!(parsed.courses.len(), 2);
         assert_eq!(parsed.courses[0].course_type, "智慧共享课");
         assert_eq!(parsed.courses[1].course_type, "翻转 / 智慧课");
+        assert!(!parsed.courses[0].enabled);
+        assert!(!parsed.courses[1].enabled);
 
         let base = vec![
             PlaywrightCookie {

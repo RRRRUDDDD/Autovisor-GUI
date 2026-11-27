@@ -290,7 +290,7 @@ export function normalizeConfig(raw) {
           id: item.id || `course-${idx + 1}`,
           title: (item.title || '').trim() || inferCourseTitle(item.url.trim(), idx + 1),
           url: item.url.trim(),
-          enabled: item.enabled !== false,
+          enabled: item.enabled === true,
           teacher: String(item.teacher ?? ''),
           school: String(item.school ?? ''),
           progress: String(item.progress ?? ''),

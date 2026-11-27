@@ -94,6 +94,17 @@ describe('configModel', () => {
     expect(configSnapshot(a)).toBe(configSnapshot(b));
   });
 
+  it('defaults normalized courses to unchecked unless explicitly enabled', () => {
+    const cfg = normalizeConfig({
+      courses: [
+        { url: 'https://studyvideoh5.zhihuishu.com/stuStudy?id=1' },
+        { url: 'https://studyvideoh5.zhihuishu.com/stuStudy?id=2', enabled: true },
+        { url: 'https://studyvideoh5.zhihuishu.com/stuStudy?id=3', enabled: false },
+      ],
+    });
+    expect(cfg.courses.map((c) => c.enabled)).toEqual([false, true, false]);
+  });
+
   it('normalizes LLM quiz settings, mastery options, and preserves CLI QR fields', () => {
     expect(isValidLlmApiBase('')).toBe(true);
     expect(isValidLlmApiBase('https://api.deepseek.com')).toBe(true);

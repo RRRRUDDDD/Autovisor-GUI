@@ -41,7 +41,7 @@ describe('App UI flows', () => {
     expect(screen.queryByText(/Autovisor v/i)).toBeNull();
     expect(screen.getByText('高等数学（上）')).toBeTruthy();
     expect(screen.getByText('人工智能导论')).toBeTruthy();
-    expect(screen.getByText(/已选 2 \/ 共 2/)).toBeTruthy();
+    expect(screen.getByText(/已选 0 \/ 共 2/)).toBeTruthy();
     expect(screen.getByText('复习模式（刷习惯分）')).toBeTruthy();
     expect(screen.getByText('刷课任务完成后自动关机')).toBeTruthy();
     expect(screen.queryByText('AI 智慧课自动刷掌握度')).toBeNull();

@@ -267,6 +267,17 @@ mod tests {
                 auto_detected: true,
             },
             CourseItem {
+                id: "old-2".into(),
+                title: "已选课程".into(),
+                url: "https://studyvideoh5.zhihuishu.com/stuStudy?recruitAndCourseId=ccc".into(),
+                enabled: true,
+                teacher: String::new(),
+                school: String::new(),
+                progress: "20%".into(),
+                course_type: String::new(),
+                auto_detected: true,
+            },
+            CourseItem {
                 id: "manual-1".into(),
                 title: "手动课程".into(),
                 url: "https://wisdom-mooc.zhihuishu.com/play/custom".into(),
@@ -301,18 +312,31 @@ mod tests {
                 course_type: "融合共享课".into(),
                 auto_detected: true,
             },
+            CourseItem {
+                id: "new-3".into(),
+                title: "线性代数".into(),
+                url: "https://studyvideoh5.zhihuishu.com/stuStudy?recruitAndCourseId=ccc".into(),
+                enabled: false,
+                teacher: "赵老师".into(),
+                school: "复旦大学".into(),
+                progress: "30%".into(),
+                course_type: "智慧共享课".into(),
+                auto_detected: true,
+            },
         ];
 
         let merged = merge_discovered_courses(&existing, discovered);
-        assert_eq!(merged.len(), 3);
+        assert_eq!(merged.len(), 4);
         assert_eq!(merged[0].id, "old-1");
         assert_eq!(merged[0].title, "高等数学");
         assert!(!merged[0].enabled);
         assert_eq!(merged[0].progress, "65%");
         assert_eq!(merged[1].title, "大学英语");
-        assert!(merged[1].enabled);
-        assert_eq!(merged[2].id, "manual-1");
-        assert!(!merged[2].auto_detected);
+        assert!(!merged[1].enabled);
+        assert_eq!(merged[2].id, "old-2");
+        assert!(merged[2].enabled);
+        assert_eq!(merged[3].id, "manual-1");
+        assert!(!merged[3].auto_detected);
     }
 
     #[test]
