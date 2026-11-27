@@ -1,12 +1,12 @@
 # encoding=utf-8
-"""统一验证码路由器：自顶向下编排易盾滑块、腾讯滑块与腾讯点选，彻底消除模块间循环导入。"""
+"""统一验证码路由器：自顶向下编排易盾滑块、易盾VLM点选、腾讯滑块与腾讯点选，彻底消除模块间循环导入。"""
 from __future__ import annotations
 
 from types import ModuleType
 
 from playwright.async_api import Page, TimeoutError
 
-from modules import click_captcha, slider, tencent_slider
+from modules import click_captcha, slider, tencent_slider, yidun_click
 from modules.logger import Logger
 
 logger = Logger()
@@ -31,6 +31,8 @@ async def captcha_visible(page: Page) -> bool:
 
 async def resolve_slider_target(page: Page):
     """返回 (provider, target)；易盾与腾讯滑块都未出现时返回 (None, None)。"""
+    if await yidun_click.resolve_yidun_click_target(page) is not None:
+        return None, None
     target = await slider.resolve_captcha_target(page)
     if target is not None:
         return "yidun", target
@@ -54,16 +56,16 @@ async def describe_other_mode(page: Page) -> str | None:
 
 async def solve_slider_captcha(
     page: Page,
-    modules: list[ModuleType],
+    modules: list[ModuleType] | None,
     appear_timeout_ms: int = slider.LOGIN_APPEAR_TIMEOUT_MS,
     max_attempts: int = slider.MAX_ATTEMPTS,
 ) -> bool:
-    """统一入口：等待并解决易盾或腾讯滑块验证。"""
-    np_mod, cv2_mod = modules
-    if not cv2_mod or not np_mod:
-        logger.warn("OpenCV或Numpy导入失败,无法开启自动滑块验证.")
-        return False
+    """统一入口：等待并解决易盾（滑块/VLM点选）或腾讯滑块验证。"""
+    click_attempts = min(max(1, int(max_attempts)), yidun_click.MAX_ATTEMPTS)
+    if await yidun_click.resolve_yidun_click_target(page) is not None:
+        return await yidun_click.solve_yidun_click(page, max_attempts=click_attempts)
 
+    np_mod, cv2_mod = modules if modules and len(modules) >= 2 else (None, None)
     provider, target = await resolve_slider_target(page)
     if target is None:
         label = await describe_other_mode(page)
@@ -78,6 +80,10 @@ async def solve_slider_captcha(
             )
         except TimeoutError:
             return False
+        if await yidun_click.resolve_yidun_click_target(page) is not None:
+            return await yidun_click.solve_yidun_click(
+                page, max_attempts=click_attempts
+            )
         provider, target = await resolve_slider_target(page)
         if target is None:
             label = await describe_other_mode(page)
@@ -87,6 +93,10 @@ async def solve_slider_captcha(
                 )
                 logger.event("滑块验证", 结果="不支持", 类型=label)
             return False
+
+    if not cv2_mod or not np_mod:
+        logger.warn("OpenCV或Numpy导入失败,无法开启自动滑块验证.")
+        return False
 
     if provider == "tencent":
         return await tencent_slider.solve_tencent_slider(
@@ -102,10 +112,13 @@ async def solve_any_captcha(
     appear_timeout_ms: int = slider.IN_COURSE_APPEAR_TIMEOUT_MS,
     max_attempts: int = slider.MAX_ATTEMPTS,
 ) -> bool:
-    """按优先级自动路由点选验证码与滑块验证码。"""
+    """按优先级自动路由点选验证码（腾讯/易盾VLM）与滑块验证码。"""
     if await click_captcha.resolve_click_captcha_target(page) is not None:
         if await click_captcha.solve_click_captcha(page, modules, attempts=max_attempts):
             return True
+    if await yidun_click.resolve_yidun_click_target(page) is not None:
+        click_attempts = min(max(1, int(max_attempts)), yidun_click.MAX_ATTEMPTS)
+        return await yidun_click.solve_yidun_click(page, max_attempts=click_attempts)
     return await solve_slider_captcha(
         page,
         modules,
