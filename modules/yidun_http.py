@@ -12,7 +12,8 @@ import json
 import math
 import random
 import re
-from typing import Any, Callable, Literal
+from typing import Any, Literal
+from collections.abc import Callable
 import urllib.parse
 
 import httpx

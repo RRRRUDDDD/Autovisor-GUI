@@ -34,7 +34,7 @@ class GenTrackTests(unittest.TestCase):
     def assert_valid_track(self, distance, track):
         self.assertGreaterEqual(len(track), 10)
         self.assertAlmostEqual(sum(step[0] for step in track), distance, places=6)
-        for dx, dy, delay in track:
+        for _dx, dy, delay in track:
             self.assertTrue(delay >= 6.0)
             self.assertLessEqual(abs(dy), 1.2)
         # 末端过冲后必然出现回拉, 否则不像真人拖动。

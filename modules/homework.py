@@ -9,23 +9,17 @@
 """
 import asyncio
 import hashlib
-import re
 import time
 
 from modules import llm
-from modules.answer_parser import (
-    letters_to_indexes as _letters_to_indexes,
-    parse_vision_answer,
-)
+from modules.answer_parser import parse_vision_answer
 from modules.logger import Logger
 from modules.quiz_dom import (
     JS_CLICK_OPTION,
-    JS_CLICK_TEXT,
     JS_FILL_CONTAINER as JS_FILL,
     JS_OPTION_CHECKED,
     click_button_by_text,
 )
-from modules.text_utils import strip_think_tags as _strip_think
 
 logger = Logger()
 
@@ -498,7 +492,8 @@ async def _try_zhidao_api(page, config, params: dict) -> dict:
     page_context = getattr(page, "context", None)
     if enable_http_captcha and not get_session_fp(page_context):
         await probe_fp_from_page(page, context=page_context)
-    fp_provider = lambda ctx=page_context: get_session_fp(ctx)
+    def fp_provider(ctx=page_context):
+        return get_session_fp(ctx)
     store = AiQuestionStore()
     course_id = params.get("courseId", "")
 

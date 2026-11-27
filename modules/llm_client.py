@@ -545,17 +545,17 @@ def _consume_openai_stream(
                 )
             try:
                 kind, payload = chunks.get(timeout=min(remaining, idle_timeout))
-            except queue.Empty:
+            except queue.Empty as exc:
                 stop_event.set()
                 _close_once()
                 # 剩余总时长小于 idle 时, 等待期间可能刚好越过总超时线.
                 if time.monotonic() >= deadline:
                     raise RuntimeError(
                         f"流式响应超时: 总时长超过 {float(total_timeout):g} 秒"
-                    )
+                    ) from exc
                 raise RuntimeError(
                     f"流式响应超时: {float(idle_timeout):g} 秒内未收到新数据"
-                )
+                ) from exc
             if kind == "heartbeat":
                 continue
             if kind == "chunk":

@@ -137,12 +137,13 @@ class SaveCredentialsTests(unittest.TestCase):
             file.write(text)
 
     def _read(self, encoding="utf-8"):
-        with open(self.config_path, "r", encoding=encoding) as file:
+        with open(self.config_path, encoding=encoding) as file:
             return file.read()
 
     def test_fills_empty_fields_and_keeps_comments(self):
         self._write(
-            "[user-account]\n;配置账号密码，留空则打开网页后需手动登录\nusername =\npassword =\n\n[browser-option]\n;配置浏览器\ndriver = Edge\n"
+            "[user-account]\n;配置账号密码，留空则打开网页后需手动登录\nusername =\npassword =\n\n"
+            "[browser-option]\n;配置浏览器\ndriver = Edge\n"
         )
         self.assertTrue(
             Autovisor.save_credentials_to_config(self.config_path, "13800000000", "secret")

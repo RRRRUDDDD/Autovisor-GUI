@@ -1,6 +1,4 @@
 # encoding=utf-8
-import asyncio
-import json
 import threading
 import unittest
 from types import SimpleNamespace

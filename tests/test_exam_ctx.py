@@ -642,7 +642,12 @@ class ExamRunnerReferenceTests(unittest.TestCase):
                     return {"examTestId": "e1", "paperId": "p1", "highMasteryScore": 100, "masteryScore": 0}
                 if knowledge_id == "k-zero":
                     # highMasteryScore == 0 时不得回退 masteryScore == 100
-                    return {"examTestId": "e2", "paperId": "p2", "highMasteryScore": 0 if n == 1 else 100, "masteryScore": 100}
+                    return {
+                        "examTestId": "e2",
+                        "paperId": "p2",
+                        "highMasteryScore": 0 if n == 1 else 100,
+                        "masteryScore": 100,
+                    }
                 return {"examTestId": "e3", "paperId": "p3", "masteryScore": 100}
 
             def list_knowledge_resources(self, *_args):

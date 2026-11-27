@@ -340,7 +340,7 @@ class QuestionBankClientTests(unittest.TestCase):
                 attempts = {"n": 0}
                 sleeps = []
 
-                def handler(url, kwargs, mode=kind):
+                def handler(url, kwargs, mode=kind, attempts=attempts):
                     if url.endswith("/info"):
                         return _Response({"code": 1, "data": {"times": 10}})
                     attempts["n"] += 1

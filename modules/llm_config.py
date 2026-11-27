@@ -27,7 +27,7 @@ def _load_provider_catalog() -> dict:
     """从共享 resources/llm_providers.json 加载三端统一的厂商与协议元数据。"""
     path = get_resource_path("resources", "llm_providers.json")
     try:
-        with open(path, "r", encoding="utf-8-sig") as f:
+        with open(path, encoding="utf-8-sig") as f:
             data = json.load(f)
         if isinstance(data, dict) and isinstance(data.get("providers"), list):
             return data
@@ -355,7 +355,7 @@ def _conf():
         # 与启动时 ensure_config_files 的生成位置保持一致(运行根目录/data)
         path = os.path.join(logger.runtime_root, "data", "llm.json")
         if os.path.isfile(path):
-            with open(path, "r", encoding="utf-8-sig") as f:
+            with open(path, encoding="utf-8-sig") as f:
                 loaded = json.load(f)
                 if isinstance(loaded, dict):
                     raw = loaded

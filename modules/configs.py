@@ -72,7 +72,9 @@ class Config:
             self.log_max_size_mb = self._safe_get_int('script-option', 'log_max_size_mb', 10, min_value=1)
             self.log_retention_days = self._safe_get_int('script-option', 'log_retention_days', 14, min_value=0)
             self.log_max_files = self._safe_get_int('script-option', 'log_max_files', 200, min_value=1)
-            self.log_compress_after_days = self._safe_get_int('script-option', 'log_compress_after_days', 3, min_value=0)
+            self.log_compress_after_days = self._safe_get_int(
+                'script-option', 'log_compress_after_days', 3, min_value=0
+            )
             # 远程消息推送选项(可选配置段；未显式配置时默认启用 Windows 系统通知)
             has_provider_option = self._config.has_option('notification', 'provider')
             raw_provider = self._config.get('notification', 'provider', raw=True, fallback='').strip()
@@ -196,7 +198,7 @@ class Config:
         if not os.path.isfile(mirrors_path):
             raise ConfigError(f"未找到镜像配置文件: {mirrors_path}")
         try:
-            with open(mirrors_path, "r", encoding="utf-8-sig") as file:
+            with open(mirrors_path, encoding="utf-8-sig") as file:
                 mirrors = json.load(file)
         except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
             raise ConfigError(f"镜像配置文件无效: {mirrors_path}") from error
@@ -502,7 +504,7 @@ def ensure_config_files(config_path: str) -> list:
         if name == "mirrors.json":
             bundled = _bundled_resource_file("mirrors.json")
             if bundled:
-                with open(bundled, "r", encoding="utf-8-sig") as src, open(
+                with open(bundled, encoding="utf-8-sig") as src, open(
                     path, "w", encoding="utf-8", newline="\n"
                 ) as dst:
                     dst.write(src.read())

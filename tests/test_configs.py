@@ -391,9 +391,9 @@ class EnsureConfigFilesTests(unittest.TestCase):
             file.write('{"api_key": "mine"}')
         created = ensure_config_files(config_path)
         self.assertEqual([os.path.basename(path) for path in created], ["mirrors.json"])
-        with open(config_path, "r", encoding="utf-8") as file:
+        with open(config_path, encoding="utf-8") as file:
             self.assertEqual(file.read(), custom)
-        with open(llm_path, "r", encoding="utf-8") as file:
+        with open(llm_path, encoding="utf-8") as file:
             self.assertEqual(json.load(file), {"api_key": "mine"})
 
     def test_generated_config_is_loadable_by_config(self):

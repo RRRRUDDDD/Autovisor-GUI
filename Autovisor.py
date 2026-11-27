@@ -11,7 +11,8 @@ configure_stdio()
 
 from playwright.async_api import TimeoutError, async_playwright
 
-from modules import homework, installer, quiz_page, updater
+from modules import homework  # noqa: F401
+from modules import installer, quiz_page, updater
 from modules.ai_smart import (  # noqa: F401
     complete_resources_for_node,
     is_ai_smart_url,
@@ -201,7 +202,7 @@ async def _main_impl(
 ) -> bool:
     global COOKIE_PATH
     if cancel_event is not None:
-        setattr(config, "_cancel_event", cancel_event)
+        config._cancel_event = cancel_event
     COOKIE_PATH = get_runtime_path("data", "cookies.json")
     ctx = RunContext(
         cookie_path=COOKIE_PATH,
@@ -686,7 +687,11 @@ def cli() -> int:
             include_argv=True,
         )
         installer.validate_python_version()
-        base_dir = os.path.dirname(sys.executable) if getattr(sys, "frozen", False) else os.path.dirname(os.path.abspath(__file__))
+        base_dir = (
+            os.path.dirname(sys.executable)
+            if getattr(sys, "frozen", False)
+            else os.path.dirname(os.path.abspath(__file__))
+        )
         default_config_name = "config.macos.ini" if sys.platform == "darwin" else "config.ini"
         config_path = args.config or os.path.join(base_dir, default_config_name)
         mirrors_path = os.path.join(base_dir, "data", "mirrors.json")

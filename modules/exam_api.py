@@ -439,7 +439,7 @@ class ExamApi:
     def close(self) -> None:
         self.client.close()
 
-    def __enter__(self) -> "ExamApi":
+    def __enter__(self) -> ExamApi:
         return self
 
     def __exit__(self, exc_type, exc, tb) -> None:

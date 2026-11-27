@@ -391,7 +391,8 @@ async def _run_zhidao_assessment_with_client(
     page_context = getattr(page, "context", None)
     if enable_http_captcha and not get_session_fp(page_context):
         await probe_fp_from_page(page, context=page_context)
-    fp_provider = lambda ctx=page_context: get_session_fp(ctx)
+    def fp_provider(ctx=page_context):
+        return get_session_fp(ctx)
     cancel_event = resolve_cancel_event(config)
     store = AiQuestionStore()
     if not qp_mod.llm.enabled():
@@ -525,13 +526,15 @@ async def _run_zhidao_assessment_with_client(
                     item_name=exam_name,
                     item_url=item_url,
                     start_log=f"[{idx}/{total_hw}] 开始作答知到作业: {exam_name}",
-                    run_fn=lambda r=item_recruit, c=item_course, e=exam_id, s=stu_exam_id, sc=item_school: hw_worker.run(
-                        recruit_id=r,
-                        course_id=c,
-                        homework_id=e,
-                        stu_exam_id=s,
-                        exam_id=e,
-                        school_id=str(sc or ""),
+                    run_fn=lambda r=item_recruit, c=item_course, e=exam_id, s=stu_exam_id, sc=item_school: (
+                        hw_worker.run(
+                            recruit_id=r,
+                            course_id=c,
+                            homework_id=e,
+                            stu_exam_id=s,
+                            exam_id=e,
+                            school_id=str(sc or ""),
+                        )
                     ),
                     check_locked=False,
                     include_score=True,
@@ -613,6 +616,23 @@ async def _run_zhidao_assessment_with_client(
                     course_id=item_course,
                     school_id=item_school,
                 )
+                def _run_exam(
+                    r=item_recruit,
+                    c=item_course,
+                    e=exam_id,
+                    s=stu_exam_id,
+                    sc=item_school,
+                    n=exam_name,
+                ):
+                    return exam_worker.run(
+                        recruit_id=r,
+                        course_id=c,
+                        exam_id=e,
+                        student_exam_id=s,
+                        school_id=str(sc or ""),
+                        exam_name=n,
+                    )
+
                 await _execute_assessment_item(
                     page=page,
                     client=client,
@@ -627,14 +647,7 @@ async def _run_zhidao_assessment_with_client(
                     item_name=exam_name,
                     item_url=exam_url,
                     start_log=f"[{idx}/{total_ex}] 接管进行中的正式考试: {exam_name}",
-                    run_fn=lambda r=item_recruit, c=item_course, e=exam_id, s=stu_exam_id, sc=item_school, n=exam_name: exam_worker.run(
-                        recruit_id=r,
-                        course_id=c,
-                        exam_id=e,
-                        student_exam_id=s,
-                        school_id=str(sc or ""),
-                        exam_name=n,
-                    ),
+                    run_fn=_run_exam,
                     check_locked=True,
                     include_score=False,
                 )

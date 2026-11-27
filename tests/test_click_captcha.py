@@ -7,8 +7,8 @@ PACKAGES = ROOT / "packages"
 if PACKAGES.exists():
     sys.path.insert(0, str(PACKAGES))
 
-from modules.click_captcha import _load_font, find_click_point, parse_click_instruction
-from modules.tasks import VERIFICATION_SELECTORS
+from modules.click_captcha import _load_font, find_click_point, parse_click_instruction  # noqa: E402
+from modules.tasks import VERIFICATION_SELECTORS  # noqa: E402
 
 try:
     import cv2

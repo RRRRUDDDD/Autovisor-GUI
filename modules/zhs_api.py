@@ -140,7 +140,7 @@ def extract_caslogc_info(cookies) -> dict:
                     break
             else:
                 if getattr(cookie, "name", None) == "CASLOGC" and getattr(cookie, "value", None):
-                    raw = str(getattr(cookie, "value"))
+                    raw = str(cookie.value)
                     break
     if not raw:
         return {}
@@ -244,7 +244,7 @@ class ZhsApiClient:
                 except Exception:
                     pass
 
-    def __enter__(self) -> "ZhsApiClient":
+    def __enter__(self) -> ZhsApiClient:
         return self
 
     def __exit__(self, exc_type, exc, tb) -> None:

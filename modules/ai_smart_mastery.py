@@ -13,23 +13,20 @@
 第 2 轮就能全对.
 """
 import asyncio
-import difflib
 import json
 import re
 import time
 from pathlib import Path
 
-from playwright.async_api import Locator, Page
+from playwright.async_api import Page
 
 from modules.answer_parser import parse_reference_answer_text as parse_answer_text
 from modules.exam_api import is_free_exam, normalize_free_exam
 from modules.text_utils import (
     brief as _text_brief,
     cache_key,
-    loose_key,
     normalize_text,
     parse_percent as _parse_percent_shared,
-    similarity,
 )
 
 QUESTION_ITEM = ".question-item"
@@ -362,7 +359,7 @@ async def pick_options(
             continue
         locator = page.locator(selector).nth(index)
         clicked = False
-        for attempt in range(3):
+        for _attempt in range(3):
             try:
                 await locator.click(timeout=6000)
                 clicked = True
@@ -962,7 +959,8 @@ async def enumerate_nodes(page: Page, course_url: str, timeout_ms: int = 40_000)
             return
         collected[url] = text
 
-    handler = lambda response: asyncio.ensure_future(on_response(response))
+    def handler(response):
+        asyncio.ensure_future(on_response(response))
     page.on("response", handler)
     try:
         await page.goto(course_url, wait_until="domcontentloaded")

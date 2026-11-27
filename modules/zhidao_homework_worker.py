@@ -3,22 +3,17 @@
 from __future__ import annotations
 
 import inspect
-import json
 import random
 import re
 import threading
 import time
 
 from modules import llm
-from modules.answer_parser import (
-    parse_homework_answer,
-    parse_json_list as _load_json_list,
-)
+from modules.answer_parser import parse_homework_answer
 from modules.answer_service import LlmCircuitBreaker, QuestionBankHelper
 from modules.answer_store import AiQuestionStore, option_hash
 from modules.html_utils import extract_plain_text, has_meaningful_image
 from modules.logger import Logger
-from modules.question_bank import QuestionBankClient
 from modules.yidun_fp import get_session_fp, is_valid_fp, normalize_fp
 from modules.yidun_http import (
     DEFAULT_ZHIDAO_REFERER,
@@ -425,7 +420,7 @@ class ZhidaoHomeworkWorker:
     def close(self) -> None:
         self._bank_helper.close()
 
-    def __enter__(self) -> "ZhidaoHomeworkWorker":
+    def __enter__(self) -> ZhidaoHomeworkWorker:
         return self
 
     def __exit__(self, exc_type, exc, tb) -> None:

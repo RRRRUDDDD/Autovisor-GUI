@@ -291,7 +291,7 @@ def save_credentials_to_config(config_path: str, username: str, password: str) -
     used_encoding = "utf-8"
     for encoding in ("utf-8-sig", "gbk"):
         try:
-            with open(config_path, "r", encoding=encoding) as file:
+            with open(config_path, encoding=encoding) as file:
                 raw = file.read()
             # utf-8-sig 仅用于剥离 BOM, 回写统一用 utf-8, 避免给原文件追加 BOM
             used_encoding = "utf-8" if encoding == "utf-8-sig" else encoding

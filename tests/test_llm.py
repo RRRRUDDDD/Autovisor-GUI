@@ -4,6 +4,8 @@ import time
 import unittest
 from unittest.mock import MagicMock, patch
 
+import requests
+
 from modules import llm
 
 PAGE_TEXT = "在线测验页面文本，包含多道题目和选项。" * 5
@@ -899,7 +901,8 @@ class OpenAiStreamTests(unittest.TestCase):
         # raw_decode handles surrounding braces before and after JSON
         messy = (
             "说明 {这里有花括号干扰} 如下：\n"
-            '{"questions": [{"index": 1, "question": "1+1=?", "options": ["1", "2"], "type": "single", "answer": [1]}]}\n'
+            '{"questions": [{"index": 1, "question": "1+1=?", "options": ["1", "2"], '
+            '"type": "single", "answer": [1]}]}\n'
             "结尾补充 {另一个花括号}"
         )
         qs = llm._parse_quiz_questions(messy)

@@ -103,7 +103,7 @@ class QuestionBankHelper:
                     pass
             self.owns_client = False
 
-    def __enter__(self) -> "QuestionBankHelper":
+    def __enter__(self) -> QuestionBankHelper:
         return self
 
     def __exit__(self, exc_type, exc, tb) -> None:

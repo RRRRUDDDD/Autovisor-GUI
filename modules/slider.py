@@ -8,12 +8,11 @@ from types import ModuleType
 from playwright.async_api import Page, TimeoutError
 
 from modules.captcha_common import (
-    FAILURE_WORDS,
+    FAILURE_WORDS,  # noqa: F401  兼容导出供测试与外部调用方复用
     decode_image_bytes,
     drag_element_horizontally,
     fetch_image_bytes,
-    gen_track,
-    get_mouse as _mouse,
+    gen_track,  # noqa: F401  兼容导出供测试与外部调用方复用
     image_to_display_point,
     is_failure_tip,
     iter_targets,

@@ -183,7 +183,7 @@ class AiExamBase(ABC):
                 pass
         self._bank_helper.close()
 
-    def __enter__(self) -> "AiExamBase":
+    def __enter__(self) -> AiExamBase:
         return self
 
     def __exit__(self, exc_type, exc, tb) -> None:
@@ -382,8 +382,8 @@ class AiExamBase(ABC):
                 ],
                 fail_log_prefix="答题",
             )
-        except ValueError:
-            raise ValueError("AI 未给出可用的选项 id")
+        except ValueError as exc:
+            raise ValueError("AI 未给出可用的选项 id") from exc
         self._last_ai_provider = name
         logger.debug(f"{name} 给出有效选项: {ids}")
         return ids
@@ -407,8 +407,8 @@ class AiExamBase(ABC):
                 ],
                 fail_log_prefix="填空作答",
             )
-        except ValueError:
-            raise ValueError("AI 未给出有效的填空答案")
+        except ValueError as exc:
+            raise ValueError("AI 未给出有效的填空答案") from exc
         self._last_ai_provider = name
         return cleaned
 
@@ -813,7 +813,7 @@ class AiFormalExamCtx(AiExamBase):
         answer_bank: AnswerBank | None = None,
         question_bank=None,
         cancel_event: threading.Event | None = None,
-    ) -> "AiFormalExamCtx":
+    ) -> AiFormalExamCtx:
         def pick(*keys):
             for key in keys:
                 value = task.get(key)

@@ -218,7 +218,7 @@ class QuestionBankClient:
                     pass
             self._owns_session = False
 
-    def __enter__(self) -> "QuestionBankClient":
+    def __enter__(self) -> QuestionBankClient:
         return self
 
     def __exit__(self, exc_type, exc, tb) -> None:

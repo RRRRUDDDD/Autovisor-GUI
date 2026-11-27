@@ -228,7 +228,7 @@ class YidunFpCollector:
     def attached(self) -> bool:
         return self._attached
 
-    def attach(self) -> "YidunFpCollector":
+    def attach(self) -> YidunFpCollector:
         if self._attached:
             return self
         target = None

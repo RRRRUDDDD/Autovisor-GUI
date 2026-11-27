@@ -1,4 +1,3 @@
-import json
 import shutil
 import tempfile
 import unittest
@@ -8,7 +7,6 @@ import requests
 
 from modules.exam_ctx import (
     EXAM_OPEN,
-    EXAM_QUESTION,
     EXAM_SUBMIT,
     FORMAL_ANSWER_SHEET,
     FORMAL_OPEN_DETAIL,

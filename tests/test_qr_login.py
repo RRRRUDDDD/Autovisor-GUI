@@ -277,7 +277,7 @@ class QrLoginTests(unittest.TestCase):
                 confirmed = mgr.poll(sid, cookie_path=cookie_file)
                 self.assertEqual(confirmed, {"status": "confirmed", "cookieCount": 1})
                 self.assertTrue(os.path.isfile(cookie_file))
-                with open(cookie_file, "r", encoding="utf-8") as f:
+                with open(cookie_file, encoding="utf-8") as f:
                     saved_cookies = json.load(f)
                 self.assertEqual(len(saved_cookies), 1)
                 self.assertEqual(saved_cookies[0]["name"], "CASLOGC")
