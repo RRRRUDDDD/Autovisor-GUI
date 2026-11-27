@@ -26,6 +26,7 @@ from modules.zhidao_homework_api import (
     extract_homework_list,
     extract_score,
     format_student_answer,
+    iter_answer_info_items,
 )
 from modules.zhs_api import ZhsApiError
 
@@ -211,22 +212,21 @@ def should_redo_submitted(
 
 
 def answer_info_by_question_id(payload) -> dict[str, dict]:
-    """把 getStuAnswerInfo 的条目按数字 questionId 建索引."""
+    """把 getStuAnswerInfo 的条目按数字 questionId 建索引.
+
+    同时兼容真实接口 ``rt={questionId: entry_dict}`` 映射与列表结构。
+    """
     if not isinstance(payload, dict):
         return {}
-    entries = payload.get("rt")
-    if isinstance(entries, dict):
-        entries = (
-            entries.get("questionDtos")
-            or entries.get("stuAnswerInfos")
-            or entries.get("questions")
-            or entries.get("answerInfos")
-        )
     result: dict[str, dict] = {}
-    for entry in entries or []:
-        if not isinstance(entry, dict):
-            continue
-        key = str(entry.get("questionId") or entry.get("id") or entry.get("eid") or "")
+    for fallback_key, entry in iter_answer_info_items(payload):
+        key = str(
+            entry.get("questionId")
+            or fallback_key
+            or entry.get("id")
+            or entry.get("eid")
+            or ""
+        )
         if key:
             result[key] = entry
     return result
@@ -237,7 +237,7 @@ def _entry_flag(entry: dict | None, *keys) -> bool:
         return False
     for key in keys:
         value = entry.get(key)
-        if value is not None:
+        if value is not None and str(value).strip() != "":
             return str(value).strip().lower() in {"1", "true", "yes", "y"}
     return False
 
@@ -784,17 +784,22 @@ class ZhidaoHomeworkWorker:
                 continue
             looked_item = looked.get(question_id)
             entry = info.get(question_id) or (info.get(eid) if eid else None)
-            correct = _entry_flag(entry, "isRight", "isCorrect", "correct")
+            correct = _entry_flag(entry, "isRight", "isCorrect", "isCurrent", "correct")
             if not correct and looked_item is not None:
-                correct = _entry_flag(looked_item.get("raw"), "isRight", "isCorrect")
+                correct = _entry_flag(
+                    looked_item.get("raw"), "isRight", "isCorrect", "isCurrent"
+                )
             answer_text = _entry_answer(entry) or (
                 _entry_answer(looked_item.get("raw")) if looked_item else ""
             )
+            qtype = question.get("type", 1)
             correct_options = []
             if looked_item is not None:
                 correct_options = correct_option_ids(looked_item.get("raw") or {})
             if not correct_options and row:
                 correct_options = row.get("correct_options") or []
+            if correct and not correct_options and answer_text:
+                correct_options = _split_user_answer(answer_text, qtype)
 
             if correct:
                 self.store.mark_correct(
@@ -806,7 +811,6 @@ class ZhidaoHomeworkWorker:
                 )
                 continue
 
-            qtype = question.get("type", 1)
             wrong = _split_user_answer(answer_text, qtype)
             if wrong:
                 self.store.record_wrong(
@@ -1164,6 +1168,24 @@ class ZhidaoHomeworkWorker:
                 logger.info(
                     f"作业得分 {stats['score']}/{total_score:g} 已达标, 停止重做."
                 )
+                if not self._is_cancelled():
+                    try:
+                        review = self._review(
+                            recruit_id=recruit_id,
+                            course_id=course_id,
+                            homework_id=homework_id,
+                            stu_exam_id=stu_exam_id,
+                            exam_key=exam_key,
+                            school_id=school_id,
+                            questions=questions,
+                        )
+                        self._apply_review(
+                            questions, review, exam_key, course_id=course_id
+                        )
+                    except Exception as exc:
+                        logger.warn(
+                            f"作业达标后复查写入题库失败(不影响已达标结果): {exc}"
+                        )
                 return stats
 
             review = self._review(

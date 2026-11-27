@@ -207,6 +207,38 @@ class ReviewTests(unittest.TestCase):
         self.assertFalse(review["90001"]["correct"])
         self.assertEqual(review["90001"]["user_answer"], "11")
 
+    def test_parse_review_supports_real_rt_dict_mapping_and_is_current(self):
+        looked = {
+            "rt": {
+                "examBase": {
+                    "workExamParts": [
+                        {
+                            "questionDtos": [
+                                {"id": 90101, "name": "单选", "questionOptions": [{"id": 101, "content": "A"}]},
+                                {"id": 90102, "name": "错题", "questionOptions": [{"id": 201, "content": "B"}]},
+                                {"id": 90103, "name": "未判", "questionOptions": [{"id": 301, "content": "C"}]},
+                            ]
+                        }
+                    ]
+                }
+            }
+        }
+        info = {
+            "status": "200",
+            "rt": {
+                "90101": {"questionId": 90101, "answer": "101", "isCurrent": "1"},
+                "90102": {"questionId": 90102, "answer": "201", "isCurrent": "0"},
+                "90103": {"answer": "301", "isCurrent": ""},
+            },
+        }
+        review = parse_review(looked, info)
+        self.assertTrue(review["90101"]["correct"])
+        self.assertEqual(review["90101"]["user_answer"], "101")
+        self.assertFalse(review["90102"]["correct"])
+        self.assertEqual(review["90102"]["user_answer"], "201")
+        self.assertFalse(review["90103"]["correct"])
+        self.assertEqual(review["90103"]["user_answer"], "301")
+
 
 class AnswerFormatTests(unittest.TestCase):
     def test_format_student_answer(self):
@@ -423,6 +455,45 @@ class CourseMetaAndHelpersTests(unittest.TestCase):
             },
         )
         self.assertEqual(extract_course_meta(None), {})
+
+    def test_extract_course_meta_skips_zero_and_empty_course_id(self):
+        from modules.zhidao_homework_api import extract_course_meta
+
+        # courseInfo.courseId 为 0 时回退顶层正整数 courseId
+        meta1 = extract_course_meta(
+            {
+                "data": {
+                    "recruitId": 100,
+                    "courseId": 20001,
+                    "courseInfo": {"courseId": 0, "name": "课程A"},
+                }
+            }
+        )
+        self.assertEqual(meta1["courseId"], "20001")
+
+        # 顶层为 0 且 courseInfo 为正整数时取 courseInfo
+        meta2 = extract_course_meta(
+            {
+                "data": {
+                    "recruitId": 100,
+                    "courseId": 0,
+                    "courseInfo": {"courseId": 30002, "name": "课程B"},
+                }
+            }
+        )
+        self.assertEqual(meta2["courseId"], "30002")
+
+        # 全为 0 或空串时返回 ""
+        meta3 = extract_course_meta(
+            {
+                "data": {
+                    "recruitId": 100,
+                    "courseId": "",
+                    "courseInfo": {"courseId": 0, "name": "课程C"},
+                }
+            }
+        )
+        self.assertEqual(meta3["courseId"], "")
 
     def test_build_exam_page_url_and_time_window(self):
         from datetime import datetime

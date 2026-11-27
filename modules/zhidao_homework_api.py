@@ -78,6 +78,22 @@ def build_exam_page_url(
     )
 
 
+def _pick_positive_id(*candidates) -> str:
+    """优先返回第一个正整数 ID 的字符串形式; 忽略 None/空串/0/负数."""
+    for raw in candidates:
+        if raw is None or isinstance(raw, bool):
+            continue
+        text = str(raw).strip()
+        if not text:
+            continue
+        try:
+            if int(text) > 0:
+                return text
+        except ValueError:
+            return text
+    return ""
+
+
 def extract_course_meta(payload) -> dict:
     """从 studyservice queryCourse 响应提取 recruitId / courseId / schoolId / courseName."""
     if not isinstance(payload, dict):
@@ -89,12 +105,12 @@ def extract_course_meta(payload) -> dict:
     if not isinstance(info, dict):
         info = {}
     recruit_id = data.get("recruitId")
-    course_id = info.get("courseId") if info.get("courseId") is not None else data.get("courseId")
+    course_id = _pick_positive_id(info.get("courseId"), data.get("courseId"))
     school_id = data.get("schoolId") if data.get("schoolId") is not None else info.get("schoolId")
     course_name = info.get("name") or info.get("courseName") or data.get("courseName") or ""
     return {
         "recruitId": "" if recruit_id is None else str(recruit_id).strip(),
-        "courseId": "" if course_id is None else str(course_id).strip(),
+        "courseId": course_id,
         "schoolId": "" if school_id is None else str(school_id).strip(),
         "courseName": str(course_name).strip(),
         "courseMode": info.get("courseMode"),
@@ -267,6 +283,42 @@ def _question_key(question: dict) -> str:
     return question.get("eid") or question.get("question_id") or ""
 
 
+_ANSWER_INFO_LIST_KEYS = ("questionDtos", "stuAnswerInfos", "questions", "answerInfos")
+
+
+def _first_present(mapping: dict | None, *keys):
+    if not isinstance(mapping, dict):
+        return None
+    for key in keys:
+        value = mapping.get(key)
+        if value is not None and str(value).strip() != "":
+            return value
+    return None
+
+
+def iter_answer_info_items(answer_info) -> list[tuple[str, dict]]:
+    """展开 getStuAnswerInfo 响应为 (fallback_key, entry_dict) 列表.
+
+    同时兼容真实接口 ``rt={questionId: entry_dict}`` 字典映射，以及历史/测试中的列表包装结构。
+    """
+    raw = answer_info
+    if isinstance(raw, dict):
+        raw = raw.get("rt")
+    if isinstance(raw, dict):
+        for list_key in _ANSWER_INFO_LIST_KEYS:
+            wrapped = raw.get(list_key)
+            if isinstance(wrapped, list):
+                return [("", entry) for entry in wrapped if isinstance(entry, dict)]
+        return [
+            (str(raw_key).strip(), entry)
+            for raw_key, entry in raw.items()
+            if isinstance(entry, dict)
+        ]
+    if isinstance(raw, list):
+        return [("", entry) for entry in raw if isinstance(entry, dict)]
+    return []
+
+
 def parse_review(payload, answer_info=None) -> dict[str, dict]:
     """合并 lookHomework 与 getStuAnswerInfo.
 
@@ -282,9 +334,9 @@ def parse_review(payload, answer_info=None) -> dict[str, dict]:
         user = dto.get("userAnswerVo")
         if not isinstance(user, dict):
             user = {}
-        correct_flag = dto.get(
-            "isCorrect", dto.get("isRight", user.get("isCorrect", user.get("isRight")))
-        )
+        correct_flag = _first_present(dto, "isCorrect", "isRight", "isCurrent")
+        if correct_flag is None:
+            correct_flag = _first_present(user, "isCorrect", "isRight", "isCurrent")
         user_answer = user.get("answer") or dto.get("userAnswer") or dto.get("stuAnswer")
         if isinstance(user_answer, list):
             user_answer = ",".join(str(item) for item in user_answer)
@@ -294,27 +346,24 @@ def parse_review(payload, answer_info=None) -> dict[str, dict]:
             "user_answer": str(user_answer or ""),
         }
 
-    entries = answer_info
-    if isinstance(entries, dict):
-        entries = entries.get("rt")
-        if isinstance(entries, dict):
-            entries = (
-                entries.get("questionDtos")
-                or entries.get("stuAnswerInfos")
-                or entries.get("questions")
-            )
-    for entry in entries or []:
-        if not isinstance(entry, dict):
-            continue
-        key = str(entry.get("eid") or entry.get("questionId") or entry.get("id") or "")
+    for fallback_key, entry in iter_answer_info_items(answer_info):
+        key = str(
+            entry.get("eid")
+            or entry.get("questionId")
+            or fallback_key
+            or entry.get("id")
+            or ""
+        )
         if not key:
             continue
         item = review.setdefault(
             key, {"correct": False, "correct_options": [], "user_answer": ""}
         )
-        item["correct"] = _flag(
-            entry.get("isRight", entry.get("isCorrect", entry.get("correct", item["correct"])))
-        )
+        entry_correct = _first_present(entry, "isRight", "isCorrect", "isCurrent", "correct")
+        if entry_correct is not None:
+            item["correct"] = _flag(entry_correct)
+        elif any(k in entry for k in ("isRight", "isCorrect", "isCurrent", "correct")):
+            item["correct"] = False
         if entry.get("correctOptions") and not item["correct_options"]:
             item["correct_options"] = correct_option_ids(entry)
         user_answer = entry.get("userAnswer") or entry.get("answer")

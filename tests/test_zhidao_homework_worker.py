@@ -278,8 +278,8 @@ class HomeworkWorkerLifecycleTests(unittest.TestCase):
 
         self.assertEqual(api.do_calls, 2)
         self.assertEqual(api.submit_calls, 2)
-        self.assertEqual(api.look_calls, 1)
-        self.assertEqual(api.info_calls, 1)
+        self.assertEqual(api.look_calls, 2)
+        self.assertEqual(api.info_calls, 2)
         self.assertEqual(api.tran_calls, 1)
 
         # 首轮三题走 LLM, 次轮只重答错题 (多选命中题库)
@@ -407,7 +407,7 @@ class HomeworkWorkerLifecycleTests(unittest.TestCase):
 
         self.assertTrue(stats["target_reached"])
         self.assertEqual(stats["rounds"], 2)
-        self.assertEqual(api.info_question_ids, [["90001"]])
+        self.assertEqual(api.info_question_ids, [["90001"], ["90001"]])
         self.assertEqual(analysis.analyze_calls, [("90001", "777", "C1", "R1")])
         # 次轮使用桥接后的数字 question_id 带来的解析与错误组合
         self.assertIn("【错误选择方式】", answerer.prompts[1])
@@ -440,7 +440,123 @@ class HomeworkWorkerLifecycleTests(unittest.TestCase):
         self.assertTrue(stats["target_reached"])
         self.assertEqual(stats["rounds"], 1)
         self.assertEqual(api.submit_calls, 1)
-        self.assertEqual(api.look_calls, 0)
+        self.assertEqual(api.look_calls, 1)
+
+    def test_first_round_reached_caches_real_dict_is_current_without_correct_options(self):
+        payload = _payload(
+            _dto("enc_single", 1, "真实单选", [(101, "甲"), (102, "乙")]),
+            _dto("enc_fill", 3, "真实填空"),
+        )
+
+        class RealDictReviewApi(FakeHomeworkApi):
+            def look_homework(self, **kwargs):
+                self.look_calls += 1
+                # 真实 lookHomework 仅返回数字 id 且隐藏 correctOptions
+                return {
+                    "status": "200",
+                    "rt": {
+                        "examBase": {
+                            "workExamParts": [
+                                {
+                                    "questionDtos": [
+                                        {
+                                            "id": 91001,
+                                            "name": "真实单选",
+                                            "questionType": {"id": 1},
+                                            "questionOptions": [
+                                                {"id": 101, "content": "甲"},
+                                                {"id": 102, "content": "乙"},
+                                            ],
+                                        },
+                                        {
+                                            "id": 91002,
+                                            "name": "真实填空",
+                                            "questionType": {"id": 3},
+                                            "questionOptions": [],
+                                        },
+                                    ]
+                                }
+                            ]
+                        }
+                    },
+                }
+
+            def get_stu_answer_info(self, **kwargs):
+                self.info_calls += 1
+                return {
+                    "status": "200",
+                    "rt": {
+                        "91001": {
+                            "questionId": 91001,
+                            "answer": "101",
+                            "isCurrent": "1",
+                        },
+                        "91002": {
+                            "questionId": 91002,
+                            "answer": "答案A/答案B",
+                            "isCurrent": "1",
+                        },
+                    },
+                }
+
+        api = RealDictReviewApi(payload, [100])
+        answerer = ScriptedAnswerer([_ids(101), _fills("答案A", "答案B")])
+        worker = self._worker(api, answerer, None, target_score=100)
+        stats = worker.run(
+            recruit_id="R1",
+            course_id="C1",
+            homework_id="H_REAL",
+            stu_exam_id="S_REAL",
+            exam_id="E_REAL",
+        )
+
+        self.assertTrue(stats["target_reached"])
+        self.assertEqual(stats["rounds"], 1)
+        self.assertEqual(api.look_calls, 1)
+        self.assertEqual(api.info_calls, 1)
+        row_single = self.store.get_by_id("C1", "91001", "E_REAL")
+        row_fill = self.store.get_by_id("C1", "91002", "E_REAL")
+        self.assertEqual(row_single["correct_options"], ["101"])
+        self.assertEqual(row_fill["correct_options"], ["答案A", "答案B"])
+
+    def test_first_round_reached_ignores_review_exception(self):
+        payload = _payload(_dto("q_ok", 1, "一次过", [(1, "A"), (2, "B")]))
+
+        class BrokenReviewApi(FakeHomeworkApi):
+            def look_homework(self, **kwargs):
+                self.look_calls += 1
+                raise RuntimeError("review network glitch")
+
+        api = BrokenReviewApi(payload, [100])
+        answerer = ScriptedAnswerer([_ids(1)])
+        worker = self._worker(api, answerer, None, target_score=60)
+        stats = worker.run(
+            recruit_id="R1",
+            course_id="C1",
+            homework_id="H_ERR",
+            stu_exam_id="S_ERR",
+            exam_id="E_ERR",
+        )
+        self.assertTrue(stats["target_reached"])
+        self.assertEqual(stats["score"], 100.0)
+        self.assertEqual(api.look_calls, 1)
+
+    def test_do_homework_captcha_minus_12_propagates(self):
+        from modules.zhs_api import CaptchaRequiredError
+
+        class CaptchaApi(FakeHomeworkApi):
+            def do_homework(self, **kwargs):
+                raise CaptchaRequiredError("接口要求验证码(code=-12)")
+
+        worker = self._worker(CaptchaApi(self.payload, []), ScriptedAnswerer([]), None)
+        with self.assertRaises(CaptchaRequiredError):
+            worker.run(
+                recruit_id="R1",
+                course_id="C1",
+                homework_id="H1",
+                stu_exam_id="S1",
+                exam_id="E1",
+            )
 
     def test_fill_cache_hits_without_llm(self):
         api = FakeHomeworkApi(_payload(_dto("f1", 3, "默写填空")), [])
