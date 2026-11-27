@@ -969,6 +969,113 @@ class CourseFetcherTests(unittest.TestCase):
         self.assertEqual(len(result), 1)
         self.assertEqual(result[0].title, "高等数学")
 
+    def test_classify_wenda_study_resource_and_dedupe_hike_preferring_file_id(self):
+        wenda_url = "https://wenda.zhihuishu.com/stu/courseInfo/studyResource?courseId=11559973&polymas=1"
+        bare_hike = "https://hike.zhihuishu.com/aidedteaching/sourceLearning/sourceLearning?courseId=11559973"
+        full_hike = "https://hike.zhihuishu.com/aidedteaching/sourceLearning/sourceLearning?courseId=11559973&fileId=35338435"
+
+        self.assertEqual(classify_course_url(wenda_url), "翻转 / 智慧课")
+        self.assertIsNone(classify_course_url("https://wenda.zhihuishu.com/question/123"))
+
+        merged = dedupe_courses(
+            [
+                FetchedCourse(title="2026秋大学物理B-2_802", url=wenda_url, course_type="翻转 / 智慧课", teacher="郭娟"),
+                FetchedCourse(title="翻转 / 智慧课", url=bare_hike, course_type="翻转 / 智慧课"),
+                FetchedCourse(title="2026秋大学物理B-2_802", url=full_hike, course_type="翻转 / 智慧课", progress="20%"),
+            ]
+        )
+        self.assertEqual(len(merged), 1)
+        self.assertEqual(merged[0].url, full_hike)
+        self.assertEqual(merged[0].teacher, "郭娟")
+        self.assertEqual(merged[0].progress, "20%")
+
+    def test_fetch_courses_via_api_enriches_hike_course_with_file_id(self):
+        import threading
+        from urllib.parse import quote
+        from requests.cookies import RequestsCookieJar, create_cookie
+        from modules.course_fetcher import (
+            AI_COURSE_LIST_URL,
+            HIKE_COURSE_LIST_URL,
+            LOGIN_USER_INFO_URL,
+            SHARE_COURSE_LIST_URL,
+            fetch_courses_via_api,
+        )
+        from modules.hike_navigation import HIKE_RESOURCE_MENU_TREE_URL
+        from modules.zhs_api import ZhsApiClient
+
+        class _FakeResp:
+            def __init__(self, payload, status_code=200):
+                self._payload = payload
+                self.status_code = status_code
+
+            def json(self):
+                return self._payload
+
+        class _HikeTreeSession:
+            def __init__(self):
+                self.cookies = RequestsCookieJar()
+                self.cookies.set_cookie(
+                    create_cookie("CASLOGC", quote(json.dumps({"uuid": "u-phys"})), domain=".zhihuishu.com")
+                )
+
+            def get(self, url, params=None, headers=None, timeout=None):
+                if url == LOGIN_USER_INFO_URL:
+                    return _FakeResp({"code": 200, "result": {"uuid": "u-phys", "realName": "测试生"}})
+                if url == HIKE_COURSE_LIST_URL:
+                    return _FakeResp(
+                        {
+                            "code": 200,
+                            "result": {
+                                "startInngcourseList": [
+                                    {"courseId": 11559973, "courseName": "2026秋大学物理B-2_802", "studyRate": "20"}
+                                ]
+                            },
+                        }
+                    )
+                if url == HIKE_RESOURCE_MENU_TREE_URL:
+                    return _FakeResp(
+                        {
+                            "status": 200,
+                            "rt": [
+                                {
+                                    "id": 1,
+                                    "type": 0,
+                                    "childList": [
+                                        {"id": 999, "type": 1, "dataType": 1, "name": "1.静电场.pdf"},
+                                        {
+                                            "id": 35338435,
+                                            "type": 1,
+                                            "dataType": 3,
+                                            "name": "矢量运算与常用坐标系",
+                                            "totalTime": 769,
+                                            "studyTime": 0,
+                                        },
+                                    ],
+                                }
+                            ],
+                        }
+                    )
+                return _FakeResp({}, status_code=404)
+
+            def post(self, url, data=None, headers=None, timeout=None):
+                if url == SHARE_COURSE_LIST_URL:
+                    return _FakeResp({"code": 200, "result": {"totalCount": 0, "courseOpenDtos": []}})
+                if url == AI_COURSE_LIST_URL:
+                    return _FakeResp({"status": "200", "rt": []})
+                return _FakeResp({}, status_code=404)
+
+        client = ZhsApiClient([])
+        client.session = _HikeTreeSession()
+        client.lock = threading.RLock()
+
+        res = fetch_courses_via_api([], client=client)
+        self.assertEqual(res.sources["hike"], 1)
+        self.assertEqual(len(res.courses), 1)
+        self.assertEqual(
+            res.courses[0].url,
+            "https://hike.zhihuishu.com/aidedteaching/sourceLearning/sourceLearning?courseId=11559973&fileId=35338435",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

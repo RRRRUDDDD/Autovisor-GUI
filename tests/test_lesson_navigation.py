@@ -51,6 +51,14 @@ class LessonNavigationTests(unittest.TestCase):
         self.assertTrue(FUSION_CATALOG.needs_expand)
         self.assertFalse(WISDOM_CATALOG.handles_ai_exercise)
 
+    def test_hike_catalog_matches_video_items_and_uses_file_name_title(self):
+        self.assertEqual(HIKE_CATALOG.name, "hike")
+        self.assertIn(".file-item:has(.icon-video)", HIKE_CATALOG.item)
+        self.assertIn(".file-name", HIKE_CATALOG.title)
+        self.assertEqual(HIKE_CATALOG.finish, ".icon-finish")
+        self.assertEqual(HIKE_CATALOG.active_class, "active")
+        self.assertIsNone(HIKE_CATALOG.progress)
+
     def test_progress_parser_clamps_and_rejects_non_finite_values(self):
         cases = {
             None: 0,

@@ -17,6 +17,9 @@ describe('configModel', () => {
     expect(detectCourseType('https://studyvideoh5.zhihuishu.com/stuStudy?recruitAndCourseId=abc').key).toBe('shared');
     expect(detectCourseType('https://fusioncourseh5.zhihuishu.com/stuStudy?id=1').key).toBe('fusion');
     expect(detectCourseType('https://studywisdomh5.zhihuishu.com/course').key).toBe('hike');
+    expect(
+      detectCourseType('https://wenda.zhihuishu.com/stu/courseInfo/studyResource?courseId=11559973&polymas=1').key
+    ).toBe('hike');
     expect(detectCourseType('https://wisdom-mooc.zhihuishu.com/play/123').key).toBe('ai-mooc');
     expect(detectCourseType('https://ai-smart-course-student-pro.zhihuishu.com/learnPage?courseId=1').key).toBe('ai-smart');
     expect(

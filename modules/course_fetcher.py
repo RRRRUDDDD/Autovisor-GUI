@@ -12,6 +12,13 @@ from urllib.parse import urlparse
 
 import requests
 
+from modules.hike_navigation import (
+    build_hike_play_url,
+    fetch_hike_file_id_via_api,
+    needs_hike_file_id_resolution,
+    parse_hike_course_url,
+)
+
 STUDENT_HOME_URL = "https://onlineweb.zhihuishu.com/onlinestuh5"
 SHARE_COURSE_LIST_URL = (
     "https://onlineservice-api.zhihuishu.com/gateway/t/v1/student/course/share/"
@@ -195,6 +202,11 @@ def classify_course_url(url: str) -> str | None:
             return "知到考试"
         if "/testdetail/" in lower_full:
             return "AI 测试详情"
+        if (
+            (host == "wenda.zhihuishu.com" or host.endswith(".wenda.zhihuishu.com"))
+            and "/stu/courseinfo/studyresource" in (parsed.path or "").lower()
+        ):
+            return "翻转 / 智慧课"
     for target_host, label in COURSE_HOST_LABELS:
         if host == target_host or host.endswith("." + target_host):
             return label
@@ -367,7 +379,8 @@ def _build_course_from_dict(
             or "hike" in pc_url_lower
         )
         if course_id and is_hike:
-            url = f"https://hike.zhihuishu.com/aidedteaching/sourceLearning/sourceLearning?courseId={course_id}"
+            file_id = _pick_str(obj, ("fileId", "lastStudyFileId", "lastFileId"))
+            url = build_hike_play_url(course_id, file_id)
 
     course_type = classify_course_url(url)
     if not course_type:
@@ -585,19 +598,21 @@ def extract_courses_from_captured(
 
 
 def dedupe_courses(courses: list[FetchedCourse]) -> list[FetchedCourse]:
-    """按课程 URL 去重，保留元数据更完整的一项。"""
-    by_url: dict[str, FetchedCourse] = {}
+    """按课程 URL 去重（同一翻转课按 courseId 归并并优先保留带 fileId 的播放页），保留元数据更完整的一项。"""
+    by_key: dict[str, FetchedCourse] = {}
     order: list[str] = []
     for item in courses:
         url = normalize_course_url(item.url)
         course_type = classify_course_url(url)
         if not course_type:
             continue
+        hike_info = parse_hike_course_url(url)
+        dedupe_key = f"hike:{hike_info['courseId']}" if hike_info else url
         title = item.title.strip()
         if _is_generic_title(title):
             title = item.course_type or course_type
-        if url not in by_url:
-            by_url[url] = FetchedCourse(
+        if dedupe_key not in by_key:
+            by_key[dedupe_key] = FetchedCourse(
                 title=title or course_type,
                 url=url,
                 course_type=item.course_type or course_type,
@@ -605,9 +620,13 @@ def dedupe_courses(courses: list[FetchedCourse]) -> list[FetchedCourse]:
                 school=item.school.strip(),
                 progress=item.progress.strip(),
             )
-            order.append(url)
+            order.append(dedupe_key)
         else:
-            prev = by_url[url]
+            prev = by_key[dedupe_key]
+            if hike_info and hike_info.get("fileId"):
+                prev_hike = parse_hike_course_url(prev.url)
+                if not prev_hike.get("fileId"):
+                    prev.url = url
             if _is_generic_title(prev.title) and not _is_generic_title(item.title):
                 prev.title = item.title.strip()
             if not prev.teacher and item.teacher.strip():
@@ -616,7 +635,7 @@ def dedupe_courses(courses: list[FetchedCourse]) -> list[FetchedCourse]:
                 prev.school = item.school.strip()
             if not prev.progress and item.progress.strip():
                 prev.progress = item.progress.strip()
-    return [by_url[u] for u in order]
+    return [by_key[k] for k in order]
 
 
 def save_fetched_courses(courses: list[FetchedCourse], output_path: str) -> str:
@@ -1023,6 +1042,26 @@ def _fetch_hike_courses_api(
                         {"startInngcourseList": items},
                         source_url=HIKE_COURSE_LIST_URL,
                     )
+                    study_sso_state = {"refreshed": False}
+                    for course in courses:
+                        if not needs_hike_file_id_resolution(course.url):
+                            continue
+                        info = parse_hike_course_url(course.url)
+                        cid = info.get("courseId", "")
+                        if not cid:
+                            continue
+                        fid = fetch_hike_file_id_via_api(
+                            client,
+                            cid,
+                            uuid=uuid,
+                            own_client=own_client,
+                            sso_state=study_sso_state,
+                            logger=logger,
+                        )
+                        if fid:
+                            course.url = build_hike_play_url(
+                                cid, fid, task_id=info.get("taskId", "")
+                            )
             return valid, courses
     except Exception as exc:
         if logger:

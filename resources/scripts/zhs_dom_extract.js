@@ -9,7 +9,8 @@
       || l.includes('studywisdomh5.zhihuishu.com')
       || l.includes('wisdom-mooc.zhihuishu.com')
       || l.includes('ai-smart-course-student-pro.zhihuishu.com')
-      || l.includes('hike.zhihuishu.com');
+      || l.includes('hike.zhihuishu.com')
+      || l.includes('wenda.zhihuishu.com/stu/courseinfo/studyresource');
   };
   const normUrl = (u) => {
     let s = String(u || '').trim();
@@ -109,6 +110,10 @@
       const isHike = parentLower.includes('startinng') || parentLower.includes('hike') || parentLower.includes('aided') || parentLower.includes('schoolcourse') || parentLower.includes('creditcourse') || val.courseNature != null || val.aidedTeaching != null || String(val.pcUrl || '').toLowerCase().includes('hike');
       if (isHike) {
         finalUrl = 'https://hike.zhihuishu.com/aidedteaching/sourceLearning/sourceLearning?courseId=' + encodeURIComponent(String(val.courseId).trim());
+        const fid = val.fileId || val.lastStudyFileId || val.lastFileId || '';
+        if (fid && String(fid).trim() && String(fid).trim() !== '0') {
+          finalUrl += '&fileId=' + encodeURIComponent(String(fid).trim());
+        }
       }
     }
 

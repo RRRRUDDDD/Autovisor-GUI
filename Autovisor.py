@@ -52,6 +52,12 @@ from modules.course_runner import (
     run_course,
 )
 from modules.diagnostics import check_browser, check_course
+from modules.hike_navigation import (
+    is_hike_404_page,
+    needs_hike_file_id_resolution,
+    parse_hike_course_url,
+    resolve_hike_playback_url,
+)
 from modules.exam_ctx import AiFormalExamCtx, ExamApi, ExamRunner  # noqa: F401
 from modules.logger import Logger
 from modules.notifier import Notifier
@@ -289,12 +295,21 @@ async def _main_impl(
                     课程总数=course_total,
                     课程地址=course_url,
                 )
-                logger.info("正在加载播放页...")
-                try:
-                    await page.goto(course_url, wait_until="domcontentloaded", timeout=30000)
-                except TimeoutError:
-                    logger.warn("播放页加载较慢，继续等待目录渲染...", shift=True)
-                await page.wait_for_timeout(2000)
+                if needs_hike_file_id_resolution(course_url):
+                    course_url = await resolve_hike_playback_url(
+                        page,
+                        course_url,
+                        config=config,
+                        logger=logger,
+                    )
+                    logger.context(课程地址=course_url)
+                if "login" not in str(getattr(page, "url", "") or "").lower():
+                    logger.info("正在加载播放页...")
+                    try:
+                        await page.goto(course_url, wait_until="domcontentloaded", timeout=30000)
+                    except TimeoutError:
+                        logger.warn("播放页加载较慢，继续等待目录渲染...", shift=True)
+                    await page.wait_for_timeout(2000)
                 if "login" in page.url:
                     logger.warn(
                         "播放页跳转到登录页, 当前登录状态已失效, 正在重新登录.",
@@ -312,12 +327,42 @@ async def _main_impl(
                     await ensure_login(context, page, None, config, modules, ctx=ctx)
                     if should_hide_window(config):
                         await hide_window(page)
+                    if needs_hike_file_id_resolution(course_url):
+                        course_url = await resolve_hike_playback_url(
+                            page,
+                            course_url,
+                            config=config,
+                            logger=logger,
+                        )
+                        logger.context(课程地址=course_url)
                     logger.info("重新进入播放页...")
                     try:
                         await page.goto(course_url, wait_until="domcontentloaded", timeout=30000)
                     except TimeoutError:
                         logger.warn("播放页加载较慢，继续等待目录渲染...", shift=True)
                     await page.wait_for_timeout(2000)
+                if parse_hike_course_url(course_url) and await is_hike_404_page(page):
+                    logger.warn(
+                        "检测到翻转/智慧课播放页 404，正在重新定位有效视频地址...",
+                        shift=True,
+                    )
+                    recovered_url = await resolve_hike_playback_url(
+                        page,
+                        course_url,
+                        config=config,
+                        logger=logger,
+                        force=True,
+                    )
+                    if recovered_url and recovered_url != course_url:
+                        course_url = recovered_url
+                        logger.context(课程地址=course_url)
+                        try:
+                            await page.goto(
+                                course_url, wait_until="domcontentloaded", timeout=30000
+                            )
+                        except TimeoutError:
+                            logger.warn("播放页加载较慢，继续等待目录渲染...", shift=True)
+                        await page.wait_for_timeout(2000)
 
                 parsed = parse_url(course_url)
                 route = course_route(parsed, course_url)

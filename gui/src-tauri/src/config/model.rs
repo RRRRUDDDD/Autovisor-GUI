@@ -250,7 +250,10 @@ pub(crate) fn infer_title(url: &str, idx: usize) -> String {
         "AI 慕课"
     } else if lower.contains("fusioncourseh5.zhihuishu.com") {
         "融合共享课"
-    } else if lower.contains("studywisdomh5.zhihuishu.com") || lower.contains("hike.zhihuishu.com") {
+    } else if lower.contains("studywisdomh5.zhihuishu.com")
+        || lower.contains("hike.zhihuishu.com")
+        || lower.contains("wenda.zhihuishu.com/stu/courseinfo/studyresource")
+    {
         "翻转 / 智慧课"
     } else if lower.contains("studyvideoh5.zhihuishu.com") {
         "智慧共享课"

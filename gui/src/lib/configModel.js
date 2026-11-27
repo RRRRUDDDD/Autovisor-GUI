@@ -175,7 +175,11 @@ export function detectCourseType(rawUrl) {
   if (url.includes('fusioncourseh5.zhihuishu.com')) {
     return { key: 'fusion', label: '融合共享课', cls: 'bg-primary-container text-on-primary-container' };
   }
-  if (url.includes('studywisdomh5.zhihuishu.com') || url.includes('hike.zhihuishu.com')) {
+  if (
+    url.includes('studywisdomh5.zhihuishu.com')
+    || url.includes('hike.zhihuishu.com')
+    || url.includes('wenda.zhihuishu.com/stu/courseinfo/studyresource')
+  ) {
     return { key: 'hike', label: '翻转 / 智慧课', cls: 'bg-success-container text-on-success-container' };
   }
   if (url.includes('studyvideoh5.zhihuishu.com')) {

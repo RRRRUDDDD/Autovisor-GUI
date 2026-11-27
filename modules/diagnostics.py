@@ -5,6 +5,10 @@ from pathlib import Path
 from playwright.async_api import async_playwright
 
 from modules.browser import create_browser_session
+from modules.hike_navigation import (
+    needs_hike_file_id_resolution,
+    resolve_hike_playback_url,
+)
 from modules.lesson_navigation import (
     CATALOGS,
     detect_catalog,
@@ -74,6 +78,10 @@ async def check_course(course_url: str, config, logger, cookie_path: str) -> int
                 "this.pause(); return Promise.resolve(); }; "
                 "addEventListener('play', event => event.target.pause(), true);"
             )
+            if needs_hike_file_id_resolution(course_url):
+                course_url = await resolve_hike_playback_url(
+                    page, course_url, config=config, logger=logger
+                )
             await page.goto(course_url, wait_until="commit", timeout=15000)
             await page.wait_for_timeout(10000)
             screenshot_path = Path.home() / "scratch-data" / "autovisor-course-check.png"

@@ -83,12 +83,14 @@ MOOC_CATALOG = CatalogSelectors(
 
 HIKE_CATALOG = CatalogSelectors(
     name="hike",
-    item=".file-item",
+    # 仅匹配视频条目(<i class="icon-video">)，排除 PPT/PDF 文档(<i class="icon-doc">等)；
+    # 兼容无图标子元素的旧版或测试节点。
+    item=".file-item:has(.icon-video), .file-item:not(:has(> i))",
     active=".file-item.active",
     finish=".icon-finish",
-    title="span[title]",
+    title=".file-name, span[title]",
     active_class="active",
-    progress=".rate",
+    progress=None,
     course_title=".course-name",
 )
 
@@ -189,23 +191,55 @@ async def wait_for_lesson_completion(
     return False
 
 
+def _is_transient_navigation_error(exc: Exception) -> bool:
+    msg = str(exc or "").lower()
+    return any(
+        tok in msg
+        for tok in (
+            "execution context was destroyed",
+            "cannot find context",
+            "frame was detached",
+            "navigating",
+        )
+    )
+
+
 async def wait_for_lesson_active(
     lesson: Locator, catalog: CatalogSelectors, timeout_ms: int = 8_000
 ) -> bool:
     deadline = asyncio.get_running_loop().time() + timeout_ms / 1000
     while asyncio.get_running_loop().time() < deadline:
-        if await lesson_is_active(lesson, catalog):
-            return True
+        remaining_ms = max(
+            200, int((deadline - asyncio.get_running_loop().time()) * 1000)
+        )
+        try:
+            if await lesson_is_active(
+                lesson, catalog, timeout_ms=min(1000, remaining_ms)
+            ):
+                return True
+        except TimeoutError:
+            pass
+        except Exception as exc:
+            if not _is_transient_navigation_error(exc):
+                raise
         await asyncio.sleep(0.2)
     return False
 
 
-async def lesson_is_active(lesson: Locator, catalog: CatalogSelectors) -> bool:
-    return await lesson.evaluate(
+async def lesson_is_active(
+    lesson: Locator, catalog: CatalogSelectors, *, timeout_ms: int | None = None
+) -> bool:
+    script = (
         """(el, config) => el.classList.contains(config.className) ||
-            Boolean(config.selector && el.querySelector(config.selector))""",
-        {"className": catalog.active_class, "selector": catalog.active},
+            Boolean(config.selector && el.querySelector(config.selector))"""
     )
+    arg = {"className": catalog.active_class, "selector": catalog.active}
+    if timeout_ms is not None:
+        try:
+            return await lesson.evaluate(script, arg, timeout=timeout_ms)
+        except TypeError:
+            return await lesson.evaluate(script, arg)
+    return await lesson.evaluate(script, arg)
 
 
 async def active_lesson(page: Page, catalog: CatalogSelectors):
