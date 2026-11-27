@@ -16,17 +16,14 @@ from urllib.parse import unquote, urljoin
 import requests
 
 from modules import zhidao_crypto
-from modules.http_utils import create_retry_session
+from modules.http_utils import DEFAULT_BROWSER_USER_AGENT, create_retry_session
 
 DEFAULT_HEADERS = {
     "Accept": "*/*",
     "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
     "Origin": "https://ai-smart-course-student-pro.zhihuishu.com",
     "Referer": "https://ai-smart-course-student-pro.zhihuishu.com/",
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-    ),
+    "User-Agent": DEFAULT_BROWSER_USER_AGENT,
 }
 
 PASSPORT_ORIGIN = "https://passport.zhihuishu.com"
@@ -96,10 +93,18 @@ STRATEGIES: dict[str, QueryStrategy] = {
         zhidao_crypto.AI_KEY, content_type="json", ok_value=200
     ),
     "homework": QueryStrategy(
-        zhidao_crypto.EXAM_KEY, set_timestamp=False, ok_field="status", ok_value="200"
+        zhidao_crypto.EXAM_KEY,
+        set_timestamp=False,
+        ok_field="status",
+        ok_value="200",
+        captcha_on_minus_12=True,
     ),
     "zhidao_exam": QueryStrategy(
-        zhidao_crypto.EXAM_KEY, set_timestamp=False, ok_field="status", ok_value="200"
+        zhidao_crypto.EXAM_KEY,
+        set_timestamp=False,
+        ok_field="status",
+        ok_value="200",
+        captcha_on_minus_12=True,
     ),
 }
 
@@ -327,7 +332,7 @@ class ZhsApiClient:
         payload = dict(data)
         timestamp = None
         if strategy.set_timestamp:
-            timestamp = int(time.time()) * 1000
+            timestamp = int(time.time() * 1000)
             payload["dateFormate"] = timestamp
         form: dict = {
             "secretStr": zhidao_crypto.encrypt(
@@ -392,9 +397,14 @@ class ZhsApiClient:
             status = int(getattr(response, "status_code", 0) or 0)
             headers = getattr(response, "headers", {}) or {}
             location = headers.get("Location") or headers.get("location") or ""
-            if status == 302 and location and CAS_TICKET_PARAM in location:
+            if 300 <= status < 400 and location and CAS_TICKET_PARAM in location:
                 target = urljoin(PASSPORT_ORIGIN, location)
-                self.session.get(target, allow_redirects=True, timeout=self.timeout)
+                ticket_resp = self.session.get(
+                    target, allow_redirects=True, timeout=self.timeout
+                )
+                ticket_status = int(getattr(ticket_resp, "status_code", 0) or 0)
+                if ticket_status >= 400:
+                    return None, ticket_status
                 return target, status
         return None, status
 

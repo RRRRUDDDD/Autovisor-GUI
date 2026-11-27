@@ -166,6 +166,23 @@ class ExamWorkerTests(unittest.TestCase):
         self.assertEqual(api.saved, [])
         self.assertEqual(api.submit_calls, [])
 
+    def test_do_exam_captcha_minus_12_propagates(self):
+        from modules.zhs_api import CaptchaRequiredError
+
+        class CaptchaExamApi(FakeExamApi):
+            def do_exam(self, **kwargs):
+                raise CaptchaRequiredError("接口要求验证码(code=-12)")
+
+        worker = self._worker(CaptchaExamApi([]))
+        with self.assertRaises(CaptchaRequiredError):
+            worker.run(
+                recruit_id="R1",
+                course_id="C1",
+                exam_id="E1",
+                student_exam_id="S1",
+                school_id="9",
+            )
+
     def test_auto_submit_false_only_saves(self):
         api = FakeExamApi([])
         worker = self._worker(api, auto_submit=False)

@@ -141,15 +141,35 @@ class StrategyQueryTests(unittest.TestCase):
         )
         self.assertEqual(payload["page"], 1)
 
-    def test_minus_12_raises_captcha_error_only_on_zhidao_strategy(self):
-        client = self._client(FakeResponse({"code": -12, "message": "验证码"}))
-        with self.assertRaises(CaptchaRequiredError):
-            client.query("zhidao", "https://example.com", {})
+    def test_minus_12_raises_captcha_error_on_zhidao_homework_and_exam_strategies(self):
+        for strategy_name, payload in (
+            ("zhidao", {"code": -12, "message": "验证码"}),
+            ("homework", {"status": "200", "code": "-12", "message": "需要滑块"}),
+            ("zhidao_exam", {"status": "200", "code": "-12", "message": "需要滑块"}),
+            ("zhidao_exam", {"status": "500", "code": -12, "message": "需要滑块"}),
+        ):
+            with self.subTest(strategy=strategy_name, payload=payload):
+                client = self._client(FakeResponse(payload))
+                with self.assertRaises(CaptchaRequiredError):
+                    client.query(strategy_name, "https://example.com", {})
 
         client = self._client(FakeResponse({"code": -12, "message": "unknown"}))
         with self.assertRaises(ZhsApiError) as ctx:
             client.query("home", "https://example.com", {})
         self.assertNotIsInstance(ctx.exception, CaptchaRequiredError)
+
+    def test_date_formate_uses_real_milliseconds(self):
+        from unittest.mock import patch
+
+        client = self._client(FakeResponse({"code": 0}))
+        with patch("modules.zhs_api.time.time", return_value=1700000000.456):
+            client.query("home", "https://example.com/api", {"x": 1})
+        form = client.session.calls[0][2]
+        self.assertEqual(form["dateFormate"], 1700000000456)
+        payload = json.loads(
+            zhidao_crypto.decrypt(form["secretStr"], key=zhidao_crypto.HOME_KEY)
+        )
+        self.assertEqual(payload["dateFormate"], 1700000000456)
 
     def test_bad_status_and_unknown_strategy_fail_fast(self):
         client = self._client(FakeResponse({"status": "500"}))
@@ -289,6 +309,54 @@ class CasSsoTests(unittest.TestCase):
         self.assertEqual(client.verify_session_status(), SessionStatus.UNAVAILABLE)
 
         client = self._client([FakeResponse({}, status_code=502)])
+        self.assertEqual(client.verify_session_status(), SessionStatus.UNAVAILABLE)
+
+    def test_cas_login_supports_3xx_and_checks_ticket_target_status(self):
+        # 303 重定向正常换票
+        client = self._client(
+            [
+                FakeResponse(
+                    status_code=303,
+                    headers={"Location": "/cas/login?ticket=ST-303"},
+                ),
+                FakeResponse(status_code=200),
+            ]
+        )
+        self.assertTrue(client.ensure_service_sso("https://example.com/svc"))
+
+        # 票据重定向目标返回 403 -> 视为失败 / EXPIRED
+        client = self._client(
+            [
+                FakeResponse(
+                    status_code=302,
+                    headers={"Location": "/cas/login?ticket=ST-403"},
+                ),
+                FakeResponse(status_code=403),
+            ]
+        )
+        self.assertFalse(client.ensure_service_sso("https://example.com/svc"))
+
+        client = self._client(
+            [
+                FakeResponse(
+                    status_code=302,
+                    headers={"Location": "/cas/login?ticket=ST-403"},
+                ),
+                FakeResponse(status_code=403),
+            ]
+        )
+        self.assertEqual(client.verify_session_status(), SessionStatus.EXPIRED)
+
+        # 票据重定向目标返回 502 -> UNAVAILABLE（不误判掉线）
+        client = self._client(
+            [
+                FakeResponse(
+                    status_code=302,
+                    headers={"Location": "/cas/login?ticket=ST-502"},
+                ),
+                FakeResponse(status_code=502),
+            ]
+        )
         self.assertEqual(client.verify_session_status(), SessionStatus.UNAVAILABLE)
 
     def test_build_session_preserves_multi_domain_cookies(self):
