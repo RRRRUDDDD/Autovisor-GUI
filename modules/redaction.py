@@ -30,12 +30,12 @@ _REDACT_RULES = (
         re.compile(
             r"(?i)((?:notification[_-]?url|tg[_-]?chat[_-]?id|chat[_-]?id|bark[_-]?url|"
             r"pushplus[_-]?token|password|passwd|pwd|api[_-]?key|x-api-key|"
-            r"x-goog-api-key|token|cookie)\s*[:=]\s*)([^\s,;]+)"
+            r"x-goog-api-key|token|cookie|\bfp|irToken)\s*[:=]\s*)([^\s,;]+)"
         ),
         r"\1***REDACTED***",
     ),
     (
-        re.compile(r"(?i)([?&](?:token|key|apikey|api_key|access_token)=)([^&\s]+)"),
+        re.compile(r"(?i)([?&](?:token|key|apikey|api_key|access_token|fp|irToken)=)([^&\s]+)"),
         r"\1***REDACTED***",
     ),
     (re.compile(r"\b(1[3-9]\d)\d{4}(\d{4})\b"), r"\1****\2"),
@@ -43,10 +43,16 @@ _REDACT_RULES = (
 
 
 def redact_sensitive(text) -> str:
-    """脱敏 API Key / Cookie / 代理口令 / 推送地址 / URL token / 手机号等敏感信息。"""
+    """脱敏 API Key / Cookie / 代理口令 / 推送地址 / URL token / 手机号及动态注册敏感值。"""
     value = str(text or "")
     for pattern, replacement in _REDACT_RULES:
         value = pattern.sub(replacement, value)
+    if value:
+        with _secrets_lock:
+            secrets = sorted(_secrets, key=len, reverse=True)
+        for secret in secrets:
+            if secret in value:
+                value = value.replace(secret, "***REDACTED***")
     return value
 
 
@@ -73,7 +79,7 @@ _secrets_lock = threading.RLock()
 _SENSITIVE_FIELDS = (
     r"(?:password|passwd|pwd|cookies?|set-cookie|authorization|api[_-]?key|key|"
     r"tokens?|[a-z_]*token|secret|enc|aienc|username|account|_?uid|fid|cpi|"
-    r"clazzid|classid|courseid|tg_chat_id|chat_id)"
+    r"clazzid|classid|courseid|tg_chat_id|chat_id|fp|irtoken)"
 )
 _SENSITIVE_RE = re.compile(_SENSITIVE_FIELDS, re.I)
 _ASSIGNMENT_RE = re.compile(

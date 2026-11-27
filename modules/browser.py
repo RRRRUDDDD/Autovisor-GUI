@@ -4,6 +4,7 @@ from dataclasses import dataclass
 import os
 from pathlib import Path
 import sys
+from typing import Any
 from urllib.parse import urlparse
 
 from playwright.async_api import Browser, BrowserContext, Page, Playwright
@@ -11,6 +12,7 @@ from modules.quiz_dom import TargetClosedError
 
 from modules.http_utils import build_playwright_proxy
 from modules.utils import get_resource_path
+from modules.yidun_fp import YidunFpCollector
 
 
 @dataclass
@@ -19,9 +21,15 @@ class BrowserSession:
     context: BrowserContext
     page: Page
     attached: bool
+    fp_collector: Any = None
 
     async def close(self) -> None:
         """Close only resources owned by Autovisor."""
+        if self.fp_collector is not None:
+            try:
+                self.fp_collector.detach(clear_store=True)
+            except Exception:
+                pass
         try:
             if self.attached:
                 if not self.page.is_closed():
@@ -175,7 +183,10 @@ async def create_browser_session(
             attached = True
             logger.info("已连接现有 Chrome,将复用当前登录状态.")
             await _prepare_page(page, logger)
-            return BrowserSession(browser, context, page, attached)
+            fp_collector = YidunFpCollector(context=context, page=page).attach()
+            return BrowserSession(
+                browser, context, page, attached, fp_collector=fp_collector
+            )
         except BaseException as exc:
             if page is not None and not page.is_closed():
                 try:
@@ -202,7 +213,10 @@ async def create_browser_session(
             page = await context.new_page()
             logger.debug(f"{config.driver}浏览器启动完成.")
             await _prepare_page(page, logger)
-            return BrowserSession(browser, context, page, False)
+            fp_collector = YidunFpCollector(context=context, page=page).attach()
+            return BrowserSession(
+                browser, context, page, False, fp_collector=fp_collector
+            )
         except BaseException:
             try:
                 await browser.close()
