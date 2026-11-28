@@ -124,6 +124,13 @@ def _is_hike_page(page: Page) -> bool:
     return "hike.zhihuishu.com" in str(getattr(page, "url", "") or "").lower()
 
 
+def _hike_course_log_key(url: str) -> str:
+    from modules.hike_navigation import parse_hike_course_url
+
+    info = parse_hike_course_url(url)
+    return str(info.get("courseId") or "hike")
+
+
 async def _apply_hike_playback_rate(page: Page, target_speed: float) -> dict | None:
     """通过 Hike ablePlayer 原生 .speedList 档位点击调速，确保触发 callback.playbackRate。
 
@@ -461,11 +468,24 @@ async def _skip_questions_loop(
     interceptor=None,
 ) -> None:
     await page.wait_for_load_state("domcontentloaded")
+    last_hike_logged: str | None = None
     while True:
         try:
             if playback_enabled is not None and not playback_enabled.is_set():
                 await asyncio.sleep(2)
                 continue
+            if _is_hike_page(page):
+                hike_key = _hike_course_log_key(page.url)
+                if hike_key != last_hike_logged:
+                    last_hike_logged = hike_key
+                    logger.info(
+                        "当前为翻转/智慧课(Hike), 跳过课中弹题监听（若课程主页另设作业/考试请手动检查）.",
+                        shift=True,
+                    )
+                    logger.event("答题", 结果="跳过", 原因="翻转/智慧课无课中弹题")
+                await asyncio.sleep(2)
+                continue
+            last_hike_logged = None
             if "studywisdomh5.zhihuishu.com" in page.url:
                 await asyncio.sleep(2)
                 if not await has_visible_element(page, (".topic-title",)):
@@ -530,10 +550,6 @@ async def _skip_questions_loop(
                 if await FusionAdapter.skip_blocking_quizzes(page, config=config):
                     event_loop.set()
                 continue
-            if "hike.zhihuishu.com" in page.url:
-                logger.warn("当前课程为新版本,不支持自动答题.", shift=True)
-                logger.event("答题", 结果="跳过", 原因="课程版本不支持")
-                return
             await asyncio.sleep(2)
             ques_element = await page.wait_for_selector(".el-scrollbar__view", state="attached", timeout=1000)
             total_ques = await ques_element.query_selector_all(".number")
@@ -663,9 +679,8 @@ async def _skip_questions_loop(
                         "skip_questions:cleanup",
                         f"答题弹窗清理跳过: {logger.summarize_exception(cleanup_exc)}",
                     )
-            elif "hike.zhihuishu.com" in page.url:
-                logger.warn("当前课程为新版本,不支持自动答题.", shift=True)
-                return
+            elif _is_hike_page(page):
+                continue
             else:
                 try:
                     not_finish_close = await page.query_selector(".el-message-box__headerbtn")

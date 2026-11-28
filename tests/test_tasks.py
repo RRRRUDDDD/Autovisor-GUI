@@ -194,6 +194,77 @@ class SkipQuestionsLoggingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(quiz_events[0]["方式"], "默认选择")
         self.assertEqual(quiz_events[1]["默认选择"], 1)
 
+    async def test_hike_logs_info_once_per_course_and_keeps_running_for_next_course(self):
+        dummy_logger = _DummyLogger()
+        dummy_logger.warns = []
+        dummy_logger.warn = lambda msg, shift=False: dummy_logger.warns.append(msg)
+        event_loop = tasks.asyncio.Event()
+
+        class _Choice:
+            def __init__(self, text):
+                self._text = text
+                self.clicked = False
+
+            async def inner_text(self):
+                return self._text
+
+            async def click(self, timeout=500):
+                self.clicked = True
+
+        class _Ques:
+            async def click(self, timeout=500):
+                return None
+
+        class _Container:
+            async def query_selector_all(self, selector):
+                return [_Ques()] if selector == ".number" else []
+
+        choices = [_Choice("A. 对"), _Choice("B. 错")]
+
+        class _SwitchPage(_FakePage):
+            def __init__(self):
+                super().__init__(
+                    "https://hike.zhihuishu.com/aidedteaching/sourceLearning/sourceLearning?courseId=11559973&fileId=35338439"
+                )
+                self.wait_for_selector = AsyncMock(return_value=_Container())
+                self.press = AsyncMock()
+                self.wait_for_timeout = AsyncMock()
+
+            async def query_selector(self, selector):
+                return None
+
+            async def query_selector_all(self, selector):
+                return choices if selector == ".topic-item" else []
+
+        page = _SwitchPage()
+        calls = 0
+
+        async def fake_sleep(_delay):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                # 同一门 Hike 课切换下一节视频，不应重复提示
+                page.url = "https://hike.zhihuishu.com/aidedteaching/sourceLearning/sourceLearning?courseId=11559973&fileId=35338440"
+            elif calls == 2:
+                # 队列切换到知到共享课，弹题任务应继续生效
+                page.url = "https://studyvideoh5.zhihuishu.com/stuStudy?recruitAndCourseId=abc"
+            elif calls > 3:
+                raise TargetClosedError("done")
+
+        with (
+            patch.object(tasks, "logger", dummy_logger),
+            patch.object(tasks.asyncio, "sleep", side_effect=fake_sleep),
+            patch.object(tasks, "answer_with_llm", AsyncMock(return_value=False)),
+        ):
+            await tasks.skip_questions(page, event_loop)
+
+        self.assertEqual(dummy_logger.warns, [])
+        hike_infos = [m for m in dummy_logger.infos if "翻转/智慧课(Hike)" in m]
+        self.assertEqual(len(hike_infos), 1)
+        self.assertIn(("答题", {"结果": "跳过", "原因": "翻转/智慧课无课中弹题"}), dummy_logger.events)
+        self.assertTrue(event_loop.is_set())
+        self.assertTrue(all(c.clicked for c in choices))
+
 
 class _QuietLogger:
     def __getattr__(self, _name):
