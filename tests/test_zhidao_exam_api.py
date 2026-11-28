@@ -153,6 +153,7 @@ class ZhidaoExamApiClientRoutingTests(unittest.TestCase):
                 "stuExamId": "2001",
                 "achieveCount": "20",
             },
+            allow_retry=False,
         )
 
     def test_homework_strategy_calls_ensure_exam_sso_and_source_1(self):

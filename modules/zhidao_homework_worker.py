@@ -74,8 +74,6 @@ def _split_user_answer(text, question_type: int) -> list[str]:
     raw = str(text or "")
     separator = "/" if question_type == 3 else ","
     parts = [item.strip() for item in raw.split(separator)]
-    if question_type == 3 and len(parts) <= 1 and "," in raw:
-        parts = [item.strip() for item in raw.split(",")]
     return [item for item in parts if item]
 
 
@@ -235,14 +233,33 @@ def answer_info_by_question_id(payload) -> dict[str, dict]:
     return result
 
 
-def _entry_flag(entry: dict | None, *keys) -> bool:
+def _entry_correctness(entry: dict | None, *keys) -> bool | None:
+    """三态解析判分结果：明确答对返回 True，明确答错返回 False，缺失或空串返回 None。"""
     if not isinstance(entry, dict):
-        return False
-    for key in keys:
-        value = entry.get(key)
-        if value is not None and str(value).strip() != "":
-            return str(value).strip().lower() in {"1", "true", "yes", "y"}
-    return False
+        return None
+    sources = [entry]
+    user = entry.get("userAnswerVo")
+    if isinstance(user, dict):
+        sources.append(user)
+    for src in sources:
+        for key in keys:
+            value = src.get(key)
+            if value is None:
+                continue
+            if isinstance(value, bool):
+                return value
+            text = str(value).strip().lower()
+            if not text:
+                continue
+            if text in {"1", "true", "yes", "y"}:
+                return True
+            if text in {"0", "false", "no", "n"}:
+                return False
+    return None
+
+
+def _entry_flag(entry: dict | None, *keys) -> bool:
+    return _entry_correctness(entry, *keys) is True
 
 
 def _entry_answer(entry: dict | None) -> str:
@@ -303,9 +320,17 @@ def build_homework_prompt(
             source_hint = "（来源：题库数据库，请结合题干与选项核对后作答）"
         else:
             source_hint = ", 仅供参考, 请自行判断正确性"
+        cleaned_ref = (
+            "\n".join(
+                part
+                for line in str(bank_reference).splitlines()
+                for part in [_plain(line)]
+                if part
+            )
+            or _plain(bank_reference)
+        )
         lines.append(
-            f"【第三方题库参考】以下内容来自外部题库{source_hint}："
-            + _plain(bank_reference)
+            f"【第三方题库参考】以下内容来自外部题库{source_hint}：{cleaned_ref}"
         )
     if qtype == 3:
         lines.append(
@@ -943,24 +968,33 @@ class ZhidaoHomeworkWorker:
                 continue
             looked_item = looked.get(question_id)
             entry = info.get(question_id) or (info.get(eid) if eid else None)
-            correct = _entry_flag(entry, "isRight", "isCorrect", "isCurrent", "correct")
-            if not correct and looked_item is not None:
-                correct = _entry_flag(
-                    looked_item.get("raw"), "isRight", "isCorrect", "isCurrent"
+            verdict = _entry_correctness(
+                entry, "isRight", "isCorrect", "isCurrent", "correct"
+            )
+            if verdict is None and looked_item is not None:
+                verdict = _entry_correctness(
+                    looked_item.get("raw"),
+                    "isRight",
+                    "isCorrect",
+                    "isCurrent",
+                    "correct",
                 )
             answer_text = _entry_answer(entry) or (
                 _entry_answer(looked_item.get("raw")) if looked_item else ""
             )
             qtype = question.get("type", 1)
-            correct_options = []
-            if looked_item is not None:
-                correct_options = correct_option_ids(looked_item.get("raw") or {})
+            looked_correct_options = (
+                correct_option_ids(looked_item.get("raw") or {})
+                if looked_item is not None
+                else []
+            )
+            correct_options = list(looked_correct_options)
             if not correct_options and row:
                 correct_options = row.get("correct_options") or []
-            if correct and not correct_options and answer_text:
+            if verdict is True and not correct_options and answer_text:
                 correct_options = _split_user_answer(answer_text, qtype)
 
-            if correct:
+            if verdict is True:
                 self.store.mark_correct(
                     course,
                     exam_key,
@@ -968,6 +1002,19 @@ class ZhidaoHomeworkWorker:
                     correct_options=correct_options,
                     auto_clear_wrong=True,
                 )
+                continue
+
+            if verdict is None:
+                # 未判分/接口缺失（如 isCurrent=="" 或 getStuAnswerInfo 失败）绝不误记错题，
+                # 若 lookHomework 直接带回标准答案则仅补录标准答案。
+                if looked_correct_options:
+                    self.store.mark_correct(
+                        course,
+                        exam_key,
+                        question_id=question_id,
+                        correct_options=looked_correct_options,
+                        auto_clear_wrong=False,
+                    )
                 continue
 
             wrong = _split_user_answer(answer_text, qtype)
@@ -1301,12 +1348,19 @@ class ZhidaoHomeworkWorker:
                 logger.info("存在图片题, 本次不自动提交; 等待视觉流程补答后再处理.")
                 return stats
 
-            submitted = self.api.submit(
-                recruit_id=recruit_id,
-                exam_id=exam_key,
-                stu_exam_id=stu_exam_id,
-                achieve_count=answered,
-            )
+            try:
+                submitted = self.api.submit(
+                    recruit_id=recruit_id,
+                    exam_id=exam_key,
+                    stu_exam_id=stu_exam_id,
+                    achieve_count=answered,
+                )
+            except CaptchaRequiredError as exc:
+                exc.retryable = False
+                logger.warn(
+                    "作业交卷阶段触发人机验证, 为防重复提交不自动重试, 请手动核对交卷状态."
+                )
+                raise
             stats["submitted"] = True
             stats["score"] = extract_score(submitted)
             total_score = payload_total_score(payload)

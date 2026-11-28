@@ -29,9 +29,15 @@ class FakeClient:
     def ensure_exam_sso(self):
         self.sso_calls += 1
 
-    def query(self, strategy, url, data, extra_fields=None):
+    def query(self, strategy, url, data, extra_fields=None, allow_retry=None):
         self.calls.append(
-            {"strategy": strategy, "url": url, "data": data, "extra": extra_fields}
+            {
+                "strategy": strategy,
+                "url": url,
+                "data": data,
+                "extra": extra_fields,
+                "allow_retry": allow_retry,
+            }
         )
         return {"status": "200", "rt": {}}
 
@@ -407,6 +413,7 @@ class HomeworkApiTests(unittest.TestCase):
         )
         call = self._last()
         self.assertEqual(call["url"], SUBMIT_HOMEWORK)
+        self.assertIs(call["allow_retry"], False)
         self.assertEqual(
             call["data"],
             {
@@ -416,6 +423,22 @@ class HomeworkApiTests(unittest.TestCase):
                 "achieveCount": "9",
             },
         )
+
+    def test_submit_marks_captcha_error_non_retryable(self):
+        from modules.zhs_api import CaptchaRequiredError
+
+        class _CaptchaClient(FakeClient):
+            def query(self, strategy, url, data, extra_fields=None, allow_retry=None):
+                super().query(
+                    strategy, url, data, extra_fields=extra_fields, allow_retry=allow_retry
+                )
+                raise CaptchaRequiredError("submit captcha", code="-12")
+
+        api = ZhidaoHomeworkApi(_CaptchaClient())
+        with self.assertRaises(CaptchaRequiredError) as ctx:
+            api.submit(recruit_id="R1", exam_id="E1", stu_exam_id="S1", achieve_count=1)
+        self.assertFalse(ctx.exception.retryable)
+        self.assertIs(api.client.calls[-1]["allow_retry"], False)
 
     def test_query_course_uses_zhidao_strategy(self):
         from modules.zhidao_homework_api import QUERY_COURSE

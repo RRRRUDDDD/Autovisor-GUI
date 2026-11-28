@@ -414,9 +414,13 @@ class ZhidaoHomeworkApi:
     def __init__(self, client):
         self.client = client
 
-    def _call(self, url: str, data: dict) -> dict:
+    def _call(
+        self, url: str, data: dict, *, allow_retry: bool | None = None
+    ) -> dict:
         self.client.ensure_exam_sso()
-        return self.client.query("homework", url, data)
+        if allow_retry is None:
+            return self.client.query("homework", url, data)
+        return self.client.query("homework", url, data, allow_retry=allow_retry)
 
     def query_course(self, recruit_and_course_id: str) -> dict:
         """用共享课链接里的 recruitAndCourseId 反查 recruitId / courseId / schoolId."""
@@ -516,15 +520,22 @@ class ZhidaoHomeworkApi:
         stu_exam_id="",
         achieve_count=0,
     ) -> dict:
-        return self._call(
-            SUBMIT_HOMEWORK,
-            {
-                "recruitId": str(recruit_id),
-                "examId": str(exam_id),
-                "stuExamId": str(stu_exam_id),
-                "achieveCount": str(achieve_count),
-            },
-        )
+        from modules.zhs_api import CaptchaRequiredError
+
+        try:
+            return self._call(
+                SUBMIT_HOMEWORK,
+                {
+                    "recruitId": str(recruit_id),
+                    "examId": str(exam_id),
+                    "stuExamId": str(stu_exam_id),
+                    "achieveCount": str(achieve_count),
+                },
+                allow_retry=False,
+            )
+        except CaptchaRequiredError as exc:
+            exc.retryable = False
+            raise
 
     def look_homework(
         self,

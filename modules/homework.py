@@ -409,14 +409,17 @@ async def _settle_captcha(page, config) -> bool:
     logger.event("作业接口作答", 结果="需要人机验证")
     logger.event("人工介入", 状态="需要", 原因="作业接口触发人机验证")
     solved = False
-    modules = _captcha_modules() if getattr(config, "enableAutoCaptcha", True) else None
+    auto_captcha = bool(getattr(config, "enableAutoCaptcha", True))
+    modules = _captcha_modules() if auto_captcha else None
     try:
         reloaded = False
         if not await captcha_visible(page):
             reloaded = await _reload_for_captcha(page)
-        if modules:
+        if auto_captcha:
             solved = bool(
-                await slider_verify(page, modules, appear_timeout_ms=6000, max_attempts=3)
+                await slider_verify(
+                    page, modules or [None, None], appear_timeout_ms=6000, max_attempts=3
+                )
             )
         if not solved:
             if not reloaded and not await captcha_visible(page):
@@ -456,6 +459,16 @@ async def _try_api_with_captcha(page, config, params: dict) -> dict:
             return await _try_zhidao_api(page, config, params)
         except CaptchaRequiredError as exc:
             last_error = exc
+            if not getattr(exc, "retryable", True):
+                logger.warn(
+                    f"交卷阶段触发人机验证, 已中止重试以防重复交卷, 请手动核对交卷状态: {exc}"
+                )
+                logger.event(
+                    "作业接口作答",
+                    结果="交卷人机验证中止",
+                    错误=logger.summarize_exception(exc),
+                )
+                break
             logger.warn(f"接口作答触发人机验证: {exc}")
             logger.event(
                 "作业接口作答",

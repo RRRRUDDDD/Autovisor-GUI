@@ -73,6 +73,11 @@ async def _run_zhidao_with_captcha(
             raise
         except CaptchaRequiredError as exc:
             last_error = exc
+            if not getattr(exc, "retryable", True):
+                logger.warn(
+                    f"「{label}」交卷阶段触发人机验证, 已中止重试以防重复交卷, 请手动核对交卷状态: {exc}"
+                )
+                break
             logger.warn(f"「{label}」触发人机验证: {exc}")
             if attempt == 0:
                 if captcha_url and getattr(page, "goto", None):

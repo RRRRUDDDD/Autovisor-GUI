@@ -443,9 +443,15 @@ class FakeClient:
     def ensure_exam_sso(self):
         self.sso_calls += 1
 
-    def query(self, strategy, url, data, extra_fields=None):
+    def query(self, strategy, url, data, extra_fields=None, allow_retry=None):
         self.calls.append(
-            {"strategy": strategy, "url": url, "data": data, "extra": extra_fields}
+            {
+                "strategy": strategy,
+                "url": url,
+                "data": data,
+                "extra": extra_fields,
+                "allow_retry": allow_retry,
+            }
         )
         return {"status": "200", "rt": {}}
 
@@ -520,6 +526,7 @@ class ExamApiContractTests(unittest.TestCase):
             student_exam_id="S1",
             achieve_count=5,
         )
+        self.assertIs(self.client.calls[-1]["allow_retry"], False)
         self.assertEqual(
             self.client.calls[-1]["data"],
             {
@@ -530,6 +537,29 @@ class ExamApiContractTests(unittest.TestCase):
                 "achieveCount": "5",
             },
         )
+
+    def test_submit_marks_captcha_error_non_retryable(self):
+        from modules.zhidao_exam_api import ZhidaoExamApi
+        from modules.zhs_api import CaptchaRequiredError
+
+        class _CaptchaClient(FakeClient):
+            def query(self, strategy, url, data, extra_fields=None, allow_retry=None):
+                super().query(
+                    strategy, url, data, extra_fields=extra_fields, allow_retry=allow_retry
+                )
+                raise CaptchaRequiredError("exam submit captcha", code="-12")
+
+        api = ZhidaoExamApi(_CaptchaClient())
+        with self.assertRaises(CaptchaRequiredError) as ctx:
+            api.submit(
+                recruit_id="R1",
+                course_id="C1",
+                exam_id="E1",
+                student_exam_id="S1",
+                achieve_count=1,
+            )
+        self.assertFalse(ctx.exception.retryable)
+        self.assertIs(api.client.calls[-1]["allow_retry"], False)
 
     def test_helper_parsers(self):
         from modules.zhidao_exam_api import (
@@ -714,12 +744,49 @@ class ExamHttpCaptchaTests(unittest.TestCase):
             captcha_solver=lambda _trigger: CaptchaSolution("CN31_sub_v_i_1", "raw"),
             fp_provider=self._valid_fp,
         )
-        with self.assertRaises(CaptchaRequiredError):
+        with self.assertRaises(CaptchaRequiredError) as ctx:
             worker.run(
                 recruit_id="R1", course_id="C1", exam_id="E1", student_exam_id="S1", school_id="9"
             )
+        self.assertFalse(ctx.exception.retryable)
         self.assertEqual(len(api.submit_calls), 1)
         self.assertEqual(api.validate_calls, [])
+
+        # 验证外层 _run_zhidao_with_captcha 绝不会因交卷 -12 过码后二次重跑 worker.run() / submit()
+        import asyncio
+        from unittest.mock import AsyncMock, MagicMock, patch
+        from modules import homework
+        from modules.stages.zhidao_assessment import _run_zhidao_with_captcha
+
+        api2 = SubmitCaptchaExamApi()
+        worker2 = self._worker(api2)
+        run_calls = 0
+
+        def _run_once():
+            nonlocal run_calls
+            run_calls += 1
+            return worker2.run(
+                recruit_id="R1", course_id="C1", exam_id="E1", student_exam_id="S1", school_id="9"
+            )
+
+        with patch.object(
+            homework, "_settle_captcha", AsyncMock(return_value=True)
+        ) as settle_mock:
+            with self.assertRaises(CaptchaRequiredError):
+                asyncio.run(
+                    _run_zhidao_with_captcha(
+                        page=MagicMock(),
+                        client=MagicMock(),
+                        config=MagicMock(),
+                        logger=MagicMock(),
+                        label="期末考试",
+                        captcha_url="",
+                        run_fn=_run_once,
+                    )
+                )
+        self.assertEqual(run_calls, 1)
+        self.assertEqual(len(api2.submit_calls), 1)
+        settle_mock.assert_not_awaited()
 
 
 if __name__ == "__main__":

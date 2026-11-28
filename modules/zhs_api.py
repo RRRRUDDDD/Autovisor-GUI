@@ -55,10 +55,12 @@ class CaptchaRequiredError(ZhsApiError):
         *,
         code: str | int | None = None,
         response: dict | None = None,
+        retryable: bool = True,
     ):
         super().__init__(message)
         self.code = None if code is None else str(code)
         self.response = response
+        self.retryable = bool(retryable)
 
 
 class SessionExpiredError(ZhsApiError):

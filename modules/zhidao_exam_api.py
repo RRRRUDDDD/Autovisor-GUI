@@ -114,8 +114,12 @@ class ZhidaoExamApi:
     def __init__(self, client):
         self.client = client
 
-    def _exam_call(self, url: str, data: dict) -> dict:
-        return self.client.query("zhidao_exam", url, data)
+    def _exam_call(
+        self, url: str, data: dict, *, allow_retry: bool | None = None
+    ) -> dict:
+        if allow_retry is None:
+            return self.client.query("zhidao_exam", url, data)
+        return self.client.query("zhidao_exam", url, data, allow_retry=allow_retry)
 
     def _homework_call(self, url: str, data: dict, *, extra_fields=None) -> dict:
         self.client.ensure_exam_sso()
@@ -206,16 +210,23 @@ class ZhidaoExamApi:
         student_exam_id="",
         achieve_count=0,
     ) -> dict:
-        return self._exam_call(
-            SUBMIT_EXAM,
-            {
-                "recruitId": str(recruit_id),
-                "courseId": str(course_id),
-                "examId": str(exam_id),
-                "stuExamId": str(student_exam_id),
-                "achieveCount": str(achieve_count),
-            },
-        )
+        from modules.zhs_api import CaptchaRequiredError
+
+        try:
+            return self._exam_call(
+                SUBMIT_EXAM,
+                {
+                    "recruitId": str(recruit_id),
+                    "courseId": str(course_id),
+                    "examId": str(exam_id),
+                    "stuExamId": str(student_exam_id),
+                    "achieveCount": str(achieve_count),
+                },
+                allow_retry=False,
+            )
+        except CaptchaRequiredError as exc:
+            exc.retryable = False
+            raise
 
     def validate_slide_token(
         self,

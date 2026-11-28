@@ -520,26 +520,244 @@ class HomeworkWorkerLifecycleTests(unittest.TestCase):
         self.assertEqual(row_fill["correct_options"], ["答案A", "答案B"])
 
     def test_first_round_reached_ignores_review_exception(self):
+        from unittest.mock import patch
+
         payload = _payload(_dto("q_ok", 1, "一次过", [(1, "A"), (2, "B")]))
-
-        class BrokenReviewApi(FakeHomeworkApi):
-            def look_homework(self, **kwargs):
-                self.look_calls += 1
-                raise RuntimeError("review network glitch")
-
-        api = BrokenReviewApi(payload, [100])
+        api = FakeHomeworkApi(payload, [100])
         answerer = ScriptedAnswerer([_ids(1)])
         worker = self._worker(api, answerer, None, target_score=60)
+        with patch.object(
+            worker, "_apply_review", side_effect=RuntimeError("review apply glitch")
+        ) as apply_mock:
+            stats = worker.run(
+                recruit_id="R1",
+                course_id="C1",
+                homework_id="H_ERR",
+                stu_exam_id="S_ERR",
+                exam_id="E_ERR",
+            )
+        self.assertTrue(stats["target_reached"])
+        self.assertEqual(stats["score"], 100.0)
+        apply_mock.assert_called_once()
+
+    def test_apply_review_tri_state_is_current_empty_and_info_error_do_not_record_wrong(self):
+        payload = _payload(
+            _dto("q_ungraded", 1, "未判分题", [(11, "A"), (12, "B")]),
+            _dto("q_nested_ok", 1, "嵌套判对题", [(21, "C"), (22, "D")]),
+        )
+
+        class TriStateReviewApi(FakeHomeworkApi):
+            def look_homework(self, **kwargs):
+                self.look_calls += 1
+                return {
+                    "status": "200",
+                    "rt": {
+                        "examBase": {
+                            "workExamParts": [
+                                {
+                                    "questionDtos": [
+                                        {
+                                            "id": 92001,
+                                            "name": "未判分题",
+                                            "questionType": {"id": 1},
+                                            "questionOptions": [
+                                                {"id": 11, "content": "A"},
+                                                {"id": 12, "content": "B"},
+                                            ],
+                                            "userAnswerVo": {"answer": "11", "isCurrent": ""},
+                                        },
+                                        {
+                                            "id": 92002,
+                                            "name": "嵌套判对题",
+                                            "questionType": {"id": 1},
+                                            "questionOptions": [
+                                                {"id": 21, "content": "C"},
+                                                {"id": 22, "content": "D"},
+                                            ],
+                                            "userAnswerVo": {"answer": "21", "isCurrent": "1"},
+                                        },
+                                    ]
+                                }
+                            ]
+                        }
+                    },
+                }
+
+            def get_stu_answer_info(self, **kwargs):
+                self.info_calls += 1
+                return {
+                    "status": "200",
+                    "rt": {
+                        "92001": {"questionId": 92001, "answer": "11", "isCurrent": ""},
+                    },
+                }
+
+        analysis_calls = []
+
+        class _SpyAnalysisApi:
+            def get_analysis(self, **kwargs):
+                analysis_calls.append(kwargs)
+                return {"rt": {"analysis": "不应被调用"}}
+
+        api = TriStateReviewApi(payload, [100])
+        worker = self._worker(
+            api, ScriptedAnswerer([_ids(11), _ids(21)]), _SpyAnalysisApi(), target_score=100
+        )
         stats = worker.run(
             recruit_id="R1",
             course_id="C1",
-            homework_id="H_ERR",
-            stu_exam_id="S_ERR",
-            exam_id="E_ERR",
+            homework_id="H_TRI",
+            stu_exam_id="S_TRI",
+            exam_id="E_TRI",
         )
         self.assertTrue(stats["target_reached"])
-        self.assertEqual(stats["score"], 100.0)
-        self.assertEqual(api.look_calls, 1)
+        row_ungraded = self.store.get_by_id("C1", "92001", "E_TRI")
+        self.assertEqual(row_ungraded.get("wrong_options") or [], [])
+        row_nested_ok = self.store.get_by_id("C1", "92002", "E_TRI")
+        self.assertEqual(row_nested_ok["correct_options"], ["21"])
+        self.assertEqual(row_nested_ok.get("wrong_options") or [], [])
+        self.assertEqual(analysis_calls, [])
+
+        # getStuAnswerInfo 抛异常（info={}）时，lookHomework 带回 userAnswerVo 也不误标错题
+        class InfoErrorApi(TriStateReviewApi):
+            def get_stu_answer_info(self, **kwargs):
+                self.info_calls += 1
+                raise RuntimeError("info timeout")
+
+        api_err = InfoErrorApi(payload, [100])
+        worker_err = self._worker(
+            api_err, ScriptedAnswerer([_ids(11), _ids(21)]), _SpyAnalysisApi(), target_score=100
+        )
+        worker_err.run(
+            recruit_id="R1",
+            course_id="C1",
+            homework_id="H_INFO_ERR",
+            stu_exam_id="S_INFO_ERR",
+            exam_id="E_INFO_ERR",
+        )
+        row_err_ungraded = self.store.get_by_id("C1", "92001", "E_INFO_ERR")
+        self.assertEqual(row_err_ungraded.get("wrong_options") or [], [])
+        row_err_ok = self.store.get_by_id("C1", "92002", "E_INFO_ERR")
+        self.assertEqual(row_err_ok["correct_options"], ["21"])
+        self.assertEqual(analysis_calls, [])
+
+    def test_single_blank_fill_with_comma_is_not_split_on_comma(self):
+        payload = _payload(_dto("f_comma", 3, "数值填空"))
+
+        class CommaFillApi(FakeHomeworkApi):
+            def look_homework(self, **kwargs):
+                self.look_calls += 1
+                return {
+                    "status": "200",
+                    "rt": {
+                        "examBase": {
+                            "workExamParts": [
+                                {
+                                    "questionDtos": [
+                                        {
+                                            "id": 93001,
+                                            "name": "数值填空",
+                                            "questionType": {"id": 3},
+                                            "questionOptions": [],
+                                        }
+                                    ]
+                                }
+                            ]
+                        }
+                    },
+                }
+
+            def get_stu_answer_info(self, **kwargs):
+                self.info_calls += 1
+                return {
+                    "status": "200",
+                    "rt": {
+                        "93001": {
+                            "questionId": 93001,
+                            "answer": "1,000",
+                            "isCurrent": "1",
+                        }
+                    },
+                }
+
+        api = CommaFillApi(payload, [100])
+        worker = self._worker(api, ScriptedAnswerer([_fills("1,000")]), None, target_score=100)
+        stats = worker.run(
+            recruit_id="R1",
+            course_id="C1",
+            homework_id="H_COMMA",
+            stu_exam_id="S_COMMA",
+            exam_id="E_COMMA",
+        )
+        self.assertTrue(stats["target_reached"])
+        row = self.store.get_by_id("C1", "93001", "E_COMMA")
+        self.assertEqual(row["correct_options"], ["1,000"])
+
+    def test_submit_captcha_minus_12_does_not_retry_in_outer_captcha_wrappers(self):
+        import asyncio
+        from unittest.mock import AsyncMock, MagicMock, patch
+        from modules import homework
+        from modules.stages.zhidao_assessment import _run_zhidao_with_captcha
+        from modules.zhs_api import CaptchaRequiredError
+
+        class SubmitCaptchaHomeworkApi(FakeHomeworkApi):
+            def submit(self, **kwargs):
+                self.submit_calls += 1
+                raise CaptchaRequiredError("submit -12", code="-12")
+
+        api = SubmitCaptchaHomeworkApi(self.payload, [])
+        worker = self._worker(api, ScriptedAnswerer([_ids(11), _ids(21, 22), _fills("牛顿")]), None)
+        run_calls = 0
+
+        def _run_hw():
+            nonlocal run_calls
+            run_calls += 1
+            return worker.run(
+                recruit_id="R1",
+                course_id="C1",
+                homework_id="H_SUB",
+                stu_exam_id="S_SUB",
+                exam_id="E_SUB",
+            )
+
+        with patch.object(
+            homework, "_settle_captcha", AsyncMock(return_value=True)
+        ) as settle_mock:
+            with self.assertRaises(CaptchaRequiredError) as ctx1:
+                asyncio.run(
+                    _run_zhidao_with_captcha(
+                        page=MagicMock(),
+                        client=MagicMock(),
+                        config=MagicMock(),
+                        logger=MagicMock(),
+                        label="第一章作业",
+                        captcha_url="",
+                        run_fn=_run_hw,
+                    )
+                )
+        self.assertFalse(ctx1.exception.retryable)
+        self.assertEqual(run_calls, 1)
+        self.assertEqual(api.submit_calls, 1)
+        settle_mock.assert_not_awaited()
+
+        # 验证 homework._try_api_with_captcha 也不对交卷阶段 -12 重试
+        api_calls = 0
+
+        async def _fake_try_api(_page, _config, _params):
+            nonlocal api_calls
+            api_calls += 1
+            raise CaptchaRequiredError("submit -12", code="-12", retryable=False)
+
+        with (
+            patch.object(homework, "_try_zhidao_api", side_effect=_fake_try_api),
+            patch.object(
+                homework, "_settle_captcha", AsyncMock(return_value=True)
+            ) as settle_mock2,
+        ):
+            with self.assertRaises(CaptchaRequiredError):
+                asyncio.run(homework._try_api_with_captcha(MagicMock(), MagicMock(), {}))
+        self.assertEqual(api_calls, 1)
+        settle_mock2.assert_not_awaited()
 
     def test_do_homework_captcha_minus_12_propagates(self):
         from modules.zhs_api import CaptchaRequiredError

@@ -22,6 +22,7 @@ from modules.zhidao_homework_worker import (
     ZhidaoHomeworkWorker,
     question_has_image,
 )
+from modules.zhs_api import CaptchaRequiredError
 
 logger = Logger()
 
@@ -281,13 +282,20 @@ class ZhidaoExamWorker(ZhidaoHomeworkWorker):
             logger.info("存在图片题, 本次不自动交卷; 等待视觉流程补答后再处理.")
             return stats
 
-        result = self.api.submit(
-            recruit_id=recruit_id,
-            course_id=course_id,
-            exam_id=exam_id,
-            student_exam_id=student_exam_id,
-            achieve_count=stats["answered"],
-        )
+        try:
+            result = self.api.submit(
+                recruit_id=recruit_id,
+                course_id=course_id,
+                exam_id=exam_id,
+                student_exam_id=student_exam_id,
+                achieve_count=stats["answered"],
+            )
+        except CaptchaRequiredError as exc:
+            exc.retryable = False
+            logger.warn(
+                "正式考试交卷阶段触发人机验证, 为防重复交卷不自动重试, 请手动核对交卷状态."
+            )
+            raise
         stats["submitted"] = submit_succeeded(result)
         if not stats["submitted"]:
             logger.warn("考试交卷接口未返回 statu=1, 请手动确认是否已交卷.")
