@@ -57,7 +57,8 @@ class LessonNavigationTests(unittest.TestCase):
         self.assertIn(".file-name", HIKE_CATALOG.title)
         self.assertEqual(HIKE_CATALOG.finish, ".icon-finish")
         self.assertEqual(HIKE_CATALOG.active_class, "active")
-        self.assertIsNone(HIKE_CATALOG.progress)
+        self.assertEqual(HIKE_CATALOG.progress, ".rate")
+        self.assertIsNone(HIKE_CATALOG.progress_attribute)
 
     def test_progress_parser_clamps_and_rejects_non_finite_values(self):
         cases = {

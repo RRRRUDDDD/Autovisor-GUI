@@ -212,7 +212,7 @@ async def learn_lesson(
                             const video = document.querySelector(selector);
                             if (!video) return;
                             video.currentTime = time;
-                            video.play();
+                            if (video.play) video.play().catch(() => {});
                         }""",
                         [COURSE_VIDEO_SELECTOR, expected_time],
                     )
@@ -291,7 +291,7 @@ async def learn_lesson(
                             const video = document.querySelector(selector);
                             if (!video) return;
                             video.currentTime = time;
-                            video.play();
+                            if (video.play) video.play().catch(() => {});
                         }""",
                         [COURSE_VIDEO_SELECTOR, retry_time],
                     )

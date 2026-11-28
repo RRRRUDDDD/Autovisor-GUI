@@ -90,7 +90,9 @@ HIKE_CATALOG = CatalogSelectors(
     finish=".icon-finish",
     title=".file-name, span[title]",
     active_class="active",
-    progress=None,
+    # Hike 侧栏 status-box 在 1%~79% 时渲染 <span class="rate">XX%</span>，
+    # 达 80% 后切换为 <i class="icon-finish"></i>（未开始为空）。
+    progress=".rate",
     course_title=".course-name",
 )
 

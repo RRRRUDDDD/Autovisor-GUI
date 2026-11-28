@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import asyncio
+import math
 import time
 from urllib.parse import parse_qs, quote, urlparse
 
@@ -35,7 +36,8 @@ HIKE_STU_VIEW_FILE_URL = (
 _API_TIMEOUT = 15
 _VIDEO_EXTS = (".mp4", ".m3u8", ".flv", ".webm", ".mov")
 _VIDEO_SUFFIXES = frozenset({"mp4", "m3u8", "flv", "webm", "mov"})
-_HIKE_FINISH_THRESHOLD = 0.91
+# Hike 前端 newSourceLearning.js 的 switchProgress 以 Math.floor(studyTime * 1000 / totalTime / 10) >= 80 判已完成
+_HIKE_FINISH_PERCENT = 80
 _HIKE_404_MARKERS = ("您所访问的页面不存在", "抱歉~您所访问的页面不存在")
 
 
@@ -143,14 +145,24 @@ def _is_video_node(node: dict) -> bool:
     return False
 
 
+def _hike_node_progress_percent(node: dict) -> int:
+    """按 Hike newSourceLearning.js 的 getProgress 公式计算节点进度百分比。"""
+    total = _to_float(node.get("totalTime"))
+    studied = _to_float(node.get("studyTime"))
+    if total <= 0 or studied <= 0:
+        return 0
+    per = math.floor(studied * 1000 / total / 10)
+    if per > 100:
+        return 100
+    if per == 0:
+        return 1
+    return per
+
+
 def _is_node_finished(node: dict) -> bool:
     if str(node.get("isFinish") or node.get("studyStatus") or "").strip() == "1":
         return True
-    total = _to_float(node.get("totalTime"))
-    studied = _to_float(node.get("studyTime"))
-    if total > 0 and studied >= total * _HIKE_FINISH_THRESHOLD:
-        return True
-    return False
+    return _hike_node_progress_percent(node) >= _HIKE_FINISH_PERCENT
 
 
 def collect_hike_document_nodes(nodes) -> list[dict]:

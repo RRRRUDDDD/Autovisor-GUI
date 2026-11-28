@@ -120,6 +120,71 @@ async def task_monitor(tasks: list[asyncio.Task]) -> None:
     logger.info("任务监控已退出.", shift=True)
 
 
+def _is_hike_page(page: Page) -> bool:
+    return "hike.zhihuishu.com" in str(getattr(page, "url", "") or "").lower()
+
+
+async def _apply_hike_playback_rate(page: Page, target_speed: float) -> dict | None:
+    """通过 Hike ablePlayer 原生 .speedList 档位点击调速，确保触发 callback.playbackRate。
+
+    Hike 页面的 newVideoPlay.js 仅在 ablePlayer 触发 playbackRate 回调时更新内部计时倍速；
+    直接改写 <video>.playbackRate 会导致视频快进播完而平台仅按 1.0x 累计 studyTotalTime。
+    """
+    return await page.evaluate(
+        """([videoSelector, targetSpeed]) => {
+            const tabs = Array.from(document.querySelectorAll('.speedList [rate]'))
+                .map((el) => ({ el, rate: Number.parseFloat(el.getAttribute('rate') || '') }))
+                .filter((item) => Number.isFinite(item.rate) && item.rate > 0)
+                .sort((a, b) => a.rate - b.rate);
+            if (!tabs.length) {
+                return {
+                    ready: false,
+                    changed: false,
+                    appliedRate: null,
+                    chosenRate: null,
+                    maxRate: null,
+                    clamped: false,
+                };
+            }
+            const maxRate = tabs[tabs.length - 1].rate;
+            let chosen = tabs[0];
+            for (const tab of tabs) {
+                if (tab.rate <= targetSpeed + 1e-6) {
+                    chosen = tab;
+                }
+            }
+            const clamped = Math.abs(targetSpeed - chosen.rate) > 1e-6;
+            const cappedToMax = targetSpeed > maxRate + 1e-6;
+            const video = document.querySelector(videoSelector);
+            const before = video ? Number(video.playbackRate) : NaN;
+            if (Number.isFinite(before) && Math.abs(before - chosen.rate) <= 1e-3) {
+                return {
+                    ready: true,
+                    changed: false,
+                    appliedRate: chosen.rate,
+                    chosenRate: chosen.rate,
+                    maxRate,
+                    clamped,
+                    cappedToMax,
+                };
+            }
+            chosen.el.click();
+            const after = video ? Number(video.playbackRate) : NaN;
+            const applied = Number.isFinite(after) && Math.abs(after - chosen.rate) <= 1e-3;
+            return {
+                ready: true,
+                changed: applied,
+                appliedRate: Number.isFinite(after) ? after : chosen.rate,
+                chosenRate: chosen.rate,
+                maxRate,
+                clamped,
+                cappedToMax,
+            };
+        }""",
+        [COURSE_VIDEO_SELECTOR, float(target_speed)],
+    )
+
+
 async def video_optimize(
     page: Page, config: Config, playback_enabled: asyncio.Event | None = None
 ) -> None:
@@ -156,7 +221,24 @@ async def video_optimize(
                     "更新静音图标",
                 )
                 changes.append(f"音量 {volume}->0")
-            if rate != config.limitSpeed:
+            if _is_hike_page(page):
+                hike_res = await _apply_hike_playback_rate(page, config.limitSpeed)
+                if isinstance(hike_res, dict) and hike_res.get("changed"):
+                    applied = hike_res.get("appliedRate")
+                    if hike_res.get("cappedToMax"):
+                        suffix = f"(翻转/智慧课原生最高 {applied:g}x)"
+                    elif hike_res.get("clamped"):
+                        suffix = f"(翻转/智慧课原生档位 {applied:g}x)"
+                    else:
+                        suffix = ""
+                    rate_label = f"{rate:g}" if isinstance(rate, (int, float)) else str(rate)
+                    changes.append(f"倍速 {rate_label}->{applied:g}{suffix}")
+                elif isinstance(hike_res, dict) and not hike_res.get("ready"):
+                    logger.debug_throttled(
+                        "video:hike_speed_wait",
+                        "翻转/智慧课倍速控件尚未渲染, 等待 ablePlayer 就绪后再调速.",
+                    )
+            elif rate != config.limitSpeed:
                 await run_on(
                     page,
                     COURSE_VIDEO_SELECTOR,

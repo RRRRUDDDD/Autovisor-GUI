@@ -116,7 +116,23 @@ class HikeTreePickerTests(unittest.TestCase):
                         "dataType": 3,
                         "name": "矢量运算与常用坐标系",
                         "totalTime": 769,
-                        "studyTime": 729,  # > 91%, finished
+                        "studyTime": 729,  # 94% >= 80%, finished
+                    },
+                    {
+                        "id": 35338439,
+                        "type": 1,
+                        "dataType": 3,
+                        "name": "毕奥萨法尔定律及应用（一）",
+                        "totalTime": 732,
+                        "studyTime": 600,  # 81% >= 80%, finished in Hike DOM (.icon-finish)
+                    },
+                    {
+                        "id": 35338440,
+                        "type": 1,
+                        "dataType": 3,
+                        "name": "毕奥萨法尔定律及应用（二）",
+                        "totalTime": 924,
+                        "studyTime": 532,  # 57% < 80%, unfinished
                     },
                     {
                         "id": 35338436,
@@ -129,8 +145,21 @@ class HikeTreePickerTests(unittest.TestCase):
                 ],
             },
         ]
-        self.assertEqual(pick_hike_file_id_from_tree(tree), "35338436")
+        self.assertEqual(pick_hike_file_id_from_tree(tree), "35338440")
         self.assertEqual(pick_hike_file_id_from_tree(tree, review_mode=True), "35338435")
+
+    def test_finish_threshold_matches_hike_80_percent_floor_rule(self):
+        tree = [
+            {
+                "id": 1,
+                "type": 0,
+                "childList": [
+                    {"id": 100, "type": 1, "dataType": 3, "name": "刚好80%", "totalTime": 1000, "studyTime": 800},
+                    {"id": 101, "type": 1, "dataType": 3, "name": "差一点79%", "totalTime": 1000, "studyTime": 799},
+                ],
+            }
+        ]
+        self.assertEqual(pick_hike_file_id_from_tree(tree), "101")
 
     def test_falls_back_to_first_finished_video_then_doc(self):
         all_done = [
