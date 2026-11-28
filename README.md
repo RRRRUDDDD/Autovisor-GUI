@@ -8,7 +8,7 @@
 
 一个开箱即用的桌面客户端：登录账号 → 自动识别课程 → 一键开始，学习进度、日志与提醒全部可视化。
 
-[![Release](https://img.shields.io/badge/release-v1.3.1-2563eb)](https://github.com/RRRRUDDDD/Autovisor-GUI/releases)
+[![Release](https://img.shields.io/badge/release-v1.3.2-2563eb)](https://github.com/RRRRUDDDD/Autovisor-GUI/releases)
 [![Tauri](https://img.shields.io/badge/Tauri-2-24C8DB?logo=tauri&logoColor=white)](https://tauri.app)
 [![React](https://img.shields.io/badge/React-18-61DAFB?logo=react&logoColor=black)](https://react.dev)
 [![Rust](https://img.shields.io/badge/Rust-stable-000000?logo=rust)](https://www.rust-lang.org)
@@ -146,7 +146,7 @@ flowchart LR
 
 | 参数 | 说明 |
 | --- | --- |
-| 播放倍速 | 视频播放速度，最高 1.8x |
+| 播放倍速 | 视频播放速度，最高 1.8x（翻转/智慧课自动对齐原生最高档位） |
 | 单门课程时长限制 | 每门课最多学习多少分钟，`0` 为不限制 |
 | 复习模式（刷习惯分） | 忽略已完成状态重播视频；设置时长后循环播放直至满足时长 |
 | 自动跳过验证码 | 自动处理登录与课中滑块 / 点选验证（配置视觉模型后支持易盾文字 / 图标点选），并在作业与考试触发 `-12` 风控时自动纯 HTTP 过码重试 |

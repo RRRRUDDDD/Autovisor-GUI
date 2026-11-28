@@ -1,6 +1,6 @@
 [package]
 name = "autovisor-gui"
-version = "1.3.1"
+version = "1.3.2"
 description = "知到 · 智慧树自动化学习助手桌面版"
 authors = ["RUD <92616185+RRRRUDDDD@users.noreply.github.com>", "PengChengxu"]
 license = "MIT"

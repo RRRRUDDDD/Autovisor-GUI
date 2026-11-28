@@ -198,7 +198,7 @@ impl BackendManager {
                 generation: 0,
                 phase: "starting".to_string(),
                 version: env!("CARGO_PKG_VERSION").to_string(),
-                backend_version: "3.22.1(Autovisor GUI Edition)".to_string(),
+                backend_version: "3.22.2(Autovisor GUI Edition)".to_string(),
                 error: String::new(),
                 port: None,
                 token: String::new(),

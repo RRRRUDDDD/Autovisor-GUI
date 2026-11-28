@@ -53,8 +53,8 @@ const mockState = {
     cookieExists: false,
     cookieCount: 0,
     cookieModifiedAt: null,
-    version: '1.3.1',
-    backendVersion: '3.22.1(Autovisor GUI Edition)',
+    version: '1.3.2',
+    backendVersion: '3.22.2(Autovisor GUI Edition)',
     closeBehavior: 'ask',
     detectedBrowsers: [
       {
