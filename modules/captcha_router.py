@@ -107,18 +107,18 @@ async def solve_slider_captcha(
 
 async def solve_any_captcha(
     page: Page,
-    modules: list[ModuleType],
+    modules: list[ModuleType] | None,
     *,
     appear_timeout_ms: int = slider.IN_COURSE_APPEAR_TIMEOUT_MS,
     max_attempts: int = slider.MAX_ATTEMPTS,
 ) -> bool:
-    """按优先级自动路由点选验证码（腾讯/易盾VLM）与滑块验证码。"""
-    if await click_captcha.resolve_click_captcha_target(page) is not None:
-        if await click_captcha.solve_click_captcha(page, modules, attempts=max_attempts):
-            return True
+    """按优先级自动路由点选验证码（易盾VLM/腾讯）与滑块验证码。"""
     if await yidun_click.resolve_yidun_click_target(page) is not None:
         click_attempts = min(max(1, int(max_attempts)), yidun_click.MAX_ATTEMPTS)
         return await yidun_click.solve_yidun_click(page, max_attempts=click_attempts)
+    if await click_captcha.resolve_click_captcha_target(page) is not None:
+        if await click_captcha.solve_click_captcha(page, modules, attempts=max_attempts):
+            return True
     return await solve_slider_captcha(
         page,
         modules,

@@ -19,6 +19,7 @@ logger = Logger()
 
 INSTRUCTION_RE = re.compile(r"请点击")
 TITLE_TEXT = "请完成安全验证"
+YIDUN_EXCLUDE_SELECTOR = ".yidun, .yidun_modal"
 CLICK_CAPTCHA_SELECTORS = (
     "#tcaptcha_iframe_dy",
     "iframe[id^='tcaptcha']",
@@ -393,9 +394,23 @@ async def _iter_targets(page: Page):
         yield target
 
 
+async def _has_visible_yidun(target) -> bool:
+    try:
+        locator = target.locator(YIDUN_EXCLUDE_SELECTOR)
+        for index in range(await locator.count()):
+            if await locator.nth(index).is_visible():
+                return True
+    except Exception:
+        return False
+    return False
+
+
 async def resolve_click_captcha_target(page: Page):
     async def matches(target) -> bool:
         try:
+            # 易盾验证码（文字/图标点选或滑块）由易盾模块接管，避免腾讯点选误抢占。
+            if await _has_visible_yidun(target):
+                return False
             if await target.get_by_text(TITLE_TEXT).count():
                 return True
             if await target.get_by_text(INSTRUCTION_RE).count():
@@ -489,8 +504,10 @@ async def _refresh(target) -> None:
             continue
 
 
-async def solve_click_captcha(page: Page, modules: list[ModuleType], attempts: int = 3) -> bool:
-    np_mod, cv_mod = modules
+async def solve_click_captcha(
+    page: Page, modules: list[ModuleType] | None, attempts: int = 3
+) -> bool:
+    np_mod, cv_mod = modules if modules and len(modules) >= 2 else (None, None)
     if not np_mod or not cv_mod:
         logger.warn("OpenCV或Numpy导入失败,无法自动识别点选验证.")
         return False

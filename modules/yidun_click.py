@@ -2,9 +2,10 @@
 """易盾点选验证码（yidun--word / yidun--icon）VLM 自动求解模块。
 
 - 未配置视觉模型时直接返回 False，保持原有人工兜底与推送提醒流程；
-- 已配置视觉模型时复用 ``modules.llm.chat_vision_sync``（遵循 ``temperature=0``、
-  兼容思考模型高 token 预算），以 JSON + ``x/y`` 正则双解析器提取原图坐标，
-  并按 ``img.yidun_bg-img`` 实时 ``bounding_box()`` 等比缩放后模拟人类点击。
+- 已配置视觉模型时复用 ``modules.llm.chat_vision_sync``（遵循 ``temperature=0.0``、
+  ``max_tokens=8000`` 兼容思考模型高 token 预算），以 JSON + ``x/y`` 正则双解析器提取原图坐标，
+  并按 ``img.yidun_bg-img`` 实时 ``bounding_box()`` 等比缩放后模拟人类点击；
+- 当前提示词与点击流程面向智慧树常见 ``type=11`` 单点推理形态。
 """
 from __future__ import annotations
 
@@ -44,7 +45,7 @@ YIDUN_TIPS_SELECTOR = ".yidun_tips__text"
 YIDUN_TIPS_FALLBACK_SELECTOR = ".yidun_tips"
 YIDUN_REFRESH_SELECTOR = ".yidun_refresh, .yidun_icon-refresh"
 MAX_ATTEMPTS = 3
-VISION_TEMPERATURE = 0
+VISION_TEMPERATURE = 0.0
 VISION_MAX_TOKENS = 8000
 
 VISION_CLICK_PROMPT = """这是网易易盾的点选验证码图片，尺寸 {width}x{height} 像素。
@@ -59,6 +60,7 @@ VISION_CLICK_PROMPT = """这是网易易盾的点选验证码图片，尺寸 {wi
 _THINK_BLOCK_RE = re.compile(
     r"<(?:think|thought)>.*?</(?:think|thought)>", re.IGNORECASE | re.DOTALL
 )
+_UNCLOSED_THINK_RE = re.compile(r"<(?:think|thought)>.*$", re.IGNORECASE | re.DOTALL)
 _JSON_OBJECT_RE = re.compile(r"\{[^{}]*\}")
 _XY_PAIR_RE = re.compile(
     r"[xX]\s*[=:：]\s*(-?\d+(?:\.\d+)?).*?[yY]\s*[=:：]\s*(-?\d+(?:\.\d+)?)",
@@ -102,6 +104,8 @@ async def yidun_click_visible(page: Page) -> bool:
 
 def is_vision_available(conf_override: dict | None = None) -> bool:
     """判断当前是否已配置可用的视觉模型。"""
+    if getattr(llm, "requests", None) is None:
+        return False
     if conf_override is not None:
         normalized = llm.normalize_conf(conf_override)
         if not normalized.get("vision_model") or not normalized.get("api_base"):
@@ -139,9 +143,11 @@ def _in_bounds(
 ) -> bool:
     if not (math.isfinite(x) and math.isfinite(y)):
         return False
-    if width is not None and not (0.0 <= x <= float(width)):
+    if x < 0.0 or y < 0.0:
         return False
-    if height is not None and not (0.0 <= y <= float(height)):
+    if width is not None and x > float(width):
+        return False
+    if height is not None and y > float(height):
         return False
     return True
 
@@ -155,7 +161,9 @@ def parse_click_point(
     """从 VLM 回复中解析点击坐标（JSON 优先，失败回退 ``x/y`` 正则）。"""
     if not content:
         return None
-    cleaned = _THINK_BLOCK_RE.sub("", content).strip() or content.strip()
+    stripped = _THINK_BLOCK_RE.sub("", content)
+    stripped = _UNCLOSED_THINK_RE.sub("", stripped).strip()
+    cleaned = stripped or content.strip()
 
     # 思考模型可能在最终 JSON 前给出分析；优先检查清理后的 JSON 对象（取最后一个合法对象）。
     json_candidates = _JSON_OBJECT_RE.findall(cleaned)
@@ -171,8 +179,7 @@ def parse_click_point(
                 if _in_bounds(x, y, width=width, height=height):
                     return x, y
 
-    pair = _XY_PAIR_RE.search(cleaned)
-    if pair:
+    for pair in reversed(list(_XY_PAIR_RE.finditer(cleaned))):
         x, y = float(pair.group(1)), float(pair.group(2))
         if _in_bounds(x, y, width=width, height=height):
             return x, y
@@ -201,7 +208,7 @@ def _invoke_chat_vision(
     conf_override: dict | None = None,
     proxy: str | None = None,
 ) -> str:
-    """调用 ``modules.llm.chat_vision_sync``（现有接口默认 temperature=0 且不截断 OpenAI/Gemini 输出）。"""
+    """调用 ``modules.llm.chat_vision_sync`` 并显式透传 temperature=0.0 与 max_tokens=8000。"""
     vision_fn = llm.chat_vision_sync
     kwargs: dict[str, Any] = {
         "mime": mime,
@@ -210,12 +217,16 @@ def _invoke_chat_vision(
     }
     try:
         params = inspect.signature(vision_fn).parameters
-        if "temperature" in params:
+        accepts_varkw = any(
+            param.kind == inspect.Parameter.VAR_KEYWORD for param in params.values()
+        )
+        if accepts_varkw or "temperature" in params:
             kwargs["temperature"] = VISION_TEMPERATURE
-        if "max_tokens" in params:
+        if accepts_varkw or "max_tokens" in params:
             kwargs["max_tokens"] = VISION_MAX_TOKENS
     except (TypeError, ValueError):
-        pass
+        kwargs["temperature"] = VISION_TEMPERATURE
+        kwargs["max_tokens"] = VISION_MAX_TOKENS
     return vision_fn(image_bytes, prompt, **kwargs)
 
 
@@ -270,14 +281,27 @@ def _decode_data_uri(uri: str) -> bytes | None:
 
 async def _wait_click_ready(target, timeout_ms: int = 5000) -> None:
     try:
-        loading = target.locator("div.yidun--loading, div.yidun_loadicon").first
-        if await loading.count() and await loading.is_visible():
+        loading = await visible_locator(
+            target, "div.yidun--loading, div.yidun_loadicon", fallback_first=False
+        )
+        if loading is not None:
             await loading.wait_for(state="hidden", timeout=timeout_ms)
     except Exception:
         pass
-    await target.locator(YIDUN_BG_SELECTOR).first.wait_for(
-        state="visible", timeout=timeout_ms
-    )
+    bg_all = target.locator(YIDUN_BG_SELECTOR)
+    try:
+        count = await bg_all.count()
+    except Exception:
+        count = 0
+    if count <= 1:
+        await bg_all.first.wait_for(state="visible", timeout=timeout_ms)
+        return
+    deadline = time.monotonic() + timeout_ms / 1000
+    while time.monotonic() < deadline:
+        if await visible_locator(target, YIDUN_BG_SELECTOR, fallback_first=False) is not None:
+            return
+        await asyncio.sleep(0.1)
+    raise TimeoutError("yidun click background image not visible")
 
 
 async def _read_tips(target) -> str:
@@ -300,8 +324,8 @@ async def _read_tips(target) -> str:
 
 async def _bg_src(target) -> str | None:
     try:
-        locator = target.locator(YIDUN_BG_SELECTOR).first
-        if await locator.count():
+        locator = await visible_locator(target, YIDUN_BG_SELECTOR, fallback_first=True)
+        if locator is not None:
             return await locator.get_attribute("src")
     except Exception:
         return None
@@ -407,14 +431,15 @@ async def _refresh_click_captcha(target) -> None:
         target.get_by_text("刷新", exact=True),
     ):
         try:
-            if not await locator.count():
-                continue
-            element = locator.first
-            if not await element.is_visible():
-                continue
-            await element.click(timeout=1500)
-            clicked = True
-            break
+            for index in range(await locator.count()):
+                element = locator.nth(index)
+                if not await element.is_visible():
+                    continue
+                await element.click(timeout=1500)
+                clicked = True
+                break
+            if clicked:
+                break
         except Exception:
             continue
     if not clicked:
@@ -472,6 +497,10 @@ async def solve_yidun_click(
                 conf_override=conf_override,
                 proxy=proxy,
             )
+            if not await _bg_visible(target):
+                logger.info(f"{mode_name}弹窗在识图期间已消失, 跳过点击.")
+                logger.event("点选验证", 类型=mode_name, 结果="通过", 尝试=attempt)
+                return True
             if resolved is None:
                 logger.warn(f"第{attempt}次{mode_name}VLM识图失败,正在刷新...")
             else:

@@ -14,9 +14,9 @@ from modules.utils import (
 )
 from modules.quiz_dom import TargetClosedError
 from modules.logger import Logger
-from modules.click_captcha import solve_click_captcha
+from modules.captcha_router import solve_any_captcha
 from modules.fusion_adapter import FusionAdapter
-from modules.slider import IN_COURSE_APPEAR_TIMEOUT_MS, slider_verify
+from modules.slider import IN_COURSE_APPEAR_TIMEOUT_MS
 from modules.video_state import (
     COURSE_VIDEO_SELECTOR,
     has_valid_duration,
@@ -107,7 +107,7 @@ async def task_monitor(tasks: list[asyncio.Task]) -> None:
     checked_tasks = set()
     logger.info("任务监控已启动.")
     while any(not task.done() for task in tasks):
-        for i, task in enumerate(tasks):
+        for _i, task in enumerate(tasks):
             if task.done() and task not in checked_tasks:
                 checked_tasks.add(task)
                 if task.cancelled():
@@ -609,18 +609,16 @@ async def wait_for_verify(
             event_loop.clear()
             wait_start = time.time()
             auto_ok = False
-            if config.enableAutoCaptcha and captcha_modules:
+            if config.enableAutoCaptcha:
                 logger.info("检测到安全验证,正在尝试自动识别...", shift=True)
                 logger.event("安全验证", 状态="自动", 地址=page.url)
-                auto_ok = bool(await solve_click_captcha(page, captcha_modules))
-                if not auto_ok:
-                    auto_ok = bool(
-                        await slider_verify(
-                            page,
-                            captcha_modules,
-                            appear_timeout_ms=IN_COURSE_APPEAR_TIMEOUT_MS,
-                        )
+                auto_ok = bool(
+                    await solve_any_captcha(
+                        page,
+                        captcha_modules or [None, None],
+                        appear_timeout_ms=IN_COURSE_APPEAR_TIMEOUT_MS,
                     )
+                )
             if auto_ok and not await has_visible_verification(page):
                 event_loop.set()
                 logger.info("安全验证已自动完成.", shift=True)

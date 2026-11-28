@@ -238,61 +238,113 @@ class YidunVlmClickTests(unittest.TestCase):
         )
         self.assertIsNone(parse_click_point('{"x": 400, "y": 50}', width=320, height=160))
         self.assertIsNone(parse_click_point('{"x": -5, "y": 50}', width=320, height=160))
+        self.assertIsNone(parse_click_point('{"x": -5, "y": 50}'))
         self.assertIsNone(parse_click_point('{"x": true, "y": 50}', width=320, height=160))
+        # 兼容未闭合 <think> 与多个 x/y 候选取最后一个有效坐标
+        self.assertEqual(
+            parse_click_point('{"x": 64, "y": 32}\n<think>被截断的补充思考', width=320, height=160),
+            (64.0, 32.0),
+        )
+        self.assertEqual(
+            parse_click_point("候选1 x=999, y=10; 最终 x=120, y=55", width=320, height=160),
+            (120.0, 55.0),
+        )
         self.assertIsNone(parse_click_point("无法识别"))
 
-    def test_request_click_point_uses_sized_prompt_and_existing_chat_vision_sync(self):
-        from unittest.mock import patch
+    def test_request_click_point_passes_temperature_and_max_tokens_through_real_chat_vision_sync(
+        self,
+    ):
+        from unittest.mock import MagicMock, patch
         from modules import llm, yidun_click
 
         png = self._sample_png(320, 160)
-        captured = {}
 
-        # 与 llm_client.chat_vision_sync 完全一致的参数签名，验证不传递非法关键字参数。
-        def _fake_chat_vision_sync(
-            image_bytes,
-            prompt,
-            mime="image/png",
-            conf_override=None,
-            proxy=None,
-        ):
-            captured["image_len"] = len(image_bytes)
-            captured["prompt"] = prompt
-            captured["mime"] = mime
-            return '{"x": 140, "y": 82}'
+        def _resp(payload):
+            resp = MagicMock()
+            resp.status_code = 200
+            resp.json.return_value = payload
+            resp.text = ""
+            resp.raise_for_status.return_value = None
+            return resp
 
-        with patch.object(llm, "chat_vision_sync", side_effect=_fake_chat_vision_sync):
-            result = yidun_click.request_click_point(png, "请点击红色字母A")
+        # 穿透真实 llm.chat_vision_sync -> _chat_sync -> requests.post 验证各协议均送达 0.0 / 8000
+        cases = [
+            (
+                {
+                    "provider": "openai",
+                    "api_format": "openai",
+                    "api_key": "sk-test",
+                    "api_base": "https://api.openai.com/v1",
+                    "model": "gpt-4o-mini",
+                    "vision_model": "gpt-4o",
+                },
+                {"choices": [{"message": {"content": '{"x": 140, "y": 82}'}}]},
+                lambda body: (
+                    self.assertEqual(body["temperature"], 0.0),
+                    self.assertEqual(body["max_tokens"], 8000),
+                    self.assertIn("320x160", body["messages"][0]["content"][0]["text"]),
+                    self.assertIn("请点击红色字母A", body["messages"][0]["content"][0]["text"]),
+                ),
+            ),
+            (
+                {
+                    "provider": "anthropic",
+                    "api_format": "anthropic",
+                    "api_key": "sk-ant",
+                    "api_base": "https://api.anthropic.com",
+                    "model": "claude-sonnet-4-20250514",
+                    "vision_model": "claude-sonnet-4-20250514",
+                },
+                {"content": [{"type": "text", "text": '{"x": 140, "y": 82}'}]},
+                lambda body: (
+                    self.assertEqual(body["temperature"], 0.0),
+                    self.assertEqual(body["max_tokens"], 8000),
+                ),
+            ),
+            (
+                {
+                    "provider": "openai",
+                    "api_format": "openai-responses",
+                    "api_key": "sk-test",
+                    "api_base": "https://api.openai.com/v1",
+                    "model": "gpt-5",
+                    "vision_model": "gpt-5",
+                },
+                {"output_text": '{"x": 140, "y": 82}'},
+                lambda body: (
+                    self.assertEqual(body["temperature"], 0.0),
+                    self.assertEqual(body["max_output_tokens"], 8000),
+                ),
+            ),
+            (
+                {
+                    "provider": "gemini",
+                    "api_format": "gemini",
+                    "api_key": "AIzaTest",
+                    "api_base": "https://generativelanguage.googleapis.com/v1beta",
+                    "model": "gemini-2.5-flash",
+                    "vision_model": "gemini-2.5-flash",
+                },
+                {
+                    "candidates": [
+                        {"content": {"parts": [{"text": '{"x": 140, "y": 82}'}]}}
+                    ]
+                },
+                lambda body: (
+                    self.assertEqual(body["generationConfig"]["temperature"], 0.0),
+                    self.assertEqual(body["generationConfig"]["maxOutputTokens"], 8000),
+                ),
+            ),
+        ]
 
-        self.assertEqual(result, (140.0, 82.0, 320, 160))
-        self.assertEqual(captured["image_len"], len(png))
-        self.assertEqual(captured["mime"], "image/png")
-        self.assertIn("320x160", captured["prompt"])
-        self.assertIn("请点击红色字母A", captured["prompt"])
-
-        # 若未来视觉接口显式支持 temperature / max_tokens，也应自动透传 0 / 8000。
-        extended = {}
-
-        def _extended_vision(
-            image_bytes,
-            prompt,
-            mime="image/png",
-            conf_override=None,
-            proxy=None,
-            *,
-            temperature=None,
-            max_tokens=None,
-        ):
-            extended["temperature"] = temperature
-            extended["max_tokens"] = max_tokens
-            return '{"x": 88, "y": 44}'
-
-        with patch.object(llm, "chat_vision_sync", new=_extended_vision):
-            ext_result = yidun_click.request_click_point(png, "请点击图标")
-
-        self.assertEqual(ext_result, (88.0, 44.0, 320, 160))
-        self.assertEqual(extended["temperature"], 0)
-        self.assertEqual(extended["max_tokens"], 8000)
+        for conf, payload, check in cases:
+            with patch.object(llm.requests, "post", return_value=_resp(payload)) as post:
+                result = yidun_click.request_click_point(
+                    png, "请点击红色字母A", conf_override=conf
+                )
+            self.assertEqual(result, (140.0, 82.0, 320, 160))
+            post.assert_called_once()
+            check(post.call_args[1]["json"])
 
     def test_click_yidun_point_scales_coordinates_to_live_bounding_box(self):
         import asyncio
@@ -420,6 +472,7 @@ class YidunVlmClickTests(unittest.TestCase):
             patch.object(
                 yidun_click, "click_yidun_point", AsyncMock(return_value=(220.0, 260.0))
             ) as click_mock,
+            patch.object(yidun_click, "_bg_visible", AsyncMock(return_value=True)),
             patch.object(yidun_click, "_wait_verify_result", AsyncMock(return_value=True)),
             patch.object(slider, "solve_yidun", AsyncMock()) as slider_mock,
         ):
@@ -431,6 +484,109 @@ class YidunVlmClickTests(unittest.TestCase):
         vision_mock.assert_called_once()
         click_mock.assert_awaited_once()
         slider_mock.assert_not_called()
+
+    def test_solve_yidun_click_returns_true_without_clicking_if_modal_vanished_during_vlm(
+        self,
+    ):
+        import asyncio
+        from unittest.mock import AsyncMock, patch
+        from modules import llm, yidun_click
+
+        png = self._sample_png(320, 160)
+        fake_page = object()
+        fake_bg = object()
+        click_mock = AsyncMock()
+        with (
+            patch.object(
+                yidun_click,
+                "resolve_yidun_click_target",
+                AsyncMock(return_value=(fake_page, "文字点选")),
+            ),
+            patch.object(llm, "vision_enabled", return_value=True),
+            patch.object(yidun_click, "_wait_click_ready", AsyncMock()),
+            patch.object(yidun_click, "_read_tips", AsyncMock(return_value="请点击A")),
+            patch.object(yidun_click, "visible_locator", AsyncMock(return_value=fake_bg)),
+            patch.object(yidun_click, "_capture_bg_bytes", AsyncMock(return_value=png)),
+            patch.object(
+                yidun_click, "request_click_point", return_value=(100.0, 60.0, 320, 160)
+            ),
+            patch.object(yidun_click, "_bg_visible", AsyncMock(return_value=False)),
+            patch.object(yidun_click, "click_yidun_point", click_mock),
+        ):
+            solved = asyncio.run(yidun_click.solve_yidun_click(fake_page))
+        self.assertTrue(solved)
+        click_mock.assert_not_awaited()
+
+    def test_solve_any_captcha_does_not_let_tencent_click_hijack_yidun_word_modal(self):
+        import asyncio
+        from unittest.mock import AsyncMock, patch
+        from modules import captcha_router, click_captcha, slider, yidun_click
+
+        class _FakeElement:
+            def __init__(self, *, visible=True, cls=""):
+                self._visible = visible
+                self._cls = cls
+
+            async def is_visible(self):
+                return self._visible
+
+            async def get_attribute(self, name):
+                if name == "class":
+                    return self._cls
+                return None
+
+        class _FakeLocator:
+            def __init__(self, items):
+                self._items = list(items)
+
+            async def count(self):
+                return len(self._items)
+
+            def nth(self, idx):
+                return self._items[idx]
+
+        class _FakeYidunPage:
+            frames = []
+
+            def __init__(self):
+                self._yidun_root = _FakeElement(visible=True, cls="yidun yidun--word")
+
+            def locator(self, selector):
+                if ".yidun" in selector:
+                    return _FakeLocator([self._yidun_root])
+                return _FakeLocator([])
+
+            def get_by_text(self, pattern):
+                # 模拟易盾点选页面同时出现 "请点击红色的A" 文案
+                text = "请点击红色的A"
+                matched = (
+                    pattern.search(text) is not None
+                    if hasattr(pattern, "search")
+                    else str(pattern) in text
+                )
+                return _FakeLocator([_FakeElement()] if matched else [])
+
+        page = _FakeYidunPage()
+        # 真实调用 click_captcha.resolve_click_captcha_target，不应误命中易盾弹窗
+        self.assertIsNone(asyncio.run(click_captcha.resolve_click_captcha_target(page)))
+
+        with (
+            patch.object(
+                click_captcha, "solve_click_captcha", AsyncMock(return_value=True)
+            ) as tencent_click_mock,
+            patch.object(
+                yidun_click, "solve_yidun_click", AsyncMock(return_value=True)
+            ) as yidun_click_mock,
+            patch.object(slider, "solve_yidun", AsyncMock()) as slider_mock,
+        ):
+            solved = asyncio.run(
+                captcha_router.solve_any_captcha(page, [None, None], max_attempts=3)
+            )
+
+        self.assertTrue(solved)
+        tencent_click_mock.assert_not_awaited()
+        yidun_click_mock.assert_awaited_once()
+        slider_mock.assert_not_awaited()
 
 
 if __name__ == "__main__":
