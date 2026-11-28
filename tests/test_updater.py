@@ -325,7 +325,7 @@ class SslFallbackTests(unittest.TestCase):
 
 class VersionSourceTests(unittest.TestCase):
     def test_pyproject_takes_version_from_code(self):
-        with open(os.path.join(PROJECT_ROOT, "pyproject.toml"), "r", encoding="utf-8") as file:
+        with open(os.path.join(PROJECT_ROOT, "pyproject.toml"), encoding="utf-8") as file:
             content = file.read()
         self.assertIn('dynamic = ["version"]', content)
         self.assertIn('attr = "modules.version.__engine_version__"', content)
@@ -342,19 +342,19 @@ class VersionSourceTests(unittest.TestCase):
         import json
 
         tauri_conf_path = os.path.join(PROJECT_ROOT, "gui", "src-tauri", "tauri.conf.json")
-        with open(tauri_conf_path, "r", encoding="utf-8") as f:
+        with open(tauri_conf_path, encoding="utf-8") as f:
             tauri_conf = json.load(f)
         self.assertEqual(tauri_conf.get("version"), __gui_version__)
 
         cargo_toml_path = os.path.join(PROJECT_ROOT, "gui", "src-tauri", "Cargo.toml")
-        with open(cargo_toml_path, "r", encoding="utf-8") as f:
+        with open(cargo_toml_path, encoding="utf-8") as f:
             cargo_toml = f.read()
         cargo_match = re.search(r'^version\s*=\s*"([^"]+)"', cargo_toml, re.MULTILINE)
         self.assertIsNotNone(cargo_match, "Cargo.toml missing package version")
         self.assertEqual(cargo_match.group(1), __gui_version__)
 
         package_json_path = os.path.join(PROJECT_ROOT, "gui", "package.json")
-        with open(package_json_path, "r", encoding="utf-8") as f:
+        with open(package_json_path, encoding="utf-8") as f:
             package_json = json.load(f)
         self.assertEqual(package_json.get("version"), __gui_version__)
 
@@ -483,7 +483,9 @@ class RateLimitWebFallbackTests(unittest.TestCase):
             <updated>2026-11-23T08:00:00Z</updated>
             <link rel="alternate" type="text/html" href="{tag_url}"/>
             <title>Autovisor GUI v3.19.0</title>
-            <content type="html">&lt;h2&gt;更新内容&lt;/h2&gt;&lt;ul&gt;&lt;li&gt;修复 API 限流&lt;/li&gt;&lt;/ul&gt;</content>
+            <content type="html">
+              &lt;h2&gt;更新内容&lt;/h2&gt;&lt;ul&gt;&lt;li&gt;修复 API 限流&lt;/li&gt;&lt;/ul&gt;
+            </content>
           </entry>
         </feed>
         '''

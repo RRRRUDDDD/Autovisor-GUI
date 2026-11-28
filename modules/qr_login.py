@@ -183,6 +183,8 @@ def qr_login_for_cookies(
             resp = client.get(QR_IMG_URL, timeout=15)
             resp.raise_for_status()
             payload = resp.json()
+            if not isinstance(payload, dict):
+                raise RuntimeError("获取登录二维码失败：接口返回非对象")
             qr_token = payload.get("qrToken")
             img_b64 = payload.get("img")
             if not qr_token or not img_b64:
@@ -216,6 +218,8 @@ def qr_login_for_cookies(
                     )
                     poll_resp.raise_for_status()
                     info = poll_resp.json()
+                    if not isinstance(info, dict):
+                        raise ValueError("二维码状态接口返回非对象")
                 except (requests.RequestException, ValueError) as exc:
                     if monotonic_fn() >= deadline:
                         raise RuntimeError(f"扫码登录轮询超时: {exc}") from exc
@@ -333,6 +337,8 @@ class QrLoginManager:
             resp = client.get(QR_IMG_URL, timeout=15)
             resp.raise_for_status()
             payload = resp.json()
+            if not isinstance(payload, dict):
+                raise RuntimeError("获取登录二维码失败：接口返回非对象")
             qr_token = str(payload.get("qrToken") or "").strip()
             img_b64 = str(payload.get("img") or "").strip()
             if not qr_token or not img_b64:
@@ -379,6 +385,8 @@ class QrLoginManager:
         )
         poll_resp.raise_for_status()
         info = poll_resp.json()
+        if not isinstance(info, dict):
+            raise RuntimeError("二维码状态查询失败：接口返回非对象")
         status = info.get("status")
 
         if status == -1:

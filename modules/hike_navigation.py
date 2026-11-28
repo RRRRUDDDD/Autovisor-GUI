@@ -176,8 +176,9 @@ def collect_hike_document_nodes(nodes) -> list[dict]:
             if not isinstance(node, dict):
                 continue
             children = node.get("childList")
-            if isinstance(children, list) and children:
-                _walk(children, depth + 1)
+            if children is not None:
+                if isinstance(children, list) and children:
+                    _walk(children, depth + 1)
                 continue
             node_type = str(node.get("type") if node.get("type") is not None else "").strip()
             if node_type == "0" and not node.get("fileId"):
@@ -242,8 +243,9 @@ def pick_hike_file_id_from_tree(nodes, *, review_mode: bool = False) -> str:
             if not isinstance(node, dict):
                 continue
             children = node.get("childList")
-            if isinstance(children, list) and children:
-                _walk(children, depth + 1)
+            if children is not None:
+                if isinstance(children, list) and children:
+                    _walk(children, depth + 1)
                 continue
             # 空目录（type == 0 且无 fileId）不是可播放文件
             if str(node.get("type") if node.get("type") is not None else "").strip() == "0" and not node.get("fileId"):
@@ -462,7 +464,7 @@ def mark_hike_documents_read_via_api(
                 status, body, auth_err = _studyresources_get_json(
                     client,
                     HIKE_STU_VIEW_FILE_URL,
-                    {"courseId": cid, "fileId": fid},
+                    {"courseId": cid, "fileId": fid, "_": int(time.time() * 1000)},
                     state=state,
                     own_client=own_client,
                 )

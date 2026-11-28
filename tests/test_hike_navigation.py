@@ -353,6 +353,7 @@ class HikeDocumentMarkingTests(unittest.IsolatedAsyncioTestCase):
                     {"id": 1004, "fileId": None, "dataType": None, "name": "章节讨论"},
                     {"id": 1005, "type": 1, "dataType": 3, "name": "教学视频.mp4", "totalTime": 300, "studyTime": 0},
                     {"id": 1006, "type": 1, "dataType": 2, "name": "已完成标记.pptx", "isFinish": 1},
+                    {"id": 1007, "type": 1, "dataType": 1, "name": "空子目录", "childList": []},
                 ],
             }
         ]
@@ -412,7 +413,11 @@ class HikeDocumentMarkingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(summary, {"found": 1, "done": 1, "failed": 0})
         self.assertEqual(sso_calls, [STUDYRESOURCES_SSO_URL])
         view_calls = [p for u, p in sess.calls if u == HIKE_STU_VIEW_FILE_URL]
-        self.assertEqual(view_calls, [{"courseId": "11559973", "fileId": "1001"}])
+        self.assertEqual(len(view_calls), 1)
+        self.assertEqual(view_calls[0]["courseId"], "11559973")
+        self.assertEqual(view_calls[0]["fileId"], "1001")
+        self.assertIsInstance(view_calls[0].get("_"), int)
+        self.assertGreater(view_calls[0]["_"], 0)
 
     async def test_complete_hike_document_nodes_skips_review_mode_and_non_hike(self):
         hike_url = "https://hike.zhihuishu.com/aidedteaching/sourceLearning/sourceLearning?courseId=11559973&fileId=35338435"

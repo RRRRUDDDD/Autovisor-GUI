@@ -97,7 +97,7 @@ pub async fn search_schools_async(query: &str, proxy: &str) -> Result<Vec<School
         None => {
             let mut builder = reqwest::Client::builder()
                 .timeout(Duration::from_secs(12))
-                .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36");
+                .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36");
             let trimmed_proxy = proxy.trim();
             if !trimmed_proxy.is_empty() {
                 if let Ok(p) = reqwest::Proxy::all(trimmed_proxy) {
