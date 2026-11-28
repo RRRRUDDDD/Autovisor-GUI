@@ -372,8 +372,14 @@ class QuestionBankClientTests(unittest.TestCase):
             attempts["n"] += 1
             return _Response({"code": 0}, status=401)
 
-        client, _ = self._client(
-            handler, max_retries=3, retry_delay=0.1, sleep=sleeps.append
+        session = _Session(handler)
+        client = qb.QuestionBankClient(
+            token=TOKEN,
+            query_url="https://bank.example/query",
+            session=session,
+            max_retries=3,
+            retry_delay=0.1,
+            sleep=sleeps.append,
         )
         res = client.probe()
         self.assertFalse(res["ok"])
@@ -741,6 +747,71 @@ class HomeworkWorkerBankTests(unittest.TestCase):
         extra = ai_exam._build_prompt_extra({"content": "题干"}, 1, [])
         self.assertEqual(extra.get("题库参考"), "自西向东")
         self.assertIs(extra.get("题库AI生成"), True)
+
+    def test_retries_http_429_and_preserves_multiline_bank_answer_in_zhidao_prompt(self):
+        attempts = {"n": 0}
+        sleeps = []
+
+        def handler(url, kwargs):
+            if url.endswith("/info"):
+                return _Response({"code": 1, "data": {"times": 10}})
+            attempts["n"] += 1
+            if attempts["n"] == 1:
+                return _Response({"error": "too many requests"}, status=429)
+            return _Response(
+                {
+                    "code": 1,
+                    "data": {
+                        "answer": "选项一#\n选项二#",
+                        "times": 9,
+                        "ai": False,
+                    },
+                }
+            )
+
+        session = _Session(handler)
+        client = qb.QuestionBankClient(
+            token=TOKEN,
+            query_url="https://bank.example/query",
+            session=session,
+            max_retries=3,
+            retry_delay=0.1,
+            sleep=sleeps.append,
+        )
+        res = client.query_result("多选题", ["选项一", "选项二"])
+        self.assertIsNotNone(res)
+        self.assertEqual(res.answer, "选项一\n选项二")
+        self.assertEqual(attempts["n"], 2)
+        self.assertEqual(sleeps, [0.1])
+
+        # 验证知到作业/考试 prompt 保留多行题库参考换行，不被 _plain() 拍平
+        exam_prompts = []
+        exam_worker = ZhidaoExamWorker(
+            None,
+            course_id="course",
+            store=object(),
+            answerer=lambda p: (exam_prompts.append(p), '```answer\n[{"id": 21}]\n```')[1],
+            question_bank=client,
+            sleep=lambda _: None,
+        )
+        exam_worker._answer_question(HOMEWORK_QUESTION, None)
+        self.assertIn("选项一\n选项二", exam_prompts[0])
+
+        # 验证仅实现纯字符串 query() 的旧式题库来源标记为未知（ai=None）而非强行标为题库数据库
+        from modules.answer_service import QuestionBankHelper
+
+        class _LegacyBank:
+            def enabled(self):
+                return True
+
+            def query(self, title, options, qtype):
+                return "传统答案"
+
+        helper = QuestionBankHelper(_LegacyBank())
+        legacy_res = helper.query_result("题目", ["A"], 1)
+        self.assertIsNotNone(legacy_res)
+        self.assertEqual(legacy_res.answer, "传统答案")
+        self.assertIsNone(legacy_res.ai)
 
 
 if __name__ == "__main__":

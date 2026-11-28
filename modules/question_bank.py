@@ -54,12 +54,16 @@ class QuestionBankResult:
     """外部题库单次命中的结构化结果."""
 
     answer: str
-    ai: bool = False
+    ai: bool | None = False
     remaining: int | None = None
 
     @property
     def source_label(self) -> str:
-        return "题库AI生成" if self.ai else "题库数据库"
+        if self.ai is True:
+            return "题库AI生成"
+        if self.ai is False:
+            return "题库数据库"
+        return "外部题库"
 
 
 def type_name(question_type) -> str:

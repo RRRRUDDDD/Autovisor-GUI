@@ -59,7 +59,7 @@ class QuestionBankHelper:
             except Exception as exc:
                 logger.debug(f"外部题库查询降级: {exc}")
                 return None
-            return QuestionBankResult(answer=str(answer), ai=False) if answer else None
+            return QuestionBankResult(answer=str(answer), ai=None) if answer else None
         bank = self.get()
         if bank is None or not bank.enabled():
             return None
@@ -76,7 +76,7 @@ class QuestionBankHelper:
             answer = bank.query(title, options, question_type) or ""
             if not answer:
                 return None
-            return QuestionBankResult(answer=str(answer), ai=False)
+            return QuestionBankResult(answer=str(answer), ai=None)
         except Exception as exc:
             logger.debug(f"外部题库查询降级: {exc}")
             return None

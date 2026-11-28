@@ -42,6 +42,37 @@ fn default_question_bank_scopes() -> Vec<String> {
     vec!["zhidao_exam".to_string(), "ai_exam".to_string()]
 }
 
+fn deserialize_question_bank_scopes<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+    match value {
+        serde_json::Value::Null => Ok(default_question_bank_scopes()),
+        serde_json::Value::Array(items) => Ok(items
+            .into_iter()
+            .filter_map(|item| match item {
+                serde_json::Value::String(s) => {
+                    let trimmed = s.trim();
+                    if trimmed.is_empty() {
+                        None
+                    } else {
+                        Some(trimmed.to_string())
+                    }
+                }
+                _ => None,
+            })
+            .collect()),
+        serde_json::Value::String(text) => Ok(text
+            .split(|c: char| c.is_whitespace() || matches!(c, ',' | ';' | '|' | '，' | '、'))
+            .map(str::trim)
+            .filter(|part| !part.is_empty())
+            .map(ToString::to_string)
+            .collect()),
+        _ => Ok(default_question_bank_scopes()),
+    }
+}
+
 fn normalize_question_bank_scopes(raw: &[String]) -> Vec<String> {
     let mut allowed = std::collections::HashSet::new();
     for item in raw {
@@ -198,7 +229,11 @@ pub struct LlmConfig {
     pub question_bank_token: String,
     #[serde(default = "default_question_bank_url", alias = "question_bank_url")]
     pub question_bank_url: String,
-    #[serde(default = "default_question_bank_scopes", alias = "question_bank_scopes")]
+    #[serde(
+        default = "default_question_bank_scopes",
+        alias = "question_bank_scopes",
+        deserialize_with = "deserialize_question_bank_scopes"
+    )]
     pub question_bank_scopes: Vec<String>,
 }
 
@@ -281,5 +316,32 @@ impl LlmConfig {
             "question_bank_url": norm.question_bank_url,
             "question_bank_scopes": norm.question_bank_scopes,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn deserializes_question_bank_scopes_from_null_string_and_array() {
+        let from_null: LlmConfig = serde_json::from_str(r#"{"question_bank_scopes": null}"#)
+            .expect("null question_bank_scopes should fall back to defaults");
+        assert_eq!(
+            from_null.normalized().question_bank_scopes,
+            vec!["zhidao_exam".to_string(), "ai_exam".to_string()]
+        );
+
+        let from_csv: LlmConfig =
+            serde_json::from_str(r#"{"question_bank_scopes": "ai_exam, zhidao_homework  invalid"}"#)
+                .expect("comma/whitespace string should deserialize");
+        assert_eq!(
+            from_csv.normalized().question_bank_scopes,
+            vec!["zhidao_homework".to_string(), "ai_exam".to_string()]
+        );
+
+        let from_empty: LlmConfig = serde_json::from_str(r#"{"question_bank_scopes": []}"#)
+            .expect("empty array should remain empty");
+        assert!(from_empty.normalized().question_bank_scopes.is_empty());
     }
 }
