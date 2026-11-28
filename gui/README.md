@@ -30,7 +30,7 @@ cd ..
 powershell -ExecutionPolicy Bypass -File .\build-portable.ps1
 ```
 
-构建完成后，便携目录位于 `Autovisor/dist/Autovisor-GUI-1.3.0-windows-amd64/`：
+构建完成后，便携目录位于 `Autovisor/dist/Autovisor-GUI-1.3.1-windows-amd64/`：
 - `Autovisor GUI.exe` — 一体化桌面主程序
 - `runtime/` — 内置无感后端运行时（自动托管，无需手动操作）
 - `userdata/` — 首次启动自动生成的用户配置、Cookie 与运行日志目录

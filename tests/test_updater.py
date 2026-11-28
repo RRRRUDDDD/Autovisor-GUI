@@ -334,9 +334,9 @@ class VersionSourceTests(unittest.TestCase):
             "pyproject.toml 不应再写死 version",
         )
         self.assertEqual(updater.__version__, __version__)
-        self.assertEqual(__engine_version__, "3.22.0")
-        self.assertEqual(__version__, "3.22.0(Autovisor GUI Edition)")
-        self.assertEqual(__gui_version__, "1.3.0")
+        self.assertEqual(__engine_version__, "3.22.1")
+        self.assertEqual(__version__, "3.22.1(Autovisor GUI Edition)")
+        self.assertEqual(__gui_version__, "1.3.1")
 
     def test_desktop_and_python_versions_are_in_sync(self):
         import json

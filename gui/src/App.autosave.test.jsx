@@ -13,8 +13,8 @@ function makeRuntime(overrides = {}) {
     cookieExists: true,
     cookieCount: 5,
     cookieModifiedAt: null,
-    version: '1.3.0',
-    backendVersion: '3.22.0(Autovisor GUI Edition)',
+    version: '1.3.1',
+    backendVersion: '3.22.1(Autovisor GUI Edition)',
     closeBehavior: 'exit',
     detectedBrowsers: [
       {

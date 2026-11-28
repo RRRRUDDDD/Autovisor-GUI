@@ -8,7 +8,7 @@
 
 一个开箱即用的桌面客户端：登录账号 → 自动识别课程 → 一键开始，学习进度、日志与提醒全部可视化。
 
-[![Release](https://img.shields.io/badge/release-v1.3.0-2563eb)](https://github.com/RRRRUDDDD/Autovisor-GUI/releases)
+[![Release](https://img.shields.io/badge/release-v1.3.1-2563eb)](https://github.com/RRRRUDDDD/Autovisor-GUI/releases)
 [![Tauri](https://img.shields.io/badge/Tauri-2-24C8DB?logo=tauri&logoColor=white)](https://tauri.app)
 [![React](https://img.shields.io/badge/React-18-61DAFB?logo=react&logoColor=black)](https://react.dev)
 [![Rust](https://img.shields.io/badge/Rust-stable-000000?logo=rust)](https://www.rust-lang.org)
