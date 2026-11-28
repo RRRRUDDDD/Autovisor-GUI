@@ -552,6 +552,83 @@ class LlmAnsweringLogTests(unittest.TestCase):
         self.assertEqual(content[0]["source"]["media_type"], "image/jpeg")
         self.assertEqual(content[1]["type"], "text")
 
+    def test_chat_vision_sync_forwards_max_tokens_and_temperature_across_all_protocols(self):
+        cases = [
+            (
+                "openai",
+                "https://api.openai.com/v1",
+                {"choices": [{"message": {"content": "ok"}}]},
+                lambda b: (
+                    self.assertEqual(b["temperature"], 0.25),
+                    self.assertEqual(b["max_tokens"], 8000),
+                ),
+            ),
+            (
+                "azure",
+                "https://demo.openai.azure.com",
+                {"choices": [{"message": {"content": "ok"}}]},
+                lambda b: (
+                    self.assertEqual(b["temperature"], 0.25),
+                    self.assertEqual(b["max_tokens"], 8000),
+                ),
+            ),
+            (
+                "anthropic",
+                "https://api.anthropic.com",
+                {"content": [{"type": "text", "text": "ok"}]},
+                lambda b: (
+                    self.assertEqual(b["temperature"], 0.25),
+                    self.assertEqual(b["max_tokens"], 8000),
+                ),
+            ),
+            (
+                "gemini",
+                "https://generativelanguage.googleapis.com/v1beta",
+                {"candidates": [{"content": {"parts": [{"text": "ok"}]}}]},
+                lambda b: (
+                    self.assertEqual(b["generationConfig"]["temperature"], 0.25),
+                    self.assertEqual(b["generationConfig"]["maxOutputTokens"], 8000),
+                ),
+            ),
+            (
+                "openai-responses",
+                "https://api.openai.com/v1",
+                {"output_text": "ok"},
+                lambda b: (
+                    self.assertEqual(b["temperature"], 0.25),
+                    self.assertEqual(b["max_output_tokens"], 8000),
+                ),
+            ),
+            (
+                "ollama",
+                "http://127.0.0.1:11434",
+                {"message": {"content": "ok"}},
+                lambda b: (
+                    self.assertEqual(b["options"]["temperature"], 0.25),
+                    self.assertEqual(b["options"]["num_predict"], 8000),
+                ),
+            ),
+        ]
+        for fmt, base, payload, check in cases:
+            mock_resp = _mock_response(payload)
+            with patch("modules.llm.requests.post", return_value=mock_resp) as post:
+                reply = llm.chat_vision_sync(
+                    b"fake-img",
+                    "prompt",
+                    conf_override={
+                        "provider": fmt,
+                        "api_format": fmt,
+                        "api_key": "sk-test",
+                        "api_base": base,
+                        "model": "m",
+                        "vision_model": "vm",
+                    },
+                    temperature=0.25,
+                    max_tokens=8000,
+                )
+            self.assertEqual(reply, "ok")
+            check(post.call_args[1]["json"])
+
 
 def _sse_delta(delta: dict) -> str:
     return "data: " + json.dumps({"choices": [{"delta": delta}]}, ensure_ascii=False)

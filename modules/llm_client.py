@@ -673,9 +673,11 @@ def _chat_sync(
     stream_timeout: float = DEFAULT_STREAM_TIMEOUT,
     stream_idle_timeout: float = DEFAULT_STREAM_IDLE_TIMEOUT,
     max_tokens: int | None = None,
+    temperature: float | None = None,
     timeout: int = 120,
 ) -> str:
     fmt = (api_format or "openai").strip().lower()
+    temp = 0 if temperature is None else temperature
     proxies = _resolve_proxies(api, proxy)
     headers = {"Content-Type": "application/json"}
 
@@ -706,7 +708,7 @@ def _chat_sync(
             "max_tokens": max_tokens or 4096,
             "messages": [{"role": "user", "content": content}],
         }
-        body = {**base_body, "temperature": 0}
+        body = {**base_body, "temperature": temp}
         data = _post_with_fallback(api, headers, body, base_body, proxies, timeout=timeout)
         return _extract_anthropic_content(data)
 
@@ -717,7 +719,7 @@ def _chat_sync(
         if image_b64:
             parts.append({"inline_data": {"mime_type": image_mime, "data": image_b64}})
         base_body = {"contents": [{"role": "user", "parts": parts}]}
-        gen_cfg = {"temperature": 0}
+        gen_cfg = {"temperature": temp}
         if max_tokens:
             gen_cfg["maxOutputTokens"] = max_tokens
         if json_mode:
@@ -737,7 +739,10 @@ def _chat_sync(
             "messages": [message],
             "stream": False,
         }
-        body = {**base_body, "options": {"temperature": 0}}
+        options = {"temperature": temp}
+        if max_tokens:
+            options["num_predict"] = max_tokens
+        body = {**base_body, "options": options}
         if json_mode:
             body["format"] = "json"
         data = _post_with_fallback(api, headers, body, base_body, proxies, timeout=timeout)
@@ -762,6 +767,10 @@ def _chat_sync(
         else:
             base_body = {"model": model, "input": prompt}
         body = dict(base_body)
+        if temperature is not None:
+            body["temperature"] = temperature
+        if max_tokens:
+            body["max_output_tokens"] = max_tokens
         if json_mode:
             body["text"] = {"format": {"type": "json_object"}}
         data = _post_with_fallback(api, headers, body, base_body, proxies, timeout=timeout)
@@ -781,7 +790,7 @@ def _chat_sync(
             {"type": "image_url", "image_url": {"url": data_url}},
         ]
     base_body = {"model": model, "messages": [{"role": "user", "content": content}]}
-    body = {**base_body, "temperature": 0}
+    body = {**base_body, "temperature": temp}
     if max_tokens:
         body["max_tokens"] = max_tokens
     if json_mode:
@@ -961,6 +970,9 @@ def chat_vision_sync(
     mime: str = "image/png",
     conf_override: dict | None = None,
     proxy: str | None = None,
+    *,
+    temperature: float | None = None,
+    max_tokens: int | None = None,
 ) -> str:
     """用配置的视觉模型识别图片并回答 prompt（复用主模型的接口与鉴权）。"""
     if requests is None:
@@ -978,6 +990,11 @@ def chat_vision_sync(
     fmt = c.get("api_format") or infer_api_format(c.get("api_base", ""), c.get("provider", ""))
     api = build_endpoint(c["api_base"], model, fmt, c.get("api_version", ""))
     chat_fn = _resolve_facade("_chat_sync", _chat_sync)
+    extra = {}
+    if temperature is not None:
+        extra["temperature"] = temperature
+    if max_tokens is not None:
+        extra["max_tokens"] = max_tokens
     return chat_fn(
         api,
         c["api_key"],
@@ -988,6 +1005,7 @@ def chat_vision_sync(
         api_version=c.get("api_version", ""),
         proxy=proxy,
         image=(image_bytes, mime),
+        **extra,
     )
 
 
