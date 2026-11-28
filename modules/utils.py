@@ -17,7 +17,7 @@ from modules.logger import Logger
 from modules.paths import get_resource_path as _get_resource_path
 from modules.popups import dismiss_course_popups
 from modules.video_state import COURSE_VIDEO_SELECTOR
-from modules.window_control import (
+from modules.window_control import (  # noqa: F401
     display_window,
     get_browser_window,
     hide_window,
@@ -103,7 +103,7 @@ def filter_zhihuishu_cookies(cookies, now=None):
 def load_cookies(filename="cookies.json"):
     """从文件加载 Cookies, 顺带过滤已过期与非智慧树域名的记录。"""
     try:
-        with open(filename, "r", encoding="utf-8") as f:
+        with open(filename, encoding="utf-8") as f:
             data = json.load(f)
     except FileNotFoundError:
         return None
@@ -154,7 +154,7 @@ def normalize_zhihuishu_cookies(cookies, now=None):
 
 
 def import_zhihuishu_cookies(source, destination="cookies.json") -> int:
-    with open(source, "r", encoding="utf-8") as file:
+    with open(source, encoding="utf-8") as file:
         raw = json.load(file)
     if not isinstance(raw, list):
         raise ValueError("Cookie 文件必须是列表格式")
@@ -168,6 +168,9 @@ def import_zhihuishu_cookies(source, destination="cookies.json") -> int:
 def clear_cookies(filename="cookies.json"):
     if os.path.exists(filename):
         os.remove(filename)
+    from modules.yidun_fp import clear_session_fp
+
+    clear_session_fp()
 
 # 将python终端前置
 def bring_console_to_front():

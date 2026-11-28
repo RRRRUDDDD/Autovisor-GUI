@@ -370,6 +370,74 @@ class YidunAlphaSliderTests(unittest.TestCase):
             ],
         )
 
+    def test_solve_yidun_preserves_piece_offset_on_dom_fallback_and_clamps_negative(self):
+        from modules import slider
+
+        moved = []
+
+        async def _fake_move(_target, distance, bias=slider.GAP_BIAS_PX):
+            moved.append((float(distance), float(bias)))
+
+        # 1) used_dom=False 且存在 piece_offset=10（gap_x=150 -> drag_distance=140+GAP_BIAS_PX）
+        with (
+            patch.object(slider, "_wait_puzzle_ready", AsyncMock()),
+            patch.object(
+                slider,
+                "_measure_yidun_puzzle",
+                AsyncMock(return_value=(150.0, 40.0, 140.0 + GAP_BIAS_PX, False, 0.8)),
+            ),
+            patch.object(slider, "move_slider", side_effect=_fake_move),
+            patch.object(slider, "_wait_verify_result", AsyncMock(return_value=True)),
+        ):
+            ok = asyncio.run(slider.solve_yidun(object(), [np, cv2], max_attempts=1))
+        self.assertTrue(ok)
+        self.assertEqual(len(moved), 1)
+        # 基线应保留 piece_offset 扣除后的 140.0，而非原始 gap_x=150.0
+        self.assertAlmostEqual(moved[0][0], 140.0, places=3)
+        self.assertAlmostEqual(moved[0][1], GAP_BIAS_PX, places=3)
+
+        # 2) used_dom=True 且 drag_distance=1.0，第 3 次尝试 probe=-2.0 不得传入负位移
+        moved.clear()
+        with (
+            patch.object(slider, "_wait_puzzle_ready", AsyncMock()),
+            patch.object(
+                slider,
+                "_measure_yidun_puzzle",
+                AsyncMock(return_value=(1.0, 40.0, 1.0, True, 0.8)),
+            ),
+            patch.object(slider, "move_slider", side_effect=_fake_move),
+            patch.object(slider, "_wait_verify_result", AsyncMock(return_value=False)),
+            patch.object(slider, "_puzzle_visible", AsyncMock(return_value=True)),
+            patch.object(slider, "_refresh_puzzle", AsyncMock()),
+        ):
+            ok2 = asyncio.run(slider.solve_yidun(object(), [np, cv2], max_attempts=3))
+        self.assertFalse(ok2)
+        self.assertEqual(len(moved), 3)
+        self.assertAlmostEqual(moved[0][0] + moved[0][1], 1.0, places=3)
+        self.assertAlmostEqual(moved[1][0] + moved[1][1], 3.0, places=3)
+        self.assertGreaterEqual(moved[2][0], 0.0)
+        self.assertEqual(moved[2][0] + moved[2][1], 0.0)
+
+    def test_opencv_edge_cases_gray_bgr_transparent_and_oversized_block(self):
+        bg, block, _ = self._build_synthetic_yidun_pair(gap_x=120)
+
+        # 2D 灰度块与 3 通道 BGR 块均应正常提取边缘并完成匹配
+        gray_block = cv2.cvtColor(block[:, :, :3], cv2.COLOR_BGR2GRAY)
+        bgr_block = block[:, :, :3]
+        self.assertGreater(int(np.count_nonzero(process_block_image(gray_block, cv2=cv2, np=np))), 0)
+        self.assertGreater(int(np.count_nonzero(process_block_image(bgr_block, cv2=cv2, np=np))), 0)
+
+        # 全透明空 Alpha 块应返回 0.0 匹配分
+        transparent = np.zeros((160, 60, 4), dtype=np.uint8)
+        score, loc = _match_yidun_gap(bg, transparent, cv2, np)
+        self.assertEqual(score, 0.0)
+        self.assertEqual(loc, (0, 0))
+
+        # front > background 应抛出 ValueError
+        oversized = np.full((200, 360, 4), 255, dtype=np.uint8)
+        with self.assertRaises(ValueError):
+            _match_yidun_gap(bg, oversized, cv2, np)
+
 
 if __name__ == "__main__":
     unittest.main()

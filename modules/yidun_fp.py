@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import re
 import threading
+import time
 from urllib.parse import parse_qs, quote, unquote, urlsplit
 
 from modules.logger import Logger
@@ -20,8 +21,9 @@ FP_MAX_LEN = 260
 YIDUN_GET_HOST = "c.dun.163.com"
 YIDUN_GET_PATH = "/api/v3/get"
 
-_FP_TAIL_RE = re.compile(r":\d{13}$")
+_FP_TAIL_RE = re.compile(r":(\d{13})$")
 _MAX_CONTEXT_ENTRIES = 32
+_FP_STALE_WARN_MS = 7 * 24 * 3600 * 1000
 
 _PROBE_STORAGE_JS = """() => {
     const found = [];
@@ -38,17 +40,45 @@ _PROBE_STORAGE_JS = """() => {
     const inspect = (raw) => {
         if (typeof raw !== 'string') return;
         push(raw);
+        if (raw.includes('%')) {
+            try {
+                push(decodeURIComponent(raw));
+            } catch (_) {}
+        }
         if (raw.length >= 150 && raw.length <= 4096 && (raw[0] === '{' || raw[0] === '[')) {
             try {
                 const parsed = JSON.parse(raw);
                 if (parsed && typeof parsed === 'object') {
                     for (const value of Object.values(parsed)) {
-                        if (typeof value === 'string') push(value);
+                        if (typeof value === 'string') {
+                            push(value);
+                            if (value.includes('%')) {
+                                try {
+                                    push(decodeURIComponent(value));
+                                } catch (_) {}
+                            }
+                        }
                     }
                 }
             } catch (_) {}
         }
     };
+    try {
+        if (typeof window.gdxidpyhxde === 'string') {
+            inspect(window.gdxidpyhxde);
+        }
+    } catch (_) {}
+    try {
+        const rawCookies = typeof document !== 'undefined' ? (document.cookie || '') : '';
+        for (const pair of rawCookies.split(';')) {
+            const idx = pair.indexOf('=');
+            if (idx <= 0) continue;
+            const name = pair.slice(0, idx).trim();
+            if (name === 'gdxidpyhxdE') {
+                inspect(pair.slice(idx + 1).trim());
+            }
+        }
+    } catch (_) {}
     for (const storeName of ['localStorage', 'sessionStorage']) {
         try {
             const store = window[storeName];
@@ -171,11 +201,11 @@ class YidunFpStore:
                     del self._by_context[next(iter(self._by_context))]
         return True
 
-    def get(self, *, context=None) -> str | None:
+    def get(self, *, context=None, fallback_latest: bool = False) -> str | None:
         with self._lock:
             if context is not None:
                 value = self._by_context.get(id(context))
-                if value:
+                if value or not fallback_latest:
                     return value
             return self._latest
 
@@ -193,9 +223,9 @@ class YidunFpStore:
 _DEFAULT_STORE = YidunFpStore()
 
 
-def get_session_fp(context=None) -> str | None:
-    """读取当前内存会话中已捕获的易盾 fp；未捕获返回 None。"""
-    return _DEFAULT_STORE.get(context=context)
+def get_session_fp(context=None, *, fallback_latest: bool = False) -> str | None:
+    """读取当前内存会话中已捕获的易盾 fp；传入明确 context 时默认不跨上下文串读。"""
+    return _DEFAULT_STORE.get(context=context, fallback_latest=fallback_latest)
 
 
 def set_session_fp(fp: str | None, *, context=None, raw_fp: str | None = None) -> bool:
@@ -274,13 +304,29 @@ class YidunFpCollector:
             return
 
 
+def _warn_if_fp_stale(fp: str) -> None:
+    match = _FP_TAIL_RE.search(fp or "")
+    if not match:
+        return
+    try:
+        ts_ms = int(match.group(1))
+    except ValueError:
+        return
+    age_ms = int(time.time() * 1000) - ts_ms
+    if age_ms > _FP_STALE_WARN_MS:
+        logger.debug(
+            f"检测到较旧的易盾设备指纹 fp（已距今约 {age_ms // (24 * 3600 * 1000)} 天），"
+            "若接口风控失败将自动回退浏览器过码."
+        )
+
+
 async def probe_fp_from_page(
     page,
     *,
     store: YidunFpStore | None = None,
     context=None,
 ) -> str | None:
-    """兜底探测页面 localStorage/sessionStorage 中已存在的易盾 fp（不抛出异常）。"""
+    """兜底探测页面全局变量、Cookie 与 Web Storage 中已存在的易盾 fp（不抛出异常）。"""
     active_store = store or _DEFAULT_STORE
     effective_ctx = context if context is not None else getattr(page, "context", None)
     existing = active_store.get(context=effective_ctx)
@@ -297,8 +343,12 @@ async def probe_fp_from_page(
     if not isinstance(candidates, (list, tuple)):
         return None
     for item in candidates:
-        fp = normalize_fp(item)
-        if active_store.set(fp, context=effective_ctx):
+        raw_item = str(item or "")
+        fp = normalize_fp(raw_item)
+        if "%" in fp:
+            fp = normalize_fp(unquote(fp))
+        if active_store.set(fp, context=effective_ctx, raw_fp=raw_item or None):
+            _warn_if_fp_stale(fp)
             logger.debug(f"已从页面存储提取易盾设备指纹 fp (len={len(fp)})")
             return fp
     return None

@@ -184,18 +184,33 @@ async def captcha_visible(page: Page) -> bool:
 async def _wait_puzzle_ready(target, timeout_ms: int = 5000) -> None:
     """等加载动画结束、背景图可见, 避免读到空图或上一张图的残留。"""
     try:
-        loading = target.locator("div.yidun--loading, div.yidun_loadicon").first
-        if await loading.count() and await loading.is_visible():
+        loading = await visible_locator(
+            target, "div.yidun--loading, div.yidun_loadicon", fallback_first=False
+        )
+        if loading is not None:
             await loading.wait_for(state="hidden", timeout=timeout_ms)
     except Exception:
         pass
-    await target.locator(YIDUN_BG_SELECTOR).first.wait_for(state="visible", timeout=timeout_ms)
+    bg_all = target.locator(YIDUN_BG_SELECTOR)
+    try:
+        count = await bg_all.count()
+    except Exception:
+        count = 0
+    if count <= 1:
+        await bg_all.first.wait_for(state="visible", timeout=timeout_ms)
+        return
+    deadline = time.monotonic() + timeout_ms / 1000
+    while time.monotonic() < deadline:
+        if await visible_locator(target, YIDUN_BG_SELECTOR, fallback_first=False) is not None:
+            return
+        await asyncio.sleep(0.1)
+    raise TimeoutError("yidun puzzle background image not visible")
 
 
 async def _bg_src(target) -> str | None:
     try:
-        locator = target.locator(YIDUN_BG_SELECTOR).first
-        if await locator.count():
+        locator = await _visible_locator(target, YIDUN_BG_SELECTOR)
+        if locator is not None:
             return await locator.get_attribute("src")
     except Exception:
         return None
@@ -234,14 +249,15 @@ async def _refresh_puzzle(target) -> None:
     clicked = False
     for locator in (target.locator(YIDUN_REFRESH_SELECTOR), target.get_by_text("刷新", exact=True)):
         try:
-            if not await locator.count():
-                continue
-            element = locator.first
-            if not await element.is_visible():
-                continue
-            await element.click(timeout=1500)
-            clicked = True
-            break
+            for index in range(await locator.count()):
+                element = locator.nth(index)
+                if not await element.is_visible():
+                    continue
+                await element.click(timeout=1500)
+                clicked = True
+                break
+            if clicked:
+                break
         except Exception:
             continue
     if not clicked:
@@ -259,6 +275,10 @@ async def _refresh_puzzle(target) -> None:
 
 def _match_yidun_gap(bg_img, block_img, cv2, np=None):
     """在后台线程执行 OpenCV 边缘提取与模板匹配，避免阻塞 asyncio 事件循环。"""
+    if np is None:
+        import numpy as _np
+
+        np = _np
     bg_edges = process_background_image(bg_img, cv2=cv2)
     block_edges = process_block_image(block_img, cv2=cv2, np=np)
     if (
@@ -266,6 +286,8 @@ def _match_yidun_gap(bg_img, block_img, cv2, np=None):
         or block_edges.shape[1] > bg_edges.shape[1]
     ):
         raise ValueError("yidun block larger than background")
+    if int(np.count_nonzero(block_edges)) == 0:
+        return 0.0, (0, 0)
     result = cv2.matchTemplate(bg_edges, block_edges, cv2.TM_CCOEFF_NORMED)
     _, score, _, max_loc = cv2.minMaxLoc(result)
     return float(score), max_loc
@@ -308,8 +330,20 @@ def gap_to_slider_distance(
         block_width = float(block_box.get("width") or 0.0)
         track_width = float(track_box.get("width") or 0.0)
         slider_width = float(slider_box.get("width") or 0.0)
+        track_x = float(track_box.get("x") or 0.0)
+        slider_x = float(slider_box.get("x", track_x))
+        raw_inset = slider_x - track_x
+        slider_inset = (
+            raw_inset
+            if 0.0 < raw_inset <= YIDUN_PIECE_OFFSET_LIMIT_PX
+            and track_width > 0
+            and raw_inset < track_width * 0.2
+            else 0.0
+        )
         max_jigsaw = bg_width - block_width
-        max_slider = track_width - slider_width
+        max_slider = track_width - slider_width - 2.0 * slider_inset
+        if max_slider <= 0:
+            max_slider = track_width - slider_width
         if (
             block_width > 0
             and slider_width > 0
@@ -426,10 +460,11 @@ async def move_slider(page: Page, distance, bias=GAP_BIAS_PX):
     slider_el = await _visible_locator(page, YIDUN_SLIDER_SELECTOR)
     if slider_el is None:
         raise TimeoutError("yidun slider not found")
+    total_distance = max(0.0, float(distance) + float(bias))
     await drag_element_horizontally(
         page,
         slider_el,
-        float(distance) + float(bias),
+        total_distance,
         approach_range=(40.0, 80.0),
         not_found_message="yidun slider not found",
     )
@@ -448,24 +483,27 @@ async def solve_yidun(
             )
             if used_dom:
                 probe = (0.0, 2.0, -2.0, 4.0)[min(attempt - 1, 3)]
+                clamped_distance = max(0.0, float(drag_distance) + probe)
                 logger.debug(
                     f"滑块缺口识别: x={gap_x:.1f}px, DOM换算位移={drag_distance:.1f}px, "
-                    f"微调={probe:+.1f}px, score={score:.3f}"
+                    f"微调={probe:+.1f}px, 实际位移={clamped_distance:.1f}px, score={score:.3f}"
                 )
                 logger.info(f"第{attempt}次尝试过滑块验证...")
-                await move_slider(target, drag_distance, bias=probe)
+                await move_slider(target, clamped_distance, bias=0.0)
             else:
-                # 无法获取完整 DOM 轨道尺寸时回退到经验偏移, 重试轻微左右试探。
+                # 无法获取完整 DOM 轨道尺寸时保留 piece_offset 扣除后的基线位移再叠加回退偏移。
+                base_distance = max(0.0, float(drag_distance) - float(GAP_BIAS_PX))
                 bias = (
                     GAP_BIAS_PX
                     if attempt == 1
                     else GAP_BIAS_PX + random.choice((-2, 0, 2))
                 )
                 logger.debug(
-                    f"滑块缺口识别: x={gap_x:.1f}px, 回退补偿={bias}px, score={score:.3f}"
+                    f"滑块缺口识别: x={gap_x:.1f}px, 基线位移={base_distance:.1f}px, "
+                    f"回退补偿={bias}px, score={score:.3f}"
                 )
                 logger.info(f"第{attempt}次尝试过滑块验证...")
-                await move_slider(target, gap_x, bias)
+                await move_slider(target, base_distance, bias)
             if await _wait_verify_result(target):
                 logger.info("滑块验证已成功通过.")
                 logger.event("滑块验证", 结果="通过", 尝试=attempt, 缺口=f"{gap_x:.1f}px")

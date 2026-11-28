@@ -170,9 +170,11 @@ async def auto_login(
         log.event("人工介入", 状态="需要", 原因="配置文件未填写账号密码,请在浏览器中手动登录.")
 
     captcha_task = None
-    if config.enableAutoCaptcha and modules:
+    if config.enableAutoCaptcha:
         log.event("滑块任务", 状态="启动")
-        captcha_task = asyncio.create_task(slider_verify(page, modules))
+        captcha_task = asyncio.create_task(
+            slider_verify(page, modules or [None, None])
+        )
 
     try:
         await wait_for_login_complete(page)
@@ -229,6 +231,9 @@ async def ensure_login(
             log.warn("检测到 Cookies 已失效, 将重新登录.", shift=True)
             log.event("登录状态", 结果="Cookies 失效", 地址=page.url)
             clear_cookies(cookie_path)
+            from modules.yidun_fp import clear_session_fp
+
+            clear_session_fp(context)
             remember_login_cookies(None, ctx=ctx)
             cookies = None
         elif status is SessionStatus.UNAVAILABLE:

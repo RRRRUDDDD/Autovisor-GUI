@@ -234,6 +234,8 @@ class YidunFpAndRedactionTests(unittest.IsolatedAsyncioTestCase):
             ),
         )
         self.assertNotIn(fp, redaction.redact_sensitive(f"fp={fp} ok"))
+        self.assertNotIn(fp, redaction.redact_sensitive(json.dumps({"fp": fp, "irToken": "ir_secret_123"})))
+        self.assertNotIn("ir_secret_123", redaction.redact_sensitive(json.dumps({"irToken": "ir_secret_123"})))
         self.assertNotIn(fp, redaction.redact_notification(f"通知正文含 {fp}"))
 
         # 验证真实 Logger 写入日志文件时严防泄露明文与 URL 编码形态
@@ -261,19 +263,52 @@ class YidunFpAndRedactionTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(store.get(context=ctx))
 
     async def test_probe_fp_from_page_extracts_and_registers_secret(self):
+        from modules.yidun_fp import _PROBE_STORAGE_JS
+
+        self.assertIn("window.gdxidpyhxde", _PROBE_STORAGE_JS)
+        self.assertIn("gdxidpyhxdE", _PROBE_STORAGE_JS)
+
         fp = _sample_fp("P")
+        encoded_fp = quote(fp, safe="")
         store = YidunFpStore()
 
         class _Page:
             context = object()
 
             async def evaluate(self, _script):
-                return ["invalid", fp]
+                return ["invalid", encoded_fp]
 
         found = await probe_fp_from_page(_Page(), store=store)
         self.assertEqual(found, fp)
         self.assertEqual(store.get(context=_Page.context), fp)
         self.assertNotIn(fp, redaction.redact_sensitive(f"raw {fp}"))
+        self.assertNotIn(encoded_fp, redaction.redact_sensitive(f"cookie gdxidpyhxdE={encoded_fp}"))
+
+    def test_fp_store_isolates_contexts_and_clears_session(self):
+        fp_a = _sample_fp("A")
+        fp_b = _sample_fp("B")
+        ctx_a = object()
+        ctx_b = object()
+        store = YidunFpStore()
+
+        self.assertTrue(store.set(fp_a, context=ctx_a))
+        self.assertEqual(store.get(context=ctx_a), fp_a)
+        # 明确传入 ctx_b 时默认不得跨上下文串读 ctx_a 的 _latest
+        self.assertIsNone(store.get(context=ctx_b))
+        self.assertEqual(store.get(context=ctx_b, fallback_latest=True), fp_a)
+        self.assertEqual(store.get(), fp_a)
+
+        self.assertTrue(store.set(fp_b, context=ctx_b))
+        self.assertEqual(store.get(context=ctx_a), fp_a)
+        self.assertEqual(store.get(context=ctx_b), fp_b)
+
+        store.clear(context=ctx_a)
+        self.assertIsNone(store.get(context=ctx_a))
+        self.assertEqual(store.get(context=ctx_b), fp_b)
+
+        store.clear()
+        self.assertIsNone(store.get(context=ctx_b))
+        self.assertIsNone(store.get())
 
     async def test_browser_session_attaches_and_cleans_up_fp_collector(self):
         fp = _sample_fp("B")
@@ -487,3 +522,17 @@ class YidunHttpSolverTests(unittest.TestCase):
                 max_retry=1,
             )
             self.assertIsNone(solver_broken.solve(CaptchaTrigger(kind="click")))
+
+    def test_find_slide_gap_x_returns_none_for_transparent_or_oversized_front(self):
+        bg_bytes, _ = _make_slide_images(128)
+        # 全透明前景图应返回 None 而不是 0.0
+        transparent_front = np.zeros((160, 56, 4), dtype=np.uint8)
+        ok_t, buf_t = cv2.imencode(".png", transparent_front)
+        self.assertTrue(ok_t)
+        self.assertIsNone(find_slide_gap_x(bg_bytes, buf_t.tobytes()))
+
+        # front 尺寸大于 background 应返回 None 而不是抛 ValueError
+        oversized_front = np.full((200, 400, 4), 255, dtype=np.uint8)
+        ok_o, buf_o = cv2.imencode(".png", oversized_front)
+        self.assertTrue(ok_o)
+        self.assertIsNone(find_slide_gap_x(bg_bytes, buf_o.tobytes()))

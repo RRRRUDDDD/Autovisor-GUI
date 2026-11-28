@@ -1,5 +1,5 @@
 # encoding=utf-8
-"""纯 HTTP 易盾验证码协议与求解封装（零 Playwright 依赖）。
+"""纯 HTTP 易盾验证码协议与求解封装（无需浏览器实例，复用 Phase 2 OpenCV/VLM 纯计算能力）。
 
 移植自 ``zhs`` 的易盾自定义加密原语与三段式 JSONP 协议（``getconf`` → ``get`` → ``check``），
 并直接复用 Phase 2 已实现的滑块 OpenCV 缺口识别（``modules.slider._match_yidun_gap``）
@@ -24,7 +24,12 @@ from modules.captcha_common import decode_image_bytes
 from modules.http_utils import DEFAULT_BROWSER_USER_AGENT, normalize_proxy_url
 from modules.logger import Logger
 from modules.redaction import register_secret
-from modules.yidun_fp import get_session_fp, is_valid_fp, normalize_fp
+from modules.yidun_fp import (
+    _register_fp_secrets,
+    get_session_fp,
+    is_valid_fp,
+    normalize_fp,
+)
 
 CaptchaKind = Literal["slide", "click"]
 
@@ -395,7 +400,12 @@ def find_slide_gap_x(background_bytes: bytes, front_bytes: bytes) -> tuple[float
     front = decode_image_bytes(front_bytes, np, cv2, unchanged=True)
     if background is None or front is None or getattr(background, "shape", (0, 0))[1] <= 0:
         return None
-    _, max_loc = slider_mod._match_yidun_gap(background, front, cv2, np)
+    try:
+        score, max_loc = slider_mod._match_yidun_gap(background, front, cv2, np)
+    except ValueError:
+        return None
+    if not math.isfinite(score) or score < 0.05:
+        return None
     return float(max_loc[0]), int(background.shape[1])
 
 
@@ -743,7 +753,7 @@ class YidunHttpSolver:
         fp_value = normalize_fp(raw)
         if not is_valid_fp(fp_value):
             return None
-        register_secret(fp_value)
+        _register_fp_secrets(fp_value, raw_fp=raw if isinstance(raw, str) else None)
         return fp_value
 
     def solve(
@@ -793,6 +803,8 @@ class YidunHttpSolver:
         conf_data = conf.get("data") if isinstance(conf.get("data"), dict) else {}
         dt = str(conf_data.get("dt") or "")
         ir_token = str(conf_data.get("irToken") or "")
+        if ir_token:
+            register_secret(ir_token)
 
         for attempt in range(1, self.max_retry + 1):
             challenge = self._fetch(client, trigger, fp_value, dt, ir_token)

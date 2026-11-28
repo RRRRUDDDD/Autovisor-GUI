@@ -28,9 +28,9 @@ _REDACT_RULES = (
     (re.compile(r"(?i)(https?:\/\/api\.telegram\.org\/bot)[^\s/?#]+"), r"\1***REDACTED***"),
     (
         re.compile(
-            r"(?i)((?:notification[_-]?url|tg[_-]?chat[_-]?id|chat[_-]?id|bark[_-]?url|"
-            r"pushplus[_-]?token|password|passwd|pwd|api[_-]?key|x-api-key|"
-            r"x-goog-api-key|token|cookie|\bfp|irToken)\s*[:=]\s*)([^\s,;]+)"
+            r"""(?i)((?:["']?(?:notification[_-]?url|tg[_-]?chat[_-]?id|chat[_-]?id|bark[_-]?url|"""
+            r"""pushplus[_-]?token|password|passwd|pwd|api[_-]?key|x-api-key|"""
+            r"""x-goog-api-key|token|cookie|\bfp|irToken)["']?)\s*[:=]\s*["']?)([^\s,;"'}\]]+)"""
         ),
         r"\1***REDACTED***",
     ),
