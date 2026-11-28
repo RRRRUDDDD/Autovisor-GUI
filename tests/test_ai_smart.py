@@ -438,6 +438,74 @@ class AiSmartReviewModeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(dom_visited), 1)
         self.assertIn("/n_mixed/", dom_visited[0])
 
+    async def test_missing_resources_uid_on_required_non_video_does_not_skip_dom_fallback(self):
+        from modules.exam_api import complete_non_video_resources_via_api
+        from modules.stages.ai_smart_stage import run_resources_stage
+
+        # 必学非视频资源缺失有效 resourcesUid 时，API 通道计入 unhandled 且不得跳过 DOM 回退
+        missing_uid_resources = [
+            {
+                "studyStatus": 0,
+                "resourcesDetail": {
+                    "resourcesUid": "",
+                    "resourcesName": "缺UID文档.pdf",
+                    "resourcesType": 1,
+                    "resourcesDistributeType": 1,
+                    "resourcesSyncType": 1,
+                },
+            }
+        ]
+
+        class _MissingUidApi:
+            def __init__(self):
+                self.closed = False
+
+            def list_knowledge_resources(self, course_id, class_id, knowledge_id):
+                return missing_uid_resources
+
+            def complete_study_resource(self, *args):
+                raise AssertionError("缺失 resourcesUid 时不应调 complete_study_resource")
+
+            def close(self):
+                self.closed = True
+
+        api = _MissingUidApi()
+        api_res = complete_non_video_resources_via_api(api, "100", "200", "n_missing", delay=0.0)
+        self.assertTrue(api_res["ok"])
+        self.assertEqual(api_res["done"], 0)
+        self.assertEqual(api_res["failed"], 0)
+        self.assertEqual(api_res["unhandled"], 1)
+        self.assertEqual(api_res["total"], 1)
+
+        dom_visited = []
+
+        async def fake_dom(_page, learn_url, *_args):
+            dom_visited.append(learn_url)
+            return {"ok": True, "done": 1, "skipped": 0, "failed": 0}
+
+        payload = {
+            "courseId": "100",
+            "classId": "200",
+            "nodes": [{"nodeUid": "n_missing", "name": "缺UID节点", "freeExam": 1}],
+        }
+        with (
+            patch("modules.stages.ai_smart_stage._av", side_effect=lambda _name, fb: fb),
+            patch("modules.stages.ai_smart_stage.enumerate_nodes", AsyncMock(return_value=payload)),
+            patch("modules.stages.ai_smart_stage.build_page_exam_api", AsyncMock(return_value=api)),
+            patch("modules.stages.ai_smart_stage.complete_resources_for_node", AsyncMock(side_effect=fake_dom)),
+            patch("modules.exam_api.time.sleep", return_value=None),
+        ):
+            stage_res = await run_resources_stage(
+                Mock(),
+                "https://ai-smart-course-student-pro.zhihuishu.com/singleCourse/knowledgeStudy/100/200",
+                SimpleNamespace(limitMaxTime=0, skip_ai_free_exam=True),
+                Mock(),
+                asyncio.Event(),
+            )
+        self.assertEqual(stage_res, {"done": 1, "failed": 0})
+        self.assertEqual(len(dom_visited), 1)
+        self.assertIn("/n_missing/", dom_visited[0])
+
 
 if __name__ == "__main__":
     unittest.main()

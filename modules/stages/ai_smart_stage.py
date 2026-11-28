@@ -130,11 +130,17 @@ async def run_resources_stage(
                     api_result = None
                 if isinstance(api_result, dict) and api_result.get("ok"):
                     api_done = int(api_result.get("done") or 0)
+                    api_skipped = int(api_result.get("skipped") or 0)
+                    api_total = int(api_result.get("total") or 0)
+                    api_failed = int(api_result.get("failed") or 0)
+                    api_unhandled = int(api_result.get("unhandled") or 0)
                     total_done += api_done
                     if (
-                        int(api_result.get("total") or 0) > 0
+                        api_total > 0
                         and not api_result.get("has_incomplete_video")
-                        and int(api_result.get("failed") or 0) == 0
+                        and api_failed == 0
+                        and api_unhandled == 0
+                        and (api_skipped + api_done) >= api_total
                     ):
                         if api_done:
                             logger.event(
@@ -142,7 +148,7 @@ async def run_resources_stage(
                                 序号=f"{index}/{len(nodes)}",
                                 名称=name,
                                 补齐=api_done,
-                                已完成=api_result.get("skipped", 0),
+                                已完成=api_skipped,
                                 失败=0,
                                 方式="API",
                             )

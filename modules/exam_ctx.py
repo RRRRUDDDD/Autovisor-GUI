@@ -412,11 +412,20 @@ class AiExamBase(ABC):
         self._last_ai_provider = name
         return cleaned
 
+    @staticmethod
+    def _question_type_int(value) -> int | None:
+        if isinstance(value, bool) or value is None:
+            return None
+        try:
+            return int(str(value).strip())
+        except (TypeError, ValueError):
+            return None
+
     def _cached_answer(
         self, question: dict, question_id, version: int, valid_ids: set
     ) -> list | None:
         """三级缓存: 当前题库快照 -> SQLite 当前 exam_id -> 跨考试课程检索."""
-        is_fill = question.get("questionType") == 3
+        is_fill = self._question_type_int(question.get("questionType")) == 3
 
         def normalize(record):
             if not record or not record.get("answer"):
@@ -473,7 +482,7 @@ class AiExamBase(ABC):
             for option in content.get("optionVos") or []
             if is_flagged(option.get("isCorrect"))
         ]
-        if content.get("questionType") == 3:
+        if ExamCtx._question_type_int(content.get("questionType")) == 3:
             cleaned = [
                 text
                 for option in correct
@@ -515,7 +524,9 @@ class AiExamBase(ABC):
         question_id = question.get("id") or question.get("questionId")
         if question_id is None:
             raise ValueError("题目缺少 id")
-        question_type = question.get("questionType")
+        question_type = self._question_type_int(question.get("questionType"))
+        if question_type is None:
+            question_type = question.get("questionType")
         version = question.get("version", 1)
         choices = [
             {"id": option["id"], "content": option.get("content", "")}

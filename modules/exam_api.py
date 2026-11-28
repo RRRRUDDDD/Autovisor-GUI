@@ -646,12 +646,14 @@ def complete_non_video_resources_via_api(
             "done": 0,
             "failed": 0,
             "skipped": 0,
+            "unhandled": 0,
             "has_incomplete_video": False,
             "total": 0,
         }
 
     total_required = 0
     skipped = 0
+    unhandled = 0
     has_incomplete_video = False
     for item in resources:
         if not isinstance(item, dict):
@@ -670,6 +672,13 @@ def complete_non_video_resources_via_api(
             continue
         if is_video_knowledge_resource(item):
             has_incomplete_video = True
+            continue
+        uid = detail.get("resourcesUid")
+        if uid in (None, "", 0, "0"):
+            uid = item.get("resourcesUid")
+        uid_key = str(uid or "").strip()
+        if not uid_key or uid_key == "0":
+            unhandled += 1
 
     targets = collect_incomplete_non_video_resources(
         resources, include_optional=include_optional
@@ -699,6 +708,7 @@ def complete_non_video_resources_via_api(
         "done": done,
         "failed": failed,
         "skipped": skipped,
+        "unhandled": unhandled,
         "has_incomplete_video": has_incomplete_video,
         "total": total_required,
     }

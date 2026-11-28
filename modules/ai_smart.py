@@ -352,8 +352,11 @@ async def _seek_video(page: Page, target_seconds: float) -> None:
     try:
         await page.evaluate(
             """(target) => {
-                const list = [...document.querySelectorAll('video')]
-                    .sort((a, b) => (Number.isFinite(b.duration) ? b.duration : 0) - (Number.isFinite(a.duration) ? a.duration : 0));
+                const list = [...document.querySelectorAll('video')].sort(
+                    (a, b) =>
+                        (Number.isFinite(b.duration) ? b.duration : 0) -
+                        (Number.isFinite(a.duration) ? a.duration : 0)
+                );
                 const video = list[0];
                 if (!video) return;
                 video.currentTime = Math.max(0, target);
@@ -709,6 +712,50 @@ async def complete_resources_for_node(
     return {"ok": True, "done": done, "skipped": skipped, "failed": failed}
 
 
+async def _try_complete_non_video_via_api(page: Page, config, logger) -> bool:
+    """文档页 DOM 滚动失败时的轻量 API 兜底（不改变视频播放路线）。"""
+    import re as _re
+
+    url = str(getattr(page, "url", "") or "")
+    match = _re.search(
+        r"/knowledgeStudy/([^/?#]+)/([^/?#]+)/([^/?#]+)", url
+    )
+    if not match:
+        return False
+    course_id, node_uid, class_id = match.groups()
+    api = None
+    try:
+        from modules.exam_api import complete_non_video_resources_via_api
+        from modules.runtime_bootstrap import build_page_exam_api
+
+        api = await build_page_exam_api(page, config)
+        res = await asyncio.to_thread(
+            complete_non_video_resources_via_api,
+            api,
+            course_id,
+            class_id,
+            node_uid,
+            logger=logger,
+        )
+        return bool(
+            isinstance(res, dict)
+            and res.get("ok")
+            and int(res.get("failed") or 0) == 0
+            and int(res.get("unhandled") or 0) == 0
+            and (int(res.get("done") or 0) > 0 or int(res.get("skipped") or 0) > 0)
+        )
+    except Exception as exc:
+        logger.debug(f"ai-smart 非视频文档 API 兜底失败: {exc}")
+        return False
+    finally:
+        close_fn = getattr(api, "close", None)
+        if callable(close_fn):
+            try:
+                close_fn()
+            except Exception:
+                pass
+
+
 async def run_ai_smart_course(
     page: Page,
     home_url: str,
@@ -862,10 +909,15 @@ async def run_ai_smart_course(
                 logger.info(f"正在学习资源: {title} ({kind})")
                 logger.event("资源开始", 标题=title, 类型=kind, 阶段="学习")
                 if kind != "video":
-                    # 文档/PPT/文献要滚到底才会被平台记为完成
+                    # 文档/PPT/文献要滚到底才会被平台记为完成；DOM 失败时尝试 API 兜底
                     if await complete_document_resource(page, resource, logger):
                         logger.info(f"资源已完成: {title}")
                         logger.event("ai-smart 资源完成", 标题=title, 类型=kind)
+                    elif await _try_complete_non_video_via_api(page, config, logger):
+                        logger.info(f"资源已通过 API 兜底完成: {title}")
+                        logger.event(
+                            "ai-smart 资源完成", 标题=title, 类型=kind, 方式="API"
+                        )
                     else:
                         target_failed = True
                     continue
