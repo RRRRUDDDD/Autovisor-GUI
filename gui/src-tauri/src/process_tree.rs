@@ -142,7 +142,7 @@ mod imp {
                 return;
             }
             // 优先通过 Child::try_wait() 回收组长，避免绕过 Child 调用 waitpid 导致后续 child.kill() 潜在 PID 复用误杀
-            let mut reap_leader = |c: &mut Option<&mut std::process::Child>| {
+            let reap_leader = |c: &mut Option<&mut std::process::Child>| {
                 if let Some(ref mut ch) = c {
                     let _ = ch.try_wait();
                 } else {

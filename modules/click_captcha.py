@@ -138,11 +138,12 @@ def _font_candidates() -> tuple[str, ...]:
         r"C:\Windows\Fonts\arialbd.ttf",
         "/System/Library/Fonts/Supplemental/Arial Bold.ttf",
         "/Library/Fonts/Arial Bold.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+        "/usr/share/fonts/liberation/LiberationSans-Bold.ttf",
         "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
         "/usr/share/fonts/dejavu/DejaVuSans-Bold.ttf",
         "/usr/share/fonts/truetype/noto/NotoSans-Bold.ttf",
         "/usr/share/fonts/noto/NotoSans-Bold.ttf",
-        "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
     )
 
 
@@ -192,7 +193,23 @@ def _pil_to_mask(image, np, cv2, size: int = TEMPLATE_SIZE):
     return cv2.resize(padded, (size, size), interpolation=cv2.INTER_AREA)
 
 
-def match_char(bitmap, ch: str, np, cv2, angles=None) -> float:
+def _template_aspect(ch: str, angle: int, np) -> float:
+    array = np.array(render_char(ch, int(angle)))
+    ys, xs = np.where(array > 0)
+    if len(xs) == 0:
+        return 1.0
+    return float(xs.max() - xs.min() + 1) / float(max(ys.max() - ys.min() + 1, 1))
+
+
+def match_char(
+    bitmap,
+    ch: str,
+    np,
+    cv2,
+    angles=None,
+    glyph_aspect: float | None = None,
+    aspect_penalty: float = 0.0,
+) -> float:
     if angles is None:
         angles = range(-30, 31, 5)
     best = -1.0
@@ -201,6 +218,10 @@ def match_char(bitmap, ch: str, np, cv2, angles=None) -> float:
         score = float(
             cv2.matchTemplate(bitmap, template, cv2.TM_CCOEFF_NORMED).max()
         )
+        if aspect_penalty > 0.0 and glyph_aspect is not None and glyph_aspect > 0.0:
+            template_aspect = _template_aspect(ch, int(angle), np)
+            ratio = min(glyph_aspect / template_aspect, template_aspect / glyph_aspect)
+            score *= ratio**aspect_penalty
         if score > best:
             best = score
     return best
@@ -247,20 +268,49 @@ def glyph_bitmap(glyph: dict, np, cv2, size: int = TEMPLATE_SIZE):
     return cv2.resize(bitmap, (size, size), interpolation=cv2.INTER_AREA)
 
 
-def score_glyph(glyph: dict, chars: tuple[str, ...], np, cv2, angles=None) -> float:
+def score_glyph(
+    glyph: dict,
+    chars: tuple[str, ...],
+    np,
+    cv2,
+    angles=None,
+    aspect_penalty: float = 0.0,
+) -> float:
     bitmap = glyph_bitmap(glyph, np, cv2)
-    return max(match_char(bitmap, char, np, cv2, angles=angles) for char in chars)
+    _, _, box_w, box_h = glyph["bbox"]
+    glyph_aspect = float(box_w) / float(max(box_h, 1)) if aspect_penalty > 0.0 else None
+    return max(
+        match_char(
+            bitmap,
+            char,
+            np,
+            cv2,
+            angles=angles,
+            glyph_aspect=glyph_aspect,
+            aspect_penalty=aspect_penalty,
+        )
+        for char in chars
+    )
 
 
 def pick_orientation_target(glyphs: list[dict], parsed: dict, np, cv2):
-    target_chars = char_variants(parsed["target"])
-    alias = SIDEWAYS_ALIAS.get(parsed["target"].lower(), "")
-    alias_chars = char_variants(alias) if alias else ()
+    target = parsed["target"]
+    target_chars = char_variants(target)
+    alias = SIDEWAYS_ALIAS.get(target.lower(), "")
+    if alias:
+        alias_chars = (alias,) if target.islower() else char_variants(alias)
+    else:
+        alias_chars = ()
     scored = []
     for glyph in glyphs:
         upright = score_glyph(glyph, target_chars, np, cv2, angles=(0, -15, 15))
         sideways = score_glyph(
-            glyph, target_chars, np, cv2, angles=(90, 270, 75, 105, 255, 285)
+            glyph,
+            target_chars,
+            np,
+            cv2,
+            angles=(90, 270, 75, 105, 255, 285),
+            aspect_penalty=0.25,
         )
         inverted = score_glyph(glyph, target_chars, np, cv2, angles=(180, 165, 195))
         lookalike = (
@@ -279,8 +329,8 @@ def pick_orientation_target(glyphs: list[dict], parsed: dict, np, cv2):
             rotated = max(sideways, lookalike)
             if rotated < 0.35:
                 continue
-            # 正向字母的 upright 分通常明显高于侧躺外形，直接排除。
-            if upright >= 0.62 and rotated < upright + 0.12:
+            # 正向字母的 upright 分通常不低于侧躺外形，直接排除。
+            if upright >= 0.62 and rotated <= upright:
                 continue
             eligible.append(item)
         if not eligible:

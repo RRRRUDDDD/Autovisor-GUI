@@ -121,6 +121,51 @@ class ClickPointTests(unittest.TestCase):
         self.assertGreater(y, 60)
         self.assertLess(y, 110)
 
+    def test_picks_sideways_b_across_fallback_and_wide_fonts(self):
+        if not SIDEWAYS_FIXTURE.exists():
+            self.skipTest("missing captcha fixture")
+        from unittest.mock import patch
+        from PIL import Image, ImageFont
+        from modules import click_captcha
+
+        image = cv2.imread(str(SIDEWAYS_FIXTURE))
+        self.assertIsNotNone(image)
+
+        # 1) Pillow 默认字体回退（模拟缺少系统粗体字体的 Linux 环境）
+        click_captcha.render_char.cache_clear()
+        try:
+            with patch.object(
+                click_captcha, "_load_font", side_effect=lambda size: ImageFont.load_default(size)
+            ):
+                point = find_click_point(image, "请点击侧向的小写b", np, cv2)
+            self.assertIsNotNone(point)
+            self.assertGreater(point[0], 170, f"default font missed sideways b: {point}")
+            self.assertLess(point[0], 230, f"default font hit upright b: {point}")
+        finally:
+            click_captcha.render_char.cache_clear()
+
+        # 2) 横向拉宽 15% 模拟 DejaVuSans-Bold 等较宽粗体字形
+        orig_render = click_captcha.render_char
+
+        def _wide_render(ch: str, angle: int = 0, size: int = click_captcha.TEMPLATE_SIZE):
+            base = orig_render(ch, 0, size)
+            w, h = base.size
+            nw = int(round(w * 1.15))
+            stretched = base.resize((nw, h), Image.BILINEAR)
+            canvas = Image.new("L", (w, h), 0)
+            canvas.paste(stretched, ((w - nw) // 2, 0))
+            return canvas.rotate(angle, resample=Image.BILINEAR, fillcolor=0) if angle else canvas
+
+        click_captcha.render_char.cache_clear()
+        try:
+            with patch.object(click_captcha, "render_char", side_effect=_wide_render):
+                point = find_click_point(image, "请点击侧向的小写b", np, cv2)
+            self.assertIsNotNone(point)
+            self.assertGreater(point[0], 170, f"wide font missed sideways b: {point}")
+            self.assertLess(point[0], 230, f"wide font hit upright b: {point}")
+        finally:
+            click_captcha.render_char.cache_clear()
+
     def test_picks_gray_v_not_colored_v(self):
         if not GRAY_FIXTURE.exists():
             self.skipTest("missing captcha fixture")
